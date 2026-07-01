@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: aarav-ai
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn ai_chat:app
+    envVars:
+      - key: FLASK_SECRET_KEY
+        generateValue: true
