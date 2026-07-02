@@ -78,12 +78,18 @@ API_KEY = GEMINI_API_KEY
 MODEL   = GEMINI_MODEL
 SYSTEM_PROMPT = (
     "You are Aarav AI, a smart and friendly AI assistant made by Aarav Singh. "
-    "Be conversational, warm, and concise. Give short helpful answers unless the user wants detail. "
     "If asked who made you, say you are Aarav AI made by Aarav Singh — say it once naturally, never repeat it unprompted. "
     "Never mention Google, Groq, OpenRouter, HuggingFace, Meta, Mistral, Anthropic, or any AI company. "
-    "Never say you use Google search or any search engine — you have no internet access, answer from your knowledge. "
+    "Never say you use Google search or any search engine — answer from your knowledge only. "
     "You can help with anything: questions, writing, coding, math, ideas, or just chatting. "
-    "When writing code, always wrap it in markdown code blocks with the language name."
+    "When writing code, always wrap it in markdown code blocks with the language name. "
+    "CRITICAL RULES — follow these every single reply: "
+    "1. NEVER restate or echo back what the user just said. Jump straight to the answer. "
+    "2. NEVER start replies with filler phrases like Great question, Sure, Of course, Absolutely, Certainly, or similar openers. "
+    "3. NEVER repeat information you already gave earlier in the conversation. Build on it instead. "
+    "4. Vary your sentence structure and vocabulary — never use the same phrasing pattern twice in a row. "
+    "5. Be direct and natural — like a knowledgeable friend texting you, not a customer service bot. "
+    "6. Keep answers concise unless the user explicitly asks for detail or a long explanation."
 )
 
 app = Flask(__name__)
@@ -267,10 +273,10 @@ PAGE = """<!DOCTYPE html>
 <title>Aarav AI</title>
 <style>
   :root {
-    --bg:#212121; --panel:#2f2f2f; --border:#3f3f3f;
-    --text:#ececec; --muted:#8e8ea0; --accent:#10a37f;
-    --accent-dim:#1a3a30; --user-bubble:#2f2f2f; --user-text:#ececec;
-    --ai-bubble:#212121; --sidebar-w:260px;
+    --bg:#ffffff; --panel:#f7f7f8; --border:#e5e7eb;
+    --text:#111827; --muted:#6b7280; --accent:#2563eb;
+    --accent-dim:#dbeafe; --user-bubble:#2563eb; --user-text:#ffffff;
+    --ai-bubble:#f3f4f6; --sidebar-w:260px;
   }
   * { box-sizing:border-box; margin:0; padding:0; }
   html,body { height:100%; background:var(--bg); color:var(--text);
@@ -369,7 +375,7 @@ PAGE = """<!DOCTYPE html>
   #send-btn { background:var(--accent); color:#fff; border:none; border-radius:10px;
     width:36px; height:36px; font-size:18px; cursor:pointer; flex-shrink:0;
     display:flex; align-items:center; justify-content:center; }
-  #send-btn:disabled { opacity:.4; cursor:not-allowed; }
+  #send-btn:disabled { background:var(--accent-dim); color:var(--muted); cursor:not-allowed; }
   #voice-btn.listening { color:#ef4444; animation:pulse 1s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
@@ -402,7 +408,6 @@ PAGE = """<!DOCTYPE html>
         <h1>Aarav AI</h1>
       </div>
       <button id="clear-btn">Delete chat</button>
-      <button id="speak-toggle" title="Toggle voice responses" style="background:none;border:1px solid var(--border);color:var(--muted);font-size:12px;padding:6px 12px;border-radius:6px;cursor:pointer;flex-shrink:0;">🔇 Voice off</button>
     </header>
 
     <div id="messages-wrap">
@@ -488,19 +493,10 @@ const scrollBtn    = document.getElementById('scroll-btn');
 const speakingIndicator = document.getElementById('speaking-indicator');
 const stopSpeakBtn = document.getElementById('stop-speak-btn');
 
-const speakToggleBtn = document.getElementById('speak-toggle');
 let activeConvId = null;
 let pendingFile  = null;
 let recognition  = null;
 let currentUtterance = null;
-let voiceEnabled = false; // OFF by default — user clicks to enable
-
-speakToggleBtn.addEventListener('click', () => {
-  voiceEnabled = !voiceEnabled;
-  speakToggleBtn.textContent = voiceEnabled ? '🔊 Voice on' : '🔇 Voice off';
-  speakToggleBtn.style.color = voiceEnabled ? 'var(--accent)' : 'var(--muted)';
-  if (!voiceEnabled) { window.speechSynthesis && window.speechSynthesis.cancel(); speakingIndicator.classList.remove('show'); }
-});
 
 // --- Scroll button ---
 messagesWrap.addEventListener('scroll', () => {
