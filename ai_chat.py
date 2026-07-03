@@ -1,23 +1,15 @@
 """
-Aarav AI — single file, powered by Groq and Cerebras (free, fast inference APIs),
-with automatic fallback between them. Optionally supports a local Ollama model.
+Aarav AI — single file, powered by Google's Gemini API or a local Ollama model.
 
-Usage (Groq + Cerebras — default, needs free API keys):
+Usage (Gemini — default, needs a free API key):
     1. pip install flask requests
-    2. Set your API keys:
-         Mac/Linux:   export GROQ_API_KEY="your-groq-key"
-                      export CEREBRAS_API_KEY="your-cerebras-key"
-         Windows:     set GROQ_API_KEY=your-groq-key
-                      set CEREBRAS_API_KEY=your-cerebras-key
+    2. Set your API key:
+         Mac/Linux:   export GEMINI_API_KEY="your-key-here"
+         Windows:     set GEMINI_API_KEY=your-key-here
     3. python ai_chat.py
     4. Open http://localhost:5000 in your browser
 
-Get a free Groq key at https://console.groq.com/keys
-Get a free Cerebras key at https://cloud.cerebras.ai
-
-If both keys are set, Aarav AI automatically rotates between them and falls back
-to the other if one is busy/rate-limited/down — you'll see a small notice in
-the chat when that happens, and a "answered by ..." caption under each reply.
+Get a FREE API key (no credit card needed) at https://aistudio.google.com/apikey
 
 Usage (Ollama — fully local, no API key or internet needed):
     1. Install Ollama from https://ollama.com and make sure it's running
@@ -33,10 +25,12 @@ Usage (Ollama — fully local, no API key or internet needed):
     5. Open http://localhost:5000 in your browser
 
 Features:
+- Login/register (real accounts, hashed passwords, stored in chat_data/users.json)
 - Multi-conversation chat with sidebar, saved per-account, survives restarts
 - File/image upload (attach an image or text file to a message)
-- Streaming responses (text appears word-by-word) with stop/regenerate/copy/edit
-- Groq <-> Cerebras automatic fallback with visible switch notices
+- Web search grounding (Gemini can search Google for current info — Gemini only)
+- Streaming responses (text appears word-by-word)
+- Switchable AI backend: Google Gemini (cloud) or Ollama (local, private, free)
 - No rate limiting — unlimited messages
 """
 
@@ -52,30 +46,42 @@ from flask import (
 )
 
 PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
-# "auto"     = automatic fallback: Groq first, then Cerebras if Groq is busy/down
-# "groq"     = Groq only
-# "cerebras" = Cerebras only
-# "ollama"   = local Ollama only
+# "auto"        = round-robin: Groq → OpenRouter → HuggingFace (all work on servers)
+# "gemini"      = Google Gemini only (free tier only works locally, not on Render)
+# "groq"        = Groq only
+# "openrouter"  = OpenRouter only
+# "huggingface" = Hugging Face only
+# "ollama"      = local Ollama only
 
-# --- API Keys — set these as environment variables (never hardcode real keys) ---
+# --- API Keys (hardcoded fallbacks — override via environment variables) ------
+# WARNING: don't commit a file with real keys to a public GitHub repo.
+# Set these as environment variables on Render instead.
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY",    "")
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "")
 CEREBRAS_API_KEY  = os.environ.get("CEREBRAS_API_KEY",  "")
-# Only used by the (separate) image-generation feature, not for chat replies.
+OPENROUTER_API_KEY= os.environ.get("OPENROUTER_API_KEY","")
 HF_API_KEY        = os.environ.get("HF_API_KEY",        "")
 
 # --- Model names -------------------------------------------------------------
+GEMINI_MODEL      = "gemini-2.5-flash"
 GROQ_MODEL        = os.environ.get("GROQ_MODEL",        "llama-3.1-8b-instant")
+OPENROUTER_MODEL  = os.environ.get("OPENROUTER_MODEL",  "google/gemma-3-4b-it:free")
+HF_MODEL          = os.environ.get("HF_MODEL",          "mistralai/Mistral-7B-Instruct-v0.3")
 CEREBRAS_MODEL    = os.environ.get("CEREBRAS_MODEL",    "gpt-oss-120b")
 OLLAMA_MODEL      = os.environ.get("OLLAMA_MODEL",       "llama3.1")
 OLLAMA_URL        = os.environ.get("OLLAMA_URL",         "http://localhost:11434").rstrip("/")
 
-# Friendly display names shown to the user (e.g. "Answered by Groq")
-PROVIDER_DISPLAY_NAMES = {"groq": "Groq", "cerebras": "Cerebras", "ollama": "Ollama"}
+GEMINI_STREAM_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:streamGenerateContent"
+)
 
+# keep old name for compatibility with existing references below
+API_KEY = GEMINI_API_KEY
+MODEL   = GEMINI_MODEL
 SYSTEM_PROMPT = (
     "You are Aarav AI, a smart and friendly AI assistant made by Aarav Singh. "
     "If asked who made you, say you are Aarav AI made by Aarav Singh — say it once naturally, never repeat it unprompted. "
-    "Never mention Google, Groq, Cerebras, Meta, Mistral, Anthropic, or any AI company as your creator or backend. "
+    "Never mention Google, Groq, OpenRouter, HuggingFace, Meta, Mistral, Anthropic, or any AI company as your creator or backend. "
     "You can help with anything: questions, writing, coding, math, ideas, or just chatting. "
     "When writing code, always wrap it in markdown code blocks with the language name. "
     "LANGUAGE: Always reply ENTIRELY in the same language the user's message is written in — "
@@ -84,16 +90,27 @@ SYSTEM_PROMPT = (
     "partway through, even if source information you know is in a different language — translate it "
     "into the reply language first). If they mix languages themselves, match their mix. "
     "Never force English on the user. "
-    "You do not have live web access — answer from what you know, and if asked about very recent "
-    "events say your information may not be fully up to date instead of pretending to search. "
-    "Never write out fake tool calls, function names, or JSON like {\"query\": ...} in your reply — "
-    "those are internal mechanisms the user must never see. "
+    "TOOL USE: Never write out fake tool calls, function names, or JSON like {\"query\": ...} in your reply — "
+    "those are internal mechanisms the user must never see. If you don't actually have live web access, "
+    "just answer from what you know and say your information may not be fully up to date, instead of "
+    "pretending to search. "
     "ANTI-REPETITION RULES — follow strictly every reply: "
     "1. NEVER restate or echo back what the user just said. Jump straight to the answer. "
     "2. NEVER start replies with filler like Great question, Sure, Of course, Absolutely, Certainly. "
     "3. NEVER repeat information already given earlier in the conversation. Build on it. "
     "4. Be direct and natural — like a knowledgeable friend, not a customer service bot. "
     "5. Keep answers concise unless the user asks for detail."
+)
+
+# Extra instruction appended ONLY for Gemini, which actually has a real google_search tool wired up.
+# Other providers (Groq/Cerebras/OpenRouter/HF/Ollama) have no real search access, so telling them
+# "you have search" makes them hallucinate fake tool-call JSON into the visible reply — hence this
+# is kept separate from the base SYSTEM_PROMPT above.
+GEMINI_SEARCH_ADDENDUM = (
+    " WEB SEARCH: You have access to Google Search. When the user asks about current events, "
+    "live prices, news, sports scores, weather, or anything that needs up-to-date information, "
+    "use the search tool to find the answer. Do not say you cannot search the web. When you use "
+    "search results, translate/summarize them into the reply language — never paste a mix of languages."
 )
 
 app = Flask(__name__)
@@ -332,16 +349,15 @@ PAGE = """<!DOCTYPE html>
     display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
   #export-btn:hover { background:var(--panel); }
 
-  /* Fullscreen bar — sits above the input row so it's always reachable on mobile,
-     away from any notch/status-bar area that can swallow top-corner taps. */
-  #fullscreen-btn { display:flex; align-items:center; justify-content:center; gap:6px;
-    width:100%; max-width:760px; margin:0 auto 8px; padding:9px 12px;
-    background:var(--panel); border:1px solid var(--border); border-radius:10px;
-    color:var(--muted); font-size:13px; cursor:pointer; touch-action:manipulation;
+  /* Fullscreen toggle — lives in the header so it's reachable with one tap
+     at the top of the screen, alongside the other header icon buttons. */
+  #fullscreen-btn { background:none; border:1px solid var(--border); color:var(--muted);
+    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; touch-action:manipulation;
     -webkit-tap-highlight-color:transparent; }
-  #fullscreen-btn:hover { color:var(--text); border-color:var(--accent); }
+  #fullscreen-btn:hover { background:var(--panel); color:var(--text); }
   #fullscreen-btn.active { color:var(--accent); border-color:var(--accent); }
-  #fullscreen-icon { font-size:15px; }
+  #fullscreen-icon { font-size:16px; line-height:1; }
 
   /* Fallback for browsers without a real Fullscreen API (iOS Safari, some in-app webviews):
      hide the sidebar toggle/header chrome so the chat fills the screen. */
@@ -368,8 +384,10 @@ PAGE = """<!DOCTYPE html>
   #name-save-btn { background:var(--accent); color:#fff; border-color:var(--accent); }
   #name-save-btn:hover { opacity:.9; }
   #clear-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    font-size:12px; padding:6px 12px; border-radius:6px; cursor:pointer; flex-shrink:0; }
-  #clear-btn:hover { background:var(--panel); }
+    width:36px; height:36px; border-radius:6px; font-size:15px; cursor:pointer; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; touch-action:manipulation;
+    -webkit-tap-highlight-color:transparent; }
+  #clear-btn:hover { background:var(--panel); color:#ef4444; border-color:#ef4444; }
 
   /* Messages */
   #messages-wrap { flex:1; overflow-y:auto; position:relative; }
@@ -485,9 +503,8 @@ PAGE = """<!DOCTYPE html>
     #sidebar-toggle { width:38px; height:38px; font-size:14px; }
     #name-btn { width:38px; height:38px; font-size:14px; }
     #export-btn { width:38px; height:38px; font-size:14px; }
-    #clear-btn { font-size:11px; padding:8px 10px; min-height:38px; }
-    #speak-toggle { font-size:11px; padding:5px 8px; }
-    #fullscreen-btn { font-size:12.5px; padding:10px 12px; }
+    #fullscreen-btn { width:38px; height:38px; font-size:14px; }
+    #clear-btn { width:38px; height:38px; font-size:14px; }
 
     #messages-wrap { overflow-y:auto; -webkit-overflow-scrolling:touch; }
     #messages { padding:14px 10px; gap:12px; max-width:100%; }
@@ -517,7 +534,6 @@ PAGE = """<!DOCTYPE html>
     :root { --sidebar-w: 88vw; }
     .msg { font-size:13.5px; }
     header h1 { font-size:13px; }
-    #speak-toggle { display:none; }
   }
 </style>
 </head>
@@ -536,9 +552,12 @@ PAGE = """<!DOCTYPE html>
         <h1>Aarav AI</h1>
       </div>
       <div class="right">
+        <button id="fullscreen-btn" type="button" title="Fullscreen">
+          <span id="fullscreen-icon">⛶</span>
+        </button>
         <button id="name-btn" title="What should Aarav AI call you?">🙂</button>
         <button id="export-btn" title="Export this chat">⬇</button>
-        <button id="clear-btn">Delete chat</button>
+        <button id="clear-btn" title="Delete this chat">🗑</button>
       </div>
     </header>
 
@@ -564,9 +583,6 @@ PAGE = """<!DOCTYPE html>
     </div>
 
     <div class="input-area">
-      <button id="fullscreen-btn" type="button">
-        <span id="fullscreen-icon">⛶</span> <span id="fullscreen-label">Fullscreen</span>
-      </button>
       <form id="chat-form">
         <div class="input-row">
           <!-- Attach file -->
@@ -916,6 +932,7 @@ async function openConversation(convId) {
     (d.messages || []).forEach(m => addMessage(m.role, m.text, m.attachment));
     loadConversationList();
   } catch {}
+  if (isMobile()) closeSidebar();
 }
 
 function startNewChat() {
@@ -923,6 +940,7 @@ function startNewChat() {
   messagesEl.innerHTML = '';
   showEmptyState();
   loadConversationList();
+  if (isMobile()) closeSidebar();
 }
 
 // --- Send / regenerate / stop ---
@@ -1062,7 +1080,6 @@ sidebarOverlay.addEventListener('click', closeSidebar);
 // Fullscreen toggle (works on Android/desktop; iOS Safari has no real Fullscreen API,
 // so it falls back to a "pseudo-fullscreen" mode that maximizes the app view instead)
 const fullscreenIcon  = document.getElementById('fullscreen-icon');
-const fullscreenLabel = document.getElementById('fullscreen-label');
 const fsSupported = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
 
 function isFullscreen() {
@@ -1072,11 +1089,11 @@ function isFullscreen() {
 function updateFullscreenBtn() {
   if (isFullscreen()) {
     fullscreenIcon.textContent = '⤢';
-    fullscreenLabel.textContent = 'Exit fullscreen';
+    fullscreenBtn.title = 'Exit fullscreen';
     fullscreenBtn.classList.add('active');
   } else {
     fullscreenIcon.textContent = '⛶';
-    fullscreenLabel.textContent = 'Fullscreen';
+    fullscreenBtn.title = 'Fullscreen';
     fullscreenBtn.classList.remove('active');
   }
 }
@@ -1135,13 +1152,6 @@ nameInput.addEventListener('keydown', (e) => {
 if (!localStorage.getItem('aarav_name_prompted')) {
   localStorage.setItem('aarav_name_prompted', '1');
   setTimeout(openNameModal, 600);
-}
-
-// Auto-close sidebar on mobile after picking a conversation
-const _origOpen = openConversation;
-async function openConversation(id) {
-  await _origOpen(id);
-  if (isMobile()) closeSidebar();
 }
 
 // Hide sidebar by default on mobile
@@ -1643,7 +1653,6 @@ def chat():
     return resp
 
 
-@app.route("/api/generate-image", methods=["POST"])
 @app.route("/api/generate-image", methods=["POST"])
 @login_required
 def generate_image():
