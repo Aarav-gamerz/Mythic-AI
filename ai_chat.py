@@ -1160,6 +1160,29 @@ async function toggleFullscreen() {
 }
 fullscreenBtn.addEventListener('click', toggleFullscreen);
 document.addEventListener('fullscreenchange', updateFullscreenBtn);
+
+// --- Auto-fullscreen on open ---
+// Browsers block real fullscreen requests until there's been a genuine user
+// gesture (tap/click) — this is a security rule, not something any page can
+// override. So: apply the "maximized" view immediately (no permission needed),
+// then silently promote to real, OS-level fullscreen on the very first tap.
+document.body.classList.add('pseudo-fullscreen');
+updateFullscreenBtn();
+
+if (fsSupported) {
+  const autoRequestFullscreen = () => {
+    if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+      const el = document.documentElement;
+      const req = el.requestFullscreen ? el.requestFullscreen() : el.webkitRequestFullscreen();
+      Promise.resolve(req).then(() => {
+        document.body.classList.remove('pseudo-fullscreen');
+        updateFullscreenBtn();
+      }).catch(() => {}); // user may have declined — stay in pseudo-fullscreen, no error shown
+    }
+    document.removeEventListener('pointerdown', autoRequestFullscreen);
+  };
+  document.addEventListener('pointerdown', autoRequestFullscreen, { once: true });
+}
 document.addEventListener('webkitfullscreenchange', updateFullscreenBtn);
 
 // "What should Aarav AI call you?" — stored locally, sent with every chat request
