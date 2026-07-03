@@ -56,11 +56,11 @@ PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
 # --- API Keys (hardcoded fallbacks — override via environment variables) ------
 # WARNING: don't commit a file with real keys to a public GitHub repo.
 # Set these as environment variables on Render instead.
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY",    "AQ.Ab8RN6ISxMXytCp9aRuWkXQ8YvXh2HRQYncggoM6jTPzxJe5Ag")
-GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "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")
-CEREBRAS_API_KEY  = os.environ.get("CEREBRAS_API_KEY",  "csk-2ph5f5nxt3jrtwj5edcehpr5xh96628268fvjh4e658m4t6h")
-OPENROUTER_API_KEY= os.environ.get("OPENROUTER_API_KEY","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")
-HF_API_KEY        = os.environ.get("HF_API_KEY",        "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")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY",    "")
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "")
+CEREBRAS_API_KEY  = os.environ.get("CEREBRAS_API_KEY",  "")
+OPENROUTER_API_KEY= os.environ.get("OPENROUTER_API_KEY","")
+HF_API_KEY        = os.environ.get("HF_API_KEY",        "")
 
 # --- Model names -------------------------------------------------------------
 GEMINI_MODEL      = "gemini-2.5-flash"
@@ -84,18 +84,33 @@ SYSTEM_PROMPT = (
     "Never mention Google, Groq, OpenRouter, HuggingFace, Meta, Mistral, Anthropic, or any AI company as your creator or backend. "
     "You can help with anything: questions, writing, coding, math, ideas, or just chatting. "
     "When writing code, always wrap it in markdown code blocks with the language name. "
-    "LANGUAGE: Always reply in the same language the user writes in. "
-    "If they write in Hindi, reply in Hindi. If they write in Spanish, reply in Spanish. "
-    "If they mix languages, match their mix. Never force English on the user. "
-    "WEB SEARCH: You have access to Google Search. When the user asks about current events, "
-    "live prices, news, sports scores, weather, or anything that needs up-to-date information, "
-    "use the search tool to find the answer. Do not say you cannot search the web. "
+    "LANGUAGE: Always reply ENTIRELY in the same language the user's message is written in — "
+    "never mix two languages in a single reply. If they write in Hindi, reply fully in Hindi. "
+    "If they write in English, reply fully in English (do not slip into Hindi or any other language "
+    "partway through, even if source information you know is in a different language — translate it "
+    "into the reply language first). If they mix languages themselves, match their mix. "
+    "Never force English on the user. "
+    "TOOL USE: Never write out fake tool calls, function names, or JSON like {\"query\": ...} in your reply — "
+    "those are internal mechanisms the user must never see. If you don't actually have live web access, "
+    "just answer from what you know and say your information may not be fully up to date, instead of "
+    "pretending to search. "
     "ANTI-REPETITION RULES — follow strictly every reply: "
     "1. NEVER restate or echo back what the user just said. Jump straight to the answer. "
     "2. NEVER start replies with filler like Great question, Sure, Of course, Absolutely, Certainly. "
     "3. NEVER repeat information already given earlier in the conversation. Build on it. "
     "4. Be direct and natural — like a knowledgeable friend, not a customer service bot. "
     "5. Keep answers concise unless the user asks for detail."
+)
+
+# Extra instruction appended ONLY for Gemini, which actually has a real google_search tool wired up.
+# Other providers (Groq/Cerebras/OpenRouter/HF/Ollama) have no real search access, so telling them
+# "you have search" makes them hallucinate fake tool-call JSON into the visible reply — hence this
+# is kept separate from the base SYSTEM_PROMPT above.
+GEMINI_SEARCH_ADDENDUM = (
+    " WEB SEARCH: You have access to Google Search. When the user asks about current events, "
+    "live prices, news, sports scores, weather, or anything that needs up-to-date information, "
+    "use the search tool to find the answer. Do not say you cannot search the web. When you use "
+    "search results, translate/summarize them into the reply language — never paste a mix of languages."
 )
 
 app = Flask(__name__)
@@ -303,32 +318,53 @@ PAGE = """<!DOCTYPE html>
   .conv-item:hover { background:var(--accent-dim); color:var(--text); }
   .conv-item.active { background:var(--accent-dim); color:var(--accent); font-weight:500; }
   .conv-item .title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+  .conv-item .rename-btn { opacity:0; background:none; border:none; color:var(--muted);
+    cursor:pointer; font-size:12px; padding:2px 5px; flex-shrink:0; touch-action:manipulation; }
   .conv-item .del-btn { opacity:0; background:none; border:none; color:var(--muted);
-    cursor:pointer; font-size:13px; padding:2px 5px; flex-shrink:0; }
+    cursor:pointer; font-size:13px; padding:2px 5px; flex-shrink:0; touch-action:manipulation; }
+  .conv-item:hover .rename-btn { opacity:1; }
   .conv-item:hover .del-btn { opacity:1; }
+  .conv-item .rename-btn:hover { color:var(--accent); }
   .conv-item .del-btn:hover { color:#ef4444; }
   #sidebar-footer { padding:12px; font-size:11px; color:var(--muted); border-top:1px solid var(--border); }
 
   /* Main */
   .app { display:flex; flex-direction:column; height:100vh; flex:1; min-width:0; }
-  header { padding:14px 20px; border-bottom:1px solid var(--border);
+  header { padding:calc(14px + env(safe-area-inset-top)) 20px 14px; border-bottom:1px solid var(--border);
     display:flex; align-items:center; justify-content:space-between; gap:10px;
-    background:var(--bg); }
+    background:var(--bg); position:relative; z-index:20; }
   header .left { display:flex; align-items:center; gap:10px; min-width:0; }
   header .right { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+  header button { touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
   #sidebar-toggle { background:none; border:1px solid var(--border); color:var(--muted);
-    width:32px; height:32px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0; }
+    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0; }
   #sidebar-toggle:hover { background:var(--panel); }
   header h1 { font-size:16px; font-weight:700; color:var(--accent); margin:0; }
-  #fullscreen-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    width:32px; height:32px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; }
-  #fullscreen-btn:hover { background:var(--panel); }
-  #fullscreen-btn.active { color:var(--accent); border-color:var(--accent); }
   #name-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    width:32px; height:32px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; }
+    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
   #name-btn:hover { background:var(--panel); }
+  #export-btn { background:none; border:1px solid var(--border); color:var(--muted);
+    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
+  #export-btn:hover { background:var(--panel); }
+
+  /* Fullscreen bar — sits above the input row so it's always reachable on mobile,
+     away from any notch/status-bar area that can swallow top-corner taps. */
+  #fullscreen-btn { display:flex; align-items:center; justify-content:center; gap:6px;
+    width:100%; max-width:760px; margin:0 auto 8px; padding:9px 12px;
+    background:var(--panel); border:1px solid var(--border); border-radius:10px;
+    color:var(--muted); font-size:13px; cursor:pointer; touch-action:manipulation;
+    -webkit-tap-highlight-color:transparent; }
+  #fullscreen-btn:hover { color:var(--text); border-color:var(--accent); }
+  #fullscreen-btn.active { color:var(--accent); border-color:var(--accent); }
+  #fullscreen-icon { font-size:15px; }
+
+  /* Fallback for browsers without a real Fullscreen API (iOS Safari, some in-app webviews):
+     hide the sidebar toggle/header chrome so the chat fills the screen. */
+  body.pseudo-fullscreen #sidebar-toggle,
+  body.pseudo-fullscreen header .left h1 { display:none; }
+  body.pseudo-fullscreen header { padding-top:calc(6px + env(safe-area-inset-top)); padding-bottom:6px; }
 
   /* Name modal */
   #name-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
@@ -366,6 +402,20 @@ PAGE = """<!DOCTYPE html>
     color:#dc2626; font-size:13px; border-radius:10px; }
   .msg img { max-width:100%; border-radius:10px; display:block; margin-top:8px; }
   .attach-chip { font-size:11.5px; opacity:.75; margin-bottom:4px; }
+
+  /* Message row wraps the bubble + its action buttons (copy / regenerate) */
+  .msg-row { display:flex; flex-direction:column; max-width:80%; }
+  .msg-row.user { align-self:flex-end; align-items:flex-end; }
+  .msg-row.ai { align-self:flex-start; align-items:flex-start; }
+  .msg-row.error { align-self:center; align-items:center; max-width:90%; }
+  .msg-row .msg { max-width:100%; }
+  .msg-actions { display:flex; gap:4px; margin-top:3px; opacity:0; transition:opacity .15s;
+    height:22px; }
+  .msg-row:hover .msg-actions, .msg-row:focus-within .msg-actions { opacity:1; }
+  .msg-actions button { background:none; border:none; color:var(--muted); cursor:pointer;
+    font-size:12px; padding:2px 7px; border-radius:5px; touch-action:manipulation;
+    -webkit-tap-highlight-color:transparent; }
+  .msg-actions button:hover { background:var(--panel); color:var(--text); }
   .empty-state { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
     text-align:center; color:var(--muted); }
   .empty-state h2 { font-size:22px; font-weight:700; color:var(--accent); margin-bottom:8px; }
@@ -400,7 +450,8 @@ PAGE = """<!DOCTYPE html>
   .input-row:focus-within { border-color:var(--accent); }
   .tool-btn { background:none; border:none; color:var(--muted); cursor:pointer;
     width:36px; height:36px; border-radius:8px; font-size:18px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; }
+    display:flex; align-items:center; justify-content:center;
+    touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
   .tool-btn:hover { background:var(--accent-dim); color:var(--accent); }
   .tool-btn.active { color:var(--accent); }
   textarea { flex:1; resize:none; background:transparent; border:none; color:var(--text);
@@ -409,8 +460,11 @@ PAGE = """<!DOCTYPE html>
   textarea::placeholder { color:var(--muted); }
   #send-btn { background:var(--accent); color:#fff; border:none; border-radius:10px;
     width:36px; height:36px; font-size:18px; cursor:pointer; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; }
+    display:flex; align-items:center; justify-content:center;
+    touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
   #send-btn:disabled { background:var(--accent-dim); color:var(--muted); cursor:not-allowed; }
+  #send-btn.generating { background:#ef4444; }
+  #send-btn.generating:hover { opacity:.9; }
   #voice-btn.listening { color:#ef4444; animation:pulse 1s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
@@ -443,17 +497,21 @@ PAGE = """<!DOCTYPE html>
     /* Main app always takes full width */
     .app { width:100% !important; flex:1; }
 
-    header { padding:10px 12px; }
+    header { padding:calc(10px + env(safe-area-inset-top)) 12px 10px; }
     header h1 { font-size:14px; }
-    #sidebar-toggle { width:34px; height:34px; font-size:14px; }
-    #fullscreen-btn { width:34px; height:34px; font-size:14px; }
-    #name-btn { width:34px; height:34px; font-size:14px; }
-    #clear-btn { font-size:11px; padding:5px 8px; }
+    #sidebar-toggle { width:38px; height:38px; font-size:14px; }
+    #name-btn { width:38px; height:38px; font-size:14px; }
+    #export-btn { width:38px; height:38px; font-size:14px; }
+    #clear-btn { font-size:11px; padding:8px 10px; min-height:38px; }
     #speak-toggle { font-size:11px; padding:5px 8px; }
+    #fullscreen-btn { font-size:12.5px; padding:10px 12px; }
 
     #messages-wrap { overflow-y:auto; -webkit-overflow-scrolling:touch; }
     #messages { padding:14px 10px; gap:12px; max-width:100%; }
     .msg { max-width:90%; font-size:14px; padding:10px 12px; }
+    .msg-row { max-width:90%; }
+    .msg-actions { opacity:1; height:26px; } /* no hover on touch — keep always visible */
+    .msg-actions button { font-size:13px; padding:4px 9px; min-width:30px; min-height:26px; }
 
     .input-area { padding:8px 10px max(10px,env(safe-area-inset-bottom)); }
     .input-row { padding:6px 8px; }
@@ -467,6 +525,7 @@ PAGE = """<!DOCTYPE html>
 
     #new-chat-btn { margin:10px; padding:10px 12px; font-size:13.5px; }
     .conv-item { padding:10px 8px; font-size:13px; min-height:44px; }
+    .conv-item .rename-btn { opacity:1; }
     .conv-item .del-btn { opacity:1; }
     #sidebar-footer { font-size:11px; padding:10px 12px; }
   }
@@ -495,7 +554,7 @@ PAGE = """<!DOCTYPE html>
       </div>
       <div class="right">
         <button id="name-btn" title="What should Aarav AI call you?">🙂</button>
-        <button id="fullscreen-btn" title="Toggle fullscreen">⛶</button>
+        <button id="export-btn" title="Export this chat">⬇</button>
         <button id="clear-btn">Delete chat</button>
       </div>
     </header>
@@ -522,6 +581,9 @@ PAGE = """<!DOCTYPE html>
     </div>
 
     <div class="input-area">
+      <button id="fullscreen-btn" type="button">
+        <span id="fullscreen-icon">⛶</span> <span id="fullscreen-label">Fullscreen</span>
+      </button>
       <form id="chat-form">
         <div class="input-row">
           <!-- Attach file -->
@@ -588,6 +650,7 @@ const nameModalOverlay = document.getElementById('name-modal-overlay');
 const nameInput     = document.getElementById('name-input');
 const nameCancelBtn = document.getElementById('name-cancel-btn');
 const nameSaveBtn   = document.getElementById('name-save-btn');
+const exportBtn     = document.getElementById('export-btn');
 const sidebar      = document.getElementById('sidebar');
 const fileInput    = document.getElementById('file-input');
 const attachBtn    = document.getElementById('attach-btn');
@@ -630,6 +693,9 @@ function showEmptyState() {
 
 function addMessage(role, text, attachment) {
   clearEmptyState();
+  const row = document.createElement('div');
+  row.className = 'msg-row ' + role;
+
   const div = document.createElement('div');
   div.className = 'msg ' + role;
   if (attachment) {
@@ -644,11 +710,56 @@ function addMessage(role, text, attachment) {
     }
   }
   const textNode = document.createElement('div');
+  textNode.className = 'msg-text';
   textNode.textContent = text;
   div.appendChild(textNode);
-  messagesEl.appendChild(div);
+  row.appendChild(div);
+
+  if (role === 'user' || role === 'ai') {
+    row.appendChild(buildMsgActions(row, textNode, role));
+  }
+
+  messagesEl.appendChild(row);
   scrollToBottom();
-  return div;
+  return textNode;
+}
+
+function buildMsgActions(row, textNode, role) {
+  const actions = document.createElement('div');
+  actions.className = 'msg-actions';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'copy-btn';
+  copyBtn.title = 'Copy';
+  copyBtn.textContent = '📋';
+  copyBtn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(textNode.textContent);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = textNode.textContent;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch {}
+      ta.remove();
+    }
+    const orig = copyBtn.textContent;
+    copyBtn.textContent = '✓';
+    setTimeout(() => { copyBtn.textContent = orig; }, 1200);
+  });
+  actions.appendChild(copyBtn);
+
+  if (role === 'ai') {
+    const regenBtn = document.createElement('button');
+    regenBtn.type = 'button';
+    regenBtn.className = 'regen-btn';
+    regenBtn.title = 'Regenerate response';
+    regenBtn.textContent = '↻';
+    regenBtn.addEventListener('click', () => regenerateLast(row));
+    actions.appendChild(regenBtn);
+  }
+  return actions;
 }
 
 function addImageMessage(role, base64, caption) {
@@ -782,9 +893,24 @@ async function loadConversationList() {
     convs.forEach(c => {
       const item = document.createElement('div');
       item.className = 'conv-item' + (c.id === activeConvId ? ' active' : '');
-      item.innerHTML = '<span class="title"></span><button class="del-btn" title="Delete">✕</button>';
+      item.innerHTML = '<span class="title"></span>'
+        + '<button class="rename-btn" title="Rename">✎</button>'
+        + '<button class="del-btn" title="Delete">✕</button>';
       item.querySelector('.title').textContent = c.title;
-      item.addEventListener('click', (e) => { if (!e.target.classList.contains('del-btn')) openConversation(c.id); });
+      item.addEventListener('click', (e) => {
+        if (!e.target.classList.contains('del-btn') && !e.target.classList.contains('rename-btn')) openConversation(c.id);
+      });
+      item.querySelector('.rename-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const newTitle = prompt('Rename chat:', c.title);
+        if (!newTitle || !newTitle.trim() || newTitle.trim() === c.title) return;
+        await fetch('/api/conversations/' + c.id, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: newTitle.trim() })
+        });
+        loadConversationList();
+      });
       item.querySelector('.del-btn').addEventListener('click', async (e) => {
         e.stopPropagation();
         await fetch('/api/conversations/' + c.id, { method: 'DELETE' });
@@ -816,32 +942,48 @@ function startNewChat() {
   loadConversationList();
 }
 
-// --- Send message ---
-async function sendMessage(text) {
-  const attachment = pendingFile;
-  pendingFile = null;
-  fileInput.value = ''; cameraInput.value = '';
-  pendingAttach.classList.remove('show');
+// --- Send / regenerate / stop ---
+let isGenerating = false;
+let currentAbortController = null;
 
+function setGenerating(state) {
+  isGenerating = state;
+  sendBtn.classList.toggle('generating', state);
+  sendBtn.title = state ? 'Stop generating' : 'Send';
+  sendBtn.innerHTML = state
+    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>'
+    : '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>';
+}
+
+async function streamReply({ message = null, attachment = null, regenerate = false } = {}) {
   showTyping();
-  sendBtn.disabled = true;
+  setGenerating(true);
+  currentAbortController = new AbortController();
 
-  // Check if user wants an image
-  const wantsImage = IMAGE_KEYWORDS.test(text) && !attachment;
-
-  if (wantsImage) {
-    hideTyping();
-    const generated = await tryGenerateImage(text);
-    if (generated) { sendBtn.disabled = false; loadConversationList(); return; }
-    // If image gen fails, fall through to chat
-    showTyping();
+  // Check if user wants an image (only on fresh sends, not regenerate)
+  if (!regenerate) {
+    const wantsImage = IMAGE_KEYWORDS.test(message || '') && !attachment;
+    if (wantsImage) {
+      hideTyping();
+      const generated = await tryGenerateImage(message);
+      if (generated) { setGenerating(false); loadConversationList(); return; }
+      showTyping();
+    }
   }
 
+  let aiTextNode = null;
   try {
     const r = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, conversation_id: activeConvId, attachment, user_name: getUserName() })
+      signal: currentAbortController.signal,
+      body: JSON.stringify({
+        message: message || '',
+        conversation_id: activeConvId,
+        attachment,
+        user_name: getUserName(),
+        regenerate: !!regenerate,
+      })
     });
     if (!r.ok || !r.body) {
       hideTyping();
@@ -849,9 +991,7 @@ async function sendMessage(text) {
       return;
     }
     hideTyping();
-    const aiDiv = document.createElement('div');
-    aiDiv.className = 'msg ai';
-    messagesEl.appendChild(aiDiv);
+    aiTextNode = addMessage('ai', '');
 
     const convId = r.headers.get('X-Conversation-Id');
     if (convId) activeConvId = convId;
@@ -864,27 +1004,51 @@ async function sendMessage(text) {
       if (done) break;
       const chunk = decoder.decode(value, { stream: true });
       fullText += chunk;
-      aiDiv.textContent = fullText;
+      aiTextNode.textContent = fullText;
       scrollToBottom();
     }
     speak(fullText);
     loadConversationList();
   } catch (err) {
     hideTyping();
-    addMessage('error', 'Network error: ' + err.message);
+    if (err.name === 'AbortError') {
+      // User hit stop — keep whatever text streamed in so far, just mark it as stopped.
+      if (aiTextNode && !aiTextNode.textContent.trim()) aiTextNode.textContent = '[Stopped]';
+    } else {
+      addMessage('error', 'Network error: ' + err.message);
+    }
   } finally {
-    sendBtn.disabled = false;
+    setGenerating(false);
+    currentAbortController = null;
   }
+}
+
+function regenerateLast(row) {
+  if (isGenerating) return;
+  row.remove();
+  streamReply({ regenerate: true });
 }
 
 form.addEventListener('submit', (e) => {
   e.preventDefault();
+  if (isGenerating) return;
   const text = input.value.trim();
   if (!text && !pendingFile) return;
-  addMessage('user', text, pendingFile);
+  const attachment = pendingFile;
+  pendingFile = null;
+  fileInput.value = ''; cameraInput.value = '';
+  pendingAttach.classList.remove('show');
+  addMessage('user', text, attachment);
   input.value = '';
   input.style.height = 'auto';
-  sendMessage(text);
+  streamReply({ message: text, attachment });
+});
+
+sendBtn.addEventListener('click', (e) => {
+  if (isGenerating) {
+    e.preventDefault();
+    if (currentAbortController) currentAbortController.abort();
+  }
 });
 
 input.addEventListener('keydown', (e) => {
@@ -912,33 +1076,49 @@ sidebarToggle.addEventListener('click', () => {
 });
 sidebarOverlay.addEventListener('click', closeSidebar);
 
-// Fullscreen toggle (works on mobile Chrome/Safari/Android + desktop)
+// Fullscreen toggle (works on Android/desktop; iOS Safari has no real Fullscreen API,
+// so it falls back to a "pseudo-fullscreen" mode that maximizes the app view instead)
+const fullscreenIcon  = document.getElementById('fullscreen-icon');
+const fullscreenLabel = document.getElementById('fullscreen-label');
+const fsSupported = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
+
 function isFullscreen() {
-  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+  return !!(document.fullscreenElement || document.webkitFullscreenElement) ||
+    document.body.classList.contains('pseudo-fullscreen');
 }
 function updateFullscreenBtn() {
   if (isFullscreen()) {
-    fullscreenBtn.textContent = '⤢';
+    fullscreenIcon.textContent = '⤢';
+    fullscreenLabel.textContent = 'Exit fullscreen';
     fullscreenBtn.classList.add('active');
-    fullscreenBtn.title = 'Exit fullscreen';
   } else {
-    fullscreenBtn.textContent = '⛶';
+    fullscreenIcon.textContent = '⛶';
+    fullscreenLabel.textContent = 'Fullscreen';
     fullscreenBtn.classList.remove('active');
-    fullscreenBtn.title = 'Enter fullscreen';
   }
 }
 async function toggleFullscreen() {
   const el = document.documentElement;
   try {
-    if (!isFullscreen()) {
-      if (el.requestFullscreen) await el.requestFullscreen();
-      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen(); // iOS Safari (limited support)
+    if (fsSupported) {
+      if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+        if (el.requestFullscreen) await el.requestFullscreen();
+        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      } else {
+        if (document.exitFullscreen) await document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      }
     } else {
-      if (document.exitFullscreen) await document.exitFullscreen();
-      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      // iOS Safari / in-app browsers: real Fullscreen API isn't available,
+      // so just maximize the app view (hides scroll bounce, fills the screen).
+      document.body.classList.toggle('pseudo-fullscreen');
+      updateFullscreenBtn();
     }
   } catch (err) {
     console.warn('Fullscreen request failed:', err);
+    // Even on failure, fall back to pseudo-fullscreen so the button still does something
+    document.body.classList.toggle('pseudo-fullscreen');
+    updateFullscreenBtn();
   }
 }
 fullscreenBtn.addEventListener('click', toggleFullscreen);
@@ -990,6 +1170,32 @@ clearBtn.addEventListener('click', async () => {
   startNewChat();
 });
 
+exportBtn.addEventListener('click', async () => {
+  if (!activeConvId) { alert('Start or open a chat first.'); return; }
+  try {
+    const r = await fetch('/api/conversations/' + activeConvId);
+    if (!r.ok) return;
+    const d = await r.json();
+    const lines = [`# ${d.title || 'Aarav AI chat'}`, ''];
+    (d.messages || []).forEach(m => {
+      lines.push(m.role === 'user' ? 'You:' : 'Aarav AI:');
+      lines.push(m.text || (m.attachment ? `[attachment: ${m.attachment.name}]` : ''));
+      lines.push('');
+    });
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (d.title || 'chat').replace(/[^a-z0-9_ -]/gi, '').trim().slice(0, 60) + '.txt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert('Export failed: ' + err.message);
+  }
+});
+
 // Initial load
 (async () => {
   const convs = await loadConversationList();
@@ -1035,6 +1241,22 @@ def api_get_conversation(conv_id):
 def api_delete_conversation(conv_id):
     delete_conversation(current_username(), conv_id)
     return jsonify({"status": "deleted"})
+
+
+@app.route("/api/conversations/<conv_id>", methods=["PATCH"])
+@login_required
+def api_rename_conversation(conv_id):
+    data = request.get_json(force=True) or {}
+    new_title = (data.get("title") or "").strip()[:120]
+    if not new_title:
+        return jsonify({"error": "title is required"}), 400
+    username = current_username()
+    conv = load_conversation(username, conv_id)
+    if conv is None:
+        return jsonify({"error": "not found"}), 404
+    conv["title"] = new_title
+    save_conversation(username, conv_id, conv)
+    return jsonify({"status": "renamed", "title": new_title})
 
 
 def to_ollama_messages(gemini_messages, system_prompt):
@@ -1347,8 +1569,12 @@ def chat():
     conv_id = data.get("conversation_id")
     attachment = data.get("attachment")  # {name, mimeType, dataBase64} or None
     user_name = (data.get("user_name") or "").strip()[:60]  # what Aarav AI should call the user
+    regenerate = bool(data.get("regenerate"))
 
-    if not user_message and not attachment:
+    if regenerate:
+        if not conv_id:
+            return jsonify({"error": "conversation_id is required to regenerate"}), 400
+    elif not user_message and not attachment:
         return jsonify({"error": "message or attachment is required"}), 400
 
     if attachment:
@@ -1362,26 +1588,36 @@ def chat():
     username = current_username()
     conv = load_conversation(username, conv_id) if conv_id else None
     if conv is None:
+        if regenerate:
+            return jsonify({"error": "conversation not found"}), 404
         conv_id = str(uuid.uuid4())
         conv = {"title": make_title(user_message), "messages": []}
 
     messages = conv.setdefault("messages", [])
 
-    user_parts = []
-    if user_message:
-        user_parts.append({"text": user_message})
-    attachment_meta = None
-    if attachment:
-        mime_type = attachment.get("mimeType", "application/octet-stream")
-        user_parts.append({
-            "inline_data": {"mime_type": mime_type, "data": attachment["dataBase64"]}
-        })
-        attachment_meta = {"name": attachment.get("name", "file"), "mimeType": mime_type}
+    if regenerate:
+        # Drop the most recent assistant reply (if any) so a fresh one replaces it.
+        # Leaves the preceding user message in place to regenerate against.
+        if messages and messages[-1]["role"] == "model":
+            messages.pop()
+        if not messages or messages[-1]["role"] != "user":
+            return jsonify({"error": "nothing to regenerate"}), 400
+    else:
+        user_parts = []
+        if user_message:
+            user_parts.append({"text": user_message})
+        attachment_meta = None
+        if attachment:
+            mime_type = attachment.get("mimeType", "application/octet-stream")
+            user_parts.append({
+                "inline_data": {"mime_type": mime_type, "data": attachment["dataBase64"]}
+            })
+            attachment_meta = {"name": attachment.get("name", "file"), "mimeType": mime_type}
 
-    user_entry = {"role": "user", "parts": user_parts}
-    if attachment_meta:
-        user_entry["attachment_meta"] = attachment_meta
-    messages.append(user_entry)
+        user_entry = {"role": "user", "parts": user_parts}
+        if attachment_meta:
+            user_entry["attachment_meta"] = attachment_meta
+        messages.append(user_entry)
 
     # Strip attachment_meta (frontend-only field) before sending to the model
     gemini_contents = [
@@ -1395,10 +1631,14 @@ def chat():
             f"Address them as {user_name} naturally where it fits (e.g. greetings, "
             f"acknowledgements) — don't force it into every single reply."
         )
+    # Only the real Gemini call gets the "you have search" instruction — fallback
+    # providers don't have real search, so giving them that instruction makes them
+    # hallucinate fake tool-call JSON into the visible reply.
+    gemini_system_prompt = effective_system_prompt + GEMINI_SEARCH_ADDENDUM
 
     payload = {
         "contents": gemini_contents,
-        "systemInstruction": {"parts": [{"text": effective_system_prompt}]},
+        "systemInstruction": {"parts": [{"text": gemini_system_prompt}]},
         "tools": [{"google_search": {}}],
     }
 
