@@ -1,3 +1,18 @@
+# Mobile-friendly CSS injection helper
+MOBILE_CSS = '''
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+*{box-sizing:border-box}
+body{margin:0}
+@media (max-width:768px){
+.sidebar{width:100%!important;position:relative!important}
+.chat-container,.main-content{width:100%!important;margin:0!important;padding:10px!important}
+.message{max-width:95%!important;font-size:16px!important}
+input,textarea,button{font-size:16px!important}
+}
+</style>
+'''
+
 """
 Aarav AI — single file, powered by Google's Gemini API or a local Ollama model.
 
@@ -41,33 +56,32 @@ import time
 import base64
 import requests
 from flask import (
-    Flask, request, jsonify, Response, session,
-    stream_with_context
+    Flask, request, jsonify, Response, session, redirect,
+    url_for, stream_with_context
 )
+from werkzeug.security import generate_password_hash, check_password_hash
 
 PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
-# "auto"        = round-robin: Groq → OpenRouter → HuggingFace (all work on servers)
-# "gemini"      = Google Gemini only (free tier only works locally, not on Render)
+# "auto"        = try Gemini → Groq → OpenRouter → HuggingFace in order (recommended)
+# "gemini"      = Google Gemini only
 # "groq"        = Groq only
 # "openrouter"  = OpenRouter only
-# "huggingface" = Hugging Face only
-# "ollama"      = local Ollama only
+# "huggingface" = Hugging Face Inference API only
+# "ollama"      = local Ollama only (no internet/key needed)
 
 # --- API Keys (hardcoded fallbacks — override via environment variables) ------
 # WARNING: don't commit a file with real keys to a public GitHub repo.
 # Set these as environment variables on Render instead.
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY",    "AQ.Ab8RN6ISxMXytCp9aRuWkXQ8YvXh2HRQYncggoM6jTPzxJe5Ag")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY",    "AQ.Ab8RN6IilW_rW7qo0jh1JKfH1Hw3XVMxiFXA8y3aJZ5LyIH0pg")
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "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")
-CEREBRAS_API_KEY  = os.environ.get("CEREBRAS_API_KEY",  "csk-2ph5f5nxt3jrtwj5edcehpr5xh96628268fvjh4e658m4t6h")
-OPENROUTER_API_KEY= os.environ.get("OPENROUTER_API_KEY","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")
+OPENROUTER_API_KEY= os.environ.get("OPENROUTER_API_KEY","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")
 HF_API_KEY        = os.environ.get("HF_API_KEY",        "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")
 
 # --- Model names -------------------------------------------------------------
 GEMINI_MODEL      = "gemini-2.5-flash"
-GROQ_MODEL        = os.environ.get("GROQ_MODEL",        "llama-3.1-8b-instant")
-OPENROUTER_MODEL  = os.environ.get("OPENROUTER_MODEL",  "google/gemma-3-4b-it:free")
+GROQ_MODEL        = os.environ.get("GROQ_MODEL",        "llama-3.3-70b-versatile")
+OPENROUTER_MODEL  = os.environ.get("OPENROUTER_MODEL",  "mistralai/mistral-7b-instruct:free")
 HF_MODEL          = os.environ.get("HF_MODEL",          "mistralai/Mistral-7B-Instruct-v0.3")
-CEREBRAS_MODEL    = os.environ.get("CEREBRAS_MODEL",    "gpt-oss-120b")
 OLLAMA_MODEL      = os.environ.get("OLLAMA_MODEL",       "llama3.1")
 OLLAMA_URL        = os.environ.get("OLLAMA_URL",         "http://localhost:11434").rstrip("/")
 
@@ -79,23 +93,15 @@ GEMINI_STREAM_URL = (
 API_KEY = GEMINI_API_KEY
 MODEL   = GEMINI_MODEL
 SYSTEM_PROMPT = (
-    "You are Aarav AI, a smart and friendly AI assistant made by Aarav Singh. "
-    "If asked who made you, say you are Aarav AI made by Aarav Singh — say it once naturally, never repeat it unprompted. "
-    "Never mention Google, Groq, OpenRouter, HuggingFace, Meta, Mistral, Anthropic, or any AI company as your creator or backend. "
-    "You can help with anything: questions, writing, coding, math, ideas, or just chatting. "
-    "When writing code, always wrap it in markdown code blocks with the language name. "
-    "LANGUAGE: Always reply in the same language the user writes in. "
-    "If they write in Hindi, reply in Hindi. If they write in Spanish, reply in Spanish. "
-    "If they mix languages, match their mix. Never force English on the user. "
-    "WEB SEARCH: You have access to Google Search. When the user asks about current events, "
-    "live prices, news, sports scores, weather, or anything that needs up-to-date information, "
-    "use the search tool to find the answer. Do not say you cannot search the web. "
-    "ANTI-REPETITION RULES — follow strictly every reply: "
-    "1. NEVER restate or echo back what the user just said. Jump straight to the answer. "
-    "2. NEVER start replies with filler like Great question, Sure, Of course, Absolutely, Certainly. "
-    "3. NEVER repeat information already given earlier in the conversation. Build on it. "
-    "4. Be direct and natural — like a knowledgeable friend, not a customer service bot. "
-    "5. Keep answers concise unless the user asks for detail."
+    "You are Aarav AI, a friendly, helpful AI assistant created by Aarav Singh. "
+    "If asked who made you, who your creator/owner/developer is, or who you belong to, "
+    "always say you were created by Aarav Singh — never mention Google, OpenAI, Anthropic, "
+    "or any other company as your creator. "
+    "You can chat about anything — answer questions, help with writing, brainstorm ideas, "
+    "explain things, or just talk. Keep a warm, casual, conversational tone, like chatting "
+    "with a knowledgeable friend. Be clear and helpful without being overly formal or stiff. "
+    "You have access to a Google Search tool and can look up current information when needed. "
+    "You can also see images and files the user attaches."
 )
 
 app = Flask(__name__)
@@ -121,25 +127,74 @@ def sb(path):
 
 # --- User accounts (Supabase: users table) -----------------------------------
 
+def load_users():
+    if not SUPABASE_URL:
+        return _load_users_file()
+    try:
+        r = requests.get(sb("users"), headers=sb_headers(), timeout=10)
+        if r.status_code == 200:
+            return {u["username"]: u for u in r.json()}
+    except Exception:
+        pass
+    return {}
+
+def save_user(username, password_hash):
+    if not SUPABASE_URL:
+        users = _load_users_file()
+        users[username] = {"username": username, "password_hash": password_hash}
+        _save_users_file(users)
+        return
+    try:
+        requests.post(sb("users"), headers=sb_headers(),
+            json={"username": username, "password_hash": password_hash}, timeout=10)
+    except Exception:
+        pass
+
+# File fallbacks (used locally when SUPABASE_URL not set)
+import os as _os
+_BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
+_DATA_DIR = _os.path.join(_BASE_DIR, "chat_data")
+_os.makedirs(_DATA_DIR, exist_ok=True)
+_USERS_FILE = _os.path.join(_DATA_DIR, "users.json")
+
+def _load_users_file():
+    if not _os.path.exists(_USERS_FILE):
+        return {}
+    try:
+        with open(_USERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_users_file(users):
+    with open(_USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
+def save_users(users):
+    """Legacy helper kept for compatibility — saves all users at once."""
+    if not SUPABASE_URL:
+        _save_users_file(users)
+        return
+    for username, u in users.items():
+        save_user(username, u["password_hash"])
+
+
 def current_username():
-    """Each visitor gets a unique anonymous ID stored in their browser cookie.
-    No login required — conversations are private per browser session."""
-    if "user_id" not in session:
-        session["user_id"] = str(uuid.uuid4())
-        session.permanent = True
-    return session["user_id"]
+    return session.get("username")
 
 
 def login_required(view):
-    """No-op decorator kept so all @login_required routes still work unchanged."""
     def wrapped(*args, **kwargs):
-        current_username()  # ensure session id is set
+        if not current_username():
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "not logged in"}), 401
+            return redirect(url_for("login_page"))
         return view(*args, **kwargs)
     wrapped.__name__ = view.__name__
     return wrapped
 
 
-# --- Supabase / file storage helpers ----------------------------------------
+# --- Persistent per-user, multi-conversation storage (Supabase) --------------
 
 def list_conversations(username):
     if not SUPABASE_URL:
@@ -215,10 +270,6 @@ def delete_conversation(username, conv_id):
 
 
 # --- Local file fallbacks for when Supabase is not configured ----------------
-import os as _os
-_BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
-_DATA_DIR = _os.path.join(_BASE_DIR, "chat_data")
-_os.makedirs(_DATA_DIR, exist_ok=True)
 
 def _user_conv_dir(username):
     path = _os.path.join(_DATA_DIR, "conversations", username)
@@ -271,6 +322,143 @@ def make_title(first_message):
 
 # --- HTML pages ----------------------------------------------------------
 
+AUTH_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aarav AI — {mode_title}</title>
+<style>
+  :root {{ --bg:#0e0f11; --panel:#17181b; --border:#2a2c30; --text:#e8e6e1;
+    --muted:#8b8d92; --accent:#d97757; }}
+  * {{ box-sizing:border-box; }}
+  html,body {{ height:100%; margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+    display:flex; align-items:center; justify-content:center; }}
+  .card {{ background:var(--panel); border:1px solid var(--border); border-radius:14px;
+    padding:32px; width:100%; max-width:340px; }}
+  .card h1 {{ font-size:17px; margin:0 0 4px; }}
+  .card .dot {{ display:inline-block; width:8px; height:8px; border-radius:50%;
+    background:var(--accent); margin-right:8px; }}
+  .card p.sub {{ color:var(--muted); font-size:13px; margin:0 0 22px; }}
+  label {{ font-size:12.5px; color:var(--muted); display:block; margin-bottom:6px; }}
+  input {{ width:100%; background:#0e0f11; border:1px solid var(--border); color:var(--text);
+    border-radius:8px; padding:10px 12px; font-size:14px; }}
+  input:focus {{ outline:none; border-color:var(--accent); }}
+  .pw-wrap {{ position:relative; margin-bottom:16px; }}
+  .pw-wrap input {{ padding-right:40px; margin-bottom:0; }}
+  .pw-toggle {{ position:absolute; right:8px; top:50%; transform:translateY(-50%);
+    background:none; border:none; color:var(--muted); cursor:pointer; font-size:15px;
+    padding:4px 6px; width:auto; }}
+  .pw-toggle:hover {{ color:var(--text); }}
+  .pw-toggle svg {{ width:18px; height:18px; display:block; }}
+  .username-wrap {{ margin-bottom:16px; }}
+  button[type="submit"] {{ width:100%; background:var(--accent); color:#1a1a1a; border:none; border-radius:8px;
+    padding:11px; font-size:14px; font-weight:600; cursor:pointer; }}
+  button[type="submit"]:hover {{ opacity:0.9; }}
+  .switch {{ text-align:center; margin-top:16px; font-size:13px; color:var(--muted); }}
+  .switch a {{ color:var(--accent); text-decoration:none; }}
+  .error {{ background:#3a1f1f; border:1px solid #6b3030; color:#f0b8b8; font-size:13px;
+    padding:9px 12px; border-radius:8px; margin-bottom:16px; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1><span class="dot"></span>Aarav AI</h1>
+    <p class="sub">{mode_title}</p>
+    {error_html}
+    <form method="POST">
+      <label>Username</label>
+      <div class="username-wrap">
+        <input type="text" name="username" required autofocus>
+      </div>
+      <label>Password</label>
+      <div class="pw-wrap">
+        <input type="password" name="password" id="pw-field" required
+          autocomplete="new-password" data-lpignore="true" data-1p-ignore
+          data-form-type="other" data-bwignore="true">
+        <button type="button" class="pw-toggle" id="pw-toggle" title="Show password">
+          <svg id="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>
+          <svg id="eye-closed" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-7-11-7a20.29 20.29 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a20.29 20.29 0 0 1-4 5.19M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+        </button>
+      </div>
+      <button type="submit">{mode_title}</button>
+    </form>
+    <div class="switch">{switch_html}</div>
+  </div>
+  <script>
+    const pwField = document.getElementById('pw-field');
+    const pwToggle = document.getElementById('pw-toggle');
+    const eyeOpen = document.getElementById('eye-open');
+    const eyeClosed = document.getElementById('eye-closed');
+    pwToggle.addEventListener('click', () => {{
+      const isHidden = pwField.type === 'password';
+      pwField.type = isHidden ? 'text' : 'password';
+      eyeOpen.style.display = isHidden ? 'none' : 'block';
+      eyeClosed.style.display = isHidden ? 'block' : 'none';
+      pwToggle.title = isHidden ? 'Hide password' : 'Show password';
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login_page():
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        users = load_users()
+        user = users.get(username)
+        if user and check_password_hash(user["password_hash"], password):
+            session["username"] = username
+            session.permanent = True
+            return redirect(url_for("index"))
+        error = "Wrong username or password."
+    error_html = f'<div class="error">{error}</div>' if error else ""
+    switch_html = 'New here? <a href="/register">Create an account</a>'
+    return Response(
+        AUTH_PAGE.format(mode_title="Log in", error_html=error_html, switch_html=switch_html),
+        mimetype="text/html",
+    )
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register_page():
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        if len(username) < 3:
+            error = "Username must be at least 3 characters."
+        elif len(password) < 6:
+            error = "Password must be at least 6 characters."
+        else:
+            users = load_users()
+            if username in users:
+                error = "That username is already taken."
+            else:
+                users[username] = {"password_hash": generate_password_hash(password)}
+                save_users(users)
+                session["username"] = username
+                session.permanent = True
+                return redirect(url_for("index"))
+    error_html = f'<div class="error">{error}</div>' if error else ""
+    switch_html = 'Already have an account? <a href="/login">Log in</a>'
+    return Response(
+        AUTH_PAGE.format(mode_title="Sign up", error_html=error_html, switch_html=switch_html),
+        mimetype="text/html",
+    )
+
+
+@app.route("/logout")
+def logout():
+    session.pop("username", None)
+    return redirect(url_for("login_page"))
+
+
 PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -279,617 +467,387 @@ PAGE = """<!DOCTYPE html>
 <title>Aarav AI</title>
 <style>
   :root {
-    --bg:#1a1a1a; --panel:#2a2a2a; --border:#3a3a3a;
-    --text:#ececec; --muted:#8e8ea0; --accent:#10a37f;
-    --accent-dim:#1a3a30; --user-bubble:#2a2a2a; --user-text:#ececec;
-    --ai-bubble:#1a1a1a; --sidebar-w:260px;
+    --bg: #0e0f11; --panel: #17181b; --border: #2a2c30;
+    --text: #e8e6e1; --muted: #8b8d92; --accent: #d97757;
+    --accent-dim: #4a2f26; --user-bubble: #262830; --ai-bubble: #1c1e22;
+    --sidebar-w: 260px;
   }
-  * { box-sizing:border-box; margin:0; padding:0; }
-  html,body { height:100%; background:var(--bg); color:var(--text);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif; overflow:hidden; }
-  .layout { display:flex; height:100vh; }
-
-  /* Sidebar */
-  #sidebar { width:var(--sidebar-w); flex-shrink:0; background:var(--panel);
-    border-right:1px solid var(--border); display:flex; flex-direction:column;
-    transition:margin-left .2s ease; }
-  #sidebar.hidden { margin-left:calc(-1 * var(--sidebar-w)); }
-  #new-chat-btn { margin:12px; padding:10px 14px; background:var(--accent); color:#fff;
-    border:none; border-radius:8px; font-size:13.5px; font-weight:600; cursor:pointer; text-align:left; }
-  #new-chat-btn:hover { opacity:.9; }
-  #conv-list { flex:1; overflow-y:auto; padding:0 8px; display:flex; flex-direction:column; gap:2px; }
-  .conv-item { display:flex; align-items:center; justify-content:space-between; gap:6px;
-    padding:9px 10px; border-radius:7px; cursor:pointer; font-size:13px; color:var(--muted); }
-  .conv-item:hover { background:var(--accent-dim); color:var(--text); }
-  .conv-item.active { background:var(--accent-dim); color:var(--accent); font-weight:500; }
-  .conv-item .title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
-  .conv-item .del-btn { opacity:0; background:none; border:none; color:var(--muted);
-    cursor:pointer; font-size:13px; padding:2px 5px; flex-shrink:0; }
-  .conv-item:hover .del-btn { opacity:1; }
-  .conv-item .del-btn:hover { color:#ef4444; }
-  #sidebar-footer { padding:12px; font-size:11px; color:var(--muted); border-top:1px solid var(--border); }
-
-  /* Main */
-  .app { display:flex; flex-direction:column; height:100vh; flex:1; min-width:0; }
-  header { padding:14px 20px; border-bottom:1px solid var(--border);
-    display:flex; align-items:center; justify-content:space-between; gap:10px;
-    background:var(--bg); }
-  header .left { display:flex; align-items:center; gap:10px; min-width:0; }
-  #sidebar-toggle { background:none; border:1px solid var(--border); color:var(--muted);
-    width:32px; height:32px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0; }
-  #sidebar-toggle:hover { background:var(--panel); }
-  header h1 { font-size:16px; font-weight:700; color:var(--accent); margin:0; }
-  #clear-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    font-size:12px; padding:6px 12px; border-radius:6px; cursor:pointer; flex-shrink:0; }
-  #clear-btn:hover { background:var(--panel); }
-
-  /* Messages */
-  #messages-wrap { flex:1; overflow-y:auto; position:relative; }
-  #messages { padding:24px 20px; display:flex; flex-direction:column; gap:16px;
-    max-width:760px; margin:0 auto; width:100%; min-height:100%; }
-  .msg { max-width:80%; padding:11px 15px; border-radius:18px; line-height:1.6;
-    font-size:14.5px; white-space:pre-wrap; word-wrap:break-word; }
-  .msg.user { align-self:flex-end; background:var(--user-bubble); color:var(--user-text);
-    border-bottom-right-radius:4px; }
-  .msg.ai { align-self:flex-start; background:var(--ai-bubble); color:var(--text);
-    border-bottom-left-radius:4px; }
-  .msg.error { align-self:center; background:#fef2f2; border:1px solid #fecaca;
-    color:#dc2626; font-size:13px; border-radius:10px; }
-  .msg img { max-width:100%; border-radius:10px; display:block; margin-top:8px; }
-  .attach-chip { font-size:11.5px; opacity:.75; margin-bottom:4px; }
-  .empty-state { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
-    text-align:center; color:var(--muted); }
-  .empty-state h2 { font-size:22px; font-weight:700; color:var(--accent); margin-bottom:8px; }
-  .empty-state p { font-size:14px; }
-  .typing { align-self:flex-start; display:flex; gap:5px; padding:14px 16px;
-    background:var(--ai-bubble); border-radius:18px; border-bottom-left-radius:4px; }
-  .typing span { width:7px; height:7px; border-radius:50%; background:var(--muted);
-    animation:blink 1.2s infinite ease-in-out; }
-  .typing span:nth-child(2) { animation-delay:.2s; }
-  .typing span:nth-child(3) { animation-delay:.4s; }
-  @keyframes blink { 0%,80%,100%{opacity:.2} 40%{opacity:1} }
-
-  /* Scroll to bottom */
-  #scroll-btn { position:fixed; bottom:130px; right:24px; width:36px; height:36px;
-    border-radius:50%; background:var(--accent); color:#fff; border:none; cursor:pointer;
-    font-size:18px; display:none; align-items:center; justify-content:center;
-    box-shadow:0 2px 8px rgba(0,0,0,.15); z-index:10; }
-  #scroll-btn.show { display:flex; }
-
-  /* Image preview */
-  .gen-img { max-width:320px; border-radius:12px; display:block; margin-top:8px; }
-
-  /* Input area */
-  #pending-attach { max-width:760px; margin:0 auto; width:100%; padding:6px 20px 0;
-    display:none; align-items:center; gap:8px; font-size:12.5px; color:var(--muted); }
-  #pending-attach.show { display:flex; }
-  #pending-attach button { background:none; border:none; color:var(--muted); cursor:pointer; }
-  .input-area { padding:10px 20px 16px; border-top:1px solid var(--border);
-    background:var(--bg); max-width:760px; margin:0 auto; width:100%; }
-  .input-row { display:flex; gap:8px; align-items:flex-end; background:var(--panel);
-    border:1.5px solid var(--border); border-radius:14px; padding:8px 10px; }
-  .input-row:focus-within { border-color:var(--accent); }
-  .tool-btn { background:none; border:none; color:var(--muted); cursor:pointer;
-    width:36px; height:36px; border-radius:8px; font-size:18px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; }
-  .tool-btn:hover { background:var(--accent-dim); color:var(--accent); }
-  .tool-btn.active { color:var(--accent); }
-  textarea { flex:1; resize:none; background:transparent; border:none; color:var(--text);
-    font-size:14.5px; font-family:inherit; line-height:1.4; max-height:140px;
-    outline:none; padding:4px 0; }
-  textarea::placeholder { color:var(--muted); }
-  #send-btn { background:var(--accent); color:#fff; border:none; border-radius:10px;
-    width:36px; height:36px; font-size:18px; cursor:pointer; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; }
-  #send-btn:disabled { background:var(--accent-dim); color:var(--muted); cursor:not-allowed; }
-  #voice-btn.listening { color:#ef4444; animation:pulse 1s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-
-  /* Speaking indicator */
-  #speaking-indicator { display:none; align-items:center; gap:6px; font-size:12px;
-    color:var(--accent); padding:4px 0; }
-  #speaking-indicator.show { display:flex; }
-  #stop-speak-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    font-size:11px; padding:2px 8px; border-radius:4px; cursor:pointer; }
-
-  #messages-wrap::-webkit-scrollbar, #conv-list::-webkit-scrollbar { width:6px; }
-  #messages-wrap::-webkit-scrollbar-thumb, #conv-list::-webkit-scrollbar-thumb
-    { background:var(--border); border-radius:4px; }
-  #sidebar-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
-    z-index:99; -webkit-tap-highlight-color:transparent; }
-
-  @media(max-width:768px) {
-    :root { --sidebar-w: 78vw; }
-
-    /* Sidebar slides in as overlay — never pushes content */
-    #sidebar { position:fixed; top:0; left:0; z-index:100; height:100%;
-      height:-webkit-fill-available; width:var(--sidebar-w) !important;
-      transform:translateX(0); transition:transform .25s ease;
-      box-shadow:4px 0 24px rgba(0,0,0,.5); }
-    #sidebar.hidden { transform:translateX(-105%); margin-left:0 !important; }
-
-    /* Show overlay when sidebar open */
-    #sidebar-overlay { display:block; }
-
-    /* Main app always takes full width */
-    .app { width:100% !important; flex:1; }
-
-    header { padding:10px 12px; }
-    header h1 { font-size:14px; }
-    #sidebar-toggle { width:34px; height:34px; font-size:14px; }
-    #clear-btn { font-size:11px; padding:5px 8px; }
-    #speak-toggle { font-size:11px; padding:5px 8px; }
-
-    #messages-wrap { overflow-y:auto; -webkit-overflow-scrolling:touch; }
-    #messages { padding:14px 10px; gap:12px; max-width:100%; }
-    .msg { max-width:90%; font-size:14px; padding:10px 12px; }
-
-    .input-area { padding:8px 10px max(10px,env(safe-area-inset-bottom)); }
-    .input-row { padding:6px 8px; }
-    textarea { font-size:16px; } /* 16px prevents iOS zoom */
-    .tool-btn { width:34px; height:34px; font-size:17px; }
-    #send-btn { width:34px; height:34px; font-size:16px; }
-
-    .empty-state h2 { font-size:19px; }
-    .empty-state p { font-size:13px; }
-    #scroll-btn { bottom:80px; right:12px; width:34px; height:34px; }
-
-    #new-chat-btn { margin:10px; padding:10px 12px; font-size:13.5px; }
-    .conv-item { padding:10px 8px; font-size:13px; min-height:44px; }
-    .conv-item .del-btn { opacity:1; }
-    #sidebar-footer { font-size:11px; padding:10px 12px; }
-  }
-
-  @media(max-width:380px) {
-    :root { --sidebar-w: 88vw; }
-    .msg { font-size:13.5px; }
-    header h1 { font-size:13px; }
-    #speak-toggle { display:none; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; overflow: hidden; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  .layout { display: flex; height: 100vh; width: 100vw; }
+  #sidebar { width: var(--sidebar-w); flex-shrink: 0; background: var(--panel);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column;
+    transition: margin-left 0.2s ease; }
+  #sidebar.hidden { margin-left: calc(-1 * var(--sidebar-w)); }
+  #new-chat-btn { margin: 14px; padding: 10px 14px; background: var(--accent); color: #1a1a1a;
+    border: none; border-radius: 8px; font-size: 13.5px; font-weight: 600; cursor: pointer; text-align: left; }
+  #new-chat-btn:hover { opacity: 0.9; }
+  #conv-list { flex: 1; overflow-y: auto; padding: 0 8px; display: flex; flex-direction: column; gap: 2px; }
+  .conv-item { display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    padding: 9px 10px; border-radius: 7px; cursor: pointer; font-size: 13px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .conv-item:hover { background: var(--ai-bubble); color: var(--text); }
+  .conv-item.active { background: var(--user-bubble); color: var(--text); }
+  .conv-item .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .conv-item .del-btn { opacity: 0; background: none; border: none; color: var(--muted);
+    cursor: pointer; font-size: 13px; padding: 2px 5px; flex-shrink: 0; }
+  .conv-item:hover .del-btn { opacity: 1; }
+  .conv-item .del-btn:hover { color: #e88; }
+  #sidebar-footer { padding: 12px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center; }
+  #sidebar-footer a { color: var(--muted); text-decoration: none; }
+  #sidebar-footer a:hover { color: var(--text); }
+  .app { display: flex; flex-direction: column; height: 100vh; flex: 1; min-width: 0; }
+  header { padding: 18px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  header .left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  #sidebar-toggle { background: none; border: 1px solid var(--border); color: var(--muted);
+    width: 30px; height: 30px; border-radius: 6px; cursor: pointer; font-size: 14px; flex-shrink: 0; }
+  #sidebar-toggle:hover { color: var(--text); }
+  header h1 { font-size: 15px; font-weight: 600; letter-spacing: 0.02em; margin: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  header .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent); margin-right: 8px; flex-shrink: 0; }
+  #clear-btn { background: none; border: 1px solid var(--border); color: var(--muted);
+    font-size: 12px; padding: 6px 12px; border-radius: 6px; cursor: pointer; flex-shrink: 0; }
+  #clear-btn:hover { color: var(--text); border-color: var(--muted); }
+  #messages { flex: 1; overflow-y: auto; padding: 24px 20px; display: flex;
+    flex-direction: column; gap: 16px; max-width: 760px; margin: 0 auto; width: 100%; }
+  .msg { max-width: 82%; padding: 11px 15px; border-radius: 14px; line-height: 1.5;
+    font-size: 14.5px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user-bubble); border-bottom-right-radius: 4px; }
+  .msg.ai { align-self: flex-start; background: var(--ai-bubble); border: 1px solid var(--border);
+    border-bottom-left-radius: 4px; }
+  .msg.error { align-self: center; background: #3a1f1f; border: 1px solid #6b3030;
+    color: #f0b8b8; font-size: 13px; }
+  .msg img.attach-thumb { max-width: 220px; border-radius: 8px; display: block; margin-top: 8px; }
+  .attach-chip { font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
+  .empty-state { margin: auto; text-align: center; color: var(--muted); }
+  .empty-state .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+    background: var(--accent); margin-bottom: 14px; }
+  .empty-state p { margin: 4px 0; font-size: 13.5px; }
+  .typing { align-self: flex-start; display: flex; gap: 4px; padding: 14px 16px;
+    background: var(--ai-bubble); border: 1px solid var(--border); border-radius: 14px;
+    border-bottom-left-radius: 4px; }
+  .typing span { width: 6px; height: 6px; border-radius: 50%; background: var(--muted);
+    animation: blink 1.2s infinite ease-in-out; }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+  #pending-attach { max-width: 760px; margin: 0 auto; width: 100%; padding: 0 20px;
+    display: none; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+  #pending-attach.show { display: flex; }
+  #pending-attach button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 13px; }
+  form { display: flex; gap: 8px; padding: 10px 20px 20px; border-top: 1px solid var(--border);
+    max-width: 760px; margin: 0 auto; width: 100%; align-items: flex-end; }
+  #attach-btn { background: none; border: 1px solid var(--border); color: var(--muted);
+    width: 42px; height: 42px; border-radius: 10px; cursor: pointer; font-size: 16px; flex-shrink: 0; }
+  #attach-btn:hover { color: var(--text); }
+  textarea { flex: 1; resize: none; background: var(--panel); border: 1px solid var(--border);
+    color: var(--text); border-radius: 10px; padding: 11px 13px; font-size: 14.5px;
+    font-family: inherit; line-height: 1.4; max-height: 140px; }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  button[type="submit"] { background: var(--accent); color: #1a1a1a; border: none;
+    border-radius: 10px; padding: 0 20px; font-size: 14px; font-weight: 600; cursor: pointer; height: 42px; }
+  button[type="submit"]:disabled { background: var(--accent-dim); color: var(--muted); cursor: not-allowed; }
+  #messages::-webkit-scrollbar, #conv-list::-webkit-scrollbar { width: 8px; }
+  #messages::-webkit-scrollbar-thumb, #conv-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  @media (max-width: 640px) {
+    #sidebar { position: fixed; top: 0; left: 0; z-index: 10; height: 100vh; }
+    #sidebar.hidden { margin-left: calc(-1 * var(--sidebar-w)); }
   }
 </style>
 </head>
 <body>
 <div class="layout">
-  <div id="sidebar-overlay" style="display:none;position:fixed;inset:0;background:#0007;z-index:99" id="sidebar-overlay"></div>
   <div id="sidebar">
-    <button id="new-chat-btn">+ New chat</button>
+    <button id="new-chat-btn" type="button">+ New chat</button>
     <div id="conv-list"></div>
-    <div id="sidebar-footer">Aarav AI &middot; by Aarav Singh</div>
+    <div id="sidebar-footer">
+      <span>__USERNAME__</span>
+      <a href="/logout">Log out</a>
+    </div>
   </div>
+
   <div class="app">
     <header>
       <div class="left">
-        <button id="sidebar-toggle" title="Toggle sidebar">☰</button>
-        <h1>Aarav AI</h1>
+        <button id="sidebar-toggle" type="button" title="Toggle sidebar">☰</button>
+        <h1><span class="dot"></span>Aarav AI</h1>
       </div>
-      <button id="clear-btn">Delete chat</button>
+      <button id="clear-btn" type="button">Delete chat</button>
     </header>
 
-    <div id="messages-wrap">
-      <div id="messages">
-        <div class="empty-state" id="empty-state">
-          <h2>Aarav AI</h2>
-          <p>Ask me anything, generate images, or just chat 👋</p>
-        </div>
+    <div id="messages">
+      <div class="empty-state" id="empty-state">
+        <div class="dot"></div>
+        <p>Hey! Ask me anything, attach a file, or just say hi 👋</p>
       </div>
     </div>
 
-    <button id="scroll-btn" title="Scroll to bottom">↓</button>
-
     <div id="pending-attach">
-      📎 <span id="pending-attach-name"></span>
-      <button id="pending-attach-remove">✕</button>
+      <span id="pending-attach-name"></span>
+      <button id="pending-attach-remove" type="button">✕</button>
     </div>
 
-    <div id="speaking-indicator">
-      🔊 Speaking...
-      <button id="stop-speak-btn">Stop</button>
-    </div>
-
-    <div class="input-area">
-      <form id="chat-form">
-        <div class="input-row">
-          <!-- Attach file -->
-          <input type="file" id="file-input" accept="image/*,.txt,.md,.csv,.json,.pdf" style="display:none">
-          <button class="tool-btn" id="attach-btn" type="button" title="Attach file">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-            </svg>
-          </button>
-          <!-- Camera -->
-          <input type="file" id="camera-input" accept="image/*" capture="environment" style="display:none">
-          <button class="tool-btn" id="camera-btn" type="button" title="Take photo">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-              <circle cx="12" cy="13" r="4"/>
-            </svg>
-          </button>
-          <textarea id="input" rows="1" placeholder="Message Aarav AI..."></textarea>
-          <!-- Voice input -->
-          <button class="tool-btn" id="voice-btn" type="button" title="Voice input">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-              <line x1="12" y1="19" x2="12" y2="23"/>
-              <line x1="8" y1="23" x2="16" y2="23"/>
-            </svg>
-          </button>
-          <button id="send-btn" type="submit" title="Send">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
-            </svg>
-          </button>
-        </div>
-      </form>
-    </div>
+    <form id="chat-form">
+      <input type="file" id="file-input" accept="image/*,.txt,.md,.csv,.json,.pdf" style="display:none">
+      <button id="attach-btn" type="button" title="Attach file">📎</button>
+      <textarea id="input" rows="1" placeholder="Message..." autofocus></textarea>
+      <button type="submit" id="send-btn">Send</button>
+    </form>
   </div>
 </div>
 
 <script>
-const messagesWrap = document.getElementById('messages-wrap');
-const messagesEl   = document.getElementById('messages');
-const form         = document.getElementById('chat-form');
-const input        = document.getElementById('input');
-const sendBtn      = document.getElementById('send-btn');
-const clearBtn     = document.getElementById('clear-btn');
-const convListEl   = document.getElementById('conv-list');
-const newChatBtn   = document.getElementById('new-chat-btn');
-const sidebarToggle= document.getElementById('sidebar-toggle');
-const sidebar      = document.getElementById('sidebar');
-const fileInput    = document.getElementById('file-input');
-const attachBtn    = document.getElementById('attach-btn');
-const cameraInput  = document.getElementById('camera-input');
-const cameraBtn    = document.getElementById('camera-btn');
-const voiceBtn     = document.getElementById('voice-btn');
-const pendingAttach= document.getElementById('pending-attach');
-const pendingName  = document.getElementById('pending-attach-name');
-const pendingRemove= document.getElementById('pending-attach-remove');
-const scrollBtn    = document.getElementById('scroll-btn');
-const speakingIndicator = document.getElementById('speaking-indicator');
-const stopSpeakBtn = document.getElementById('stop-speak-btn');
+  const messagesEl = document.getElementById('messages');
+  const form = document.getElementById('chat-form');
+  const input = document.getElementById('input');
+  const sendBtn = document.getElementById('send-btn');
+  const clearBtn = document.getElementById('clear-btn');
+  const convListEl = document.getElementById('conv-list');
+  const newChatBtn = document.getElementById('new-chat-btn');
+  const sidebarToggle = document.getElementById('sidebar-toggle');
+  const sidebar = document.getElementById('sidebar');
+  const fileInput = document.getElementById('file-input');
+  const attachBtn = document.getElementById('attach-btn');
+  const pendingAttach = document.getElementById('pending-attach');
+  const pendingAttachName = document.getElementById('pending-attach-name');
+  const pendingAttachRemove = document.getElementById('pending-attach-remove');
 
-let activeConvId = null;
-let pendingFile  = null;
-let recognition  = null;
-let currentUtterance = null;
+  let activeConvId = null;
+  let pendingFile = null; // {name, mimeType, dataBase64}
 
-// --- Scroll button ---
-messagesWrap.addEventListener('scroll', () => {
-  const nearBottom = messagesWrap.scrollHeight - messagesWrap.scrollTop - messagesWrap.clientHeight < 120;
-  scrollBtn.classList.toggle('show', !nearBottom);
-});
-scrollBtn.addEventListener('click', () => {
-  messagesWrap.scrollTo({ top: messagesWrap.scrollHeight, behavior: 'smooth' });
-});
-function scrollToBottom() {
-  requestAnimationFrame(() => {
-    messagesWrap.scrollTo({ top: messagesWrap.scrollHeight, behavior: 'smooth' });
-  });
-}
+  function scrollToBottom() {
+    requestAnimationFrame(() => { messagesEl.scrollTop = messagesEl.scrollHeight; });
+  }
+  function clearEmptyState() {
+    const es = document.getElementById('empty-state');
+    if (es) es.remove();
+  }
+  function showEmptyState() {
+    messagesEl.innerHTML = '<div class="empty-state" id="empty-state"><div class="dot"></div><p>Hey! Ask me anything, attach a file, or just say hi 👋</p></div>';
+  }
 
-function clearEmptyState() {
-  const es = document.getElementById('empty-state');
-  if (es) es.remove();
-}
-function showEmptyState() {
-  messagesEl.innerHTML = '<div class="empty-state" id="empty-state"><h2>Aarav AI</h2><p>Ask me anything, generate images, or just chat 👋</p></div>';
-}
-
-function addMessage(role, text, attachment) {
-  clearEmptyState();
-  const div = document.createElement('div');
-  div.className = 'msg ' + role;
-  if (attachment) {
-    const chip = document.createElement('div');
-    chip.className = 'attach-chip';
-    chip.textContent = '📎 ' + attachment.name;
-    div.appendChild(chip);
-    if (attachment.mimeType && attachment.mimeType.startsWith('image/') && attachment.dataBase64) {
+  function addMessage(role, text, attachment) {
+    clearEmptyState();
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    if (attachment && attachment.mimeType && attachment.mimeType.startsWith('image/')) {
+      const chip = document.createElement('div');
+      chip.className = 'attach-chip';
+      chip.textContent = '📎 ' + attachment.name;
+      div.appendChild(chip);
       const img = document.createElement('img');
+      img.className = 'attach-thumb';
       img.src = 'data:' + attachment.mimeType + ';base64,' + attachment.dataBase64;
       div.appendChild(img);
+    } else if (attachment) {
+      const chip = document.createElement('div');
+      chip.className = 'attach-chip';
+      chip.textContent = '📎 ' + attachment.name;
+      div.appendChild(chip);
+    }
+    const textNode = document.createElement('div');
+    textNode.textContent = text;
+    div.appendChild(textNode);
+    messagesEl.appendChild(div);
+    scrollToBottom();
+    return textNode;
+  }
+
+  function showTyping() {
+    const div = document.createElement('div');
+    div.className = 'typing';
+    div.id = 'typing-indicator';
+    div.innerHTML = '<span></span><span></span><span></span>';
+    messagesEl.appendChild(div);
+    scrollToBottom();
+  }
+  function hideTyping() {
+    const el = document.getElementById('typing-indicator');
+    if (el) el.remove();
+  }
+
+  async function loadConversationList() {
+    try {
+      const res = await fetch('/api/conversations');
+      const data = await res.json();
+      renderConvList(data.conversations || []);
+      return data.conversations || [];
+    } catch (err) {
+      console.error('Could not load conversations:', err);
+      return [];
     }
   }
-  const textNode = document.createElement('div');
-  textNode.textContent = text;
-  div.appendChild(textNode);
-  messagesEl.appendChild(div);
-  scrollToBottom();
-  return div;
-}
 
-function addImageMessage(role, base64, caption) {
-  clearEmptyState();
-  const div = document.createElement('div');
-  div.className = 'msg ' + role;
-  if (caption) {
-    const cap = document.createElement('div');
-    cap.textContent = caption;
-    cap.style.marginBottom = '8px';
-    div.appendChild(cap);
-  }
-  const img = document.createElement('img');
-  img.className = 'gen-img';
-  img.src = 'data:image/png;base64,' + base64;
-  div.appendChild(img);
-  messagesEl.appendChild(div);
-  scrollToBottom();
-}
-
-function showTyping() {
-  const div = document.createElement('div');
-  div.className = 'typing'; div.id = 'typing-indicator';
-  div.innerHTML = '<span></span><span></span><span></span>';
-  messagesEl.appendChild(div);
-  scrollToBottom();
-}
-function hideTyping() {
-  const el = document.getElementById('typing-indicator');
-  if (el) el.remove();
-}
-
-// --- Text-to-speech ---
-function speak(text) {
-  if (!window.speechSynthesis) return;
-  window.speechSynthesis.cancel();
-  const plain = text.replace(/[#*`_~>]/g, '').trim();
-  if (!plain) return;
-  currentUtterance = new SpeechSynthesisUtterance(plain);
-  currentUtterance.rate = 1.05;
-  currentUtterance.onstart = () => speakingIndicator.classList.add('show');
-  currentUtterance.onend = () => speakingIndicator.classList.remove('show');
-  currentUtterance.onerror = () => speakingIndicator.classList.remove('show');
-  window.speechSynthesis.speak(currentUtterance);
-}
-stopSpeakBtn.addEventListener('click', () => {
-  window.speechSynthesis && window.speechSynthesis.cancel();
-  speakingIndicator.classList.remove('show');
-});
-
-// --- Voice input ---
-function setupVoice() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) { voiceBtn.title = 'Voice not supported in this browser'; return; }
-  recognition = new SR();
-  recognition.continuous = false;
-  recognition.interimResults = true;
-  recognition.lang = 'en-US';
-  let finalTranscript = '';
-  recognition.onstart  = () => { voiceBtn.classList.add('active', 'listening'); finalTranscript = ''; };
-  recognition.onresult = (e) => {
-    finalTranscript = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      if (e.results[i].isFinal) finalTranscript += e.results[i][0].transcript;
-      else input.value = e.results[i][0].transcript;
-    }
-    if (finalTranscript) input.value = finalTranscript;
-  };
-  recognition.onend = () => {
-    voiceBtn.classList.remove('active', 'listening');
-    if (input.value.trim()) form.requestSubmit();
-  };
-  recognition.onerror = () => voiceBtn.classList.remove('active', 'listening');
-}
-setupVoice();
-voiceBtn.addEventListener('click', () => {
-  if (!recognition) { alert('Voice input is not supported in this browser. Try Chrome.'); return; }
-  if (voiceBtn.classList.contains('listening')) { recognition.stop(); return; }
-  recognition.start();
-});
-
-// --- File / camera attach ---
-function handleFileSelect(file) {
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const dataUrl = e.target.result;
-    const base64  = dataUrl.split(',')[1];
-    pendingFile = { name: file.name, mimeType: file.type || 'application/octet-stream', dataBase64: base64 };
-    pendingName.textContent = file.name;
-    pendingAttach.classList.add('show');
-  };
-  reader.readAsDataURL(file);
-}
-attachBtn.addEventListener('click', () => fileInput.click());
-cameraBtn.addEventListener('click', () => cameraInput.click());
-fileInput.addEventListener('change', () => handleFileSelect(fileInput.files[0]));
-cameraInput.addEventListener('change', () => handleFileSelect(cameraInput.files[0]));
-pendingRemove.addEventListener('click', () => {
-  pendingFile = null;
-  fileInput.value = '';
-  cameraInput.value = '';
-  pendingAttach.classList.remove('show');
-});
-
-// --- Image generation detection ---
-const IMAGE_KEYWORDS = /\b(generate|create|draw|make|paint|render|show me|ghibli|anime|realistic|cartoon|portrait|landscape|art|artwork|image of|picture of|photo of|illustration)\b/i;
-async function tryGenerateImage(prompt) {
-  try {
-    const r = await fetch('/api/generate-image', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt })
-    });
-    const d = await r.json();
-    if (d.image) {
-      addImageMessage('ai', d.image, '');
-      return true;
-    }
-  } catch {}
-  return false;
-}
-
-// --- Conversations ---
-async function loadConversationList() {
-  try {
-    const r = await fetch('/api/conversations');
-    const d = await r.json();
-    const convs = d.conversations || [];
+  function renderConvList(convs) {
     convListEl.innerHTML = '';
     convs.forEach(c => {
       const item = document.createElement('div');
       item.className = 'conv-item' + (c.id === activeConvId ? ' active' : '');
       item.innerHTML = '<span class="title"></span><button class="del-btn" title="Delete">✕</button>';
       item.querySelector('.title').textContent = c.title;
-      item.addEventListener('click', (e) => { if (!e.target.classList.contains('del-btn')) openConversation(c.id); });
+      item.addEventListener('click', (e) => {
+        if (e.target.classList.contains('del-btn')) return;
+        openConversation(c.id);
+      });
       item.querySelector('.del-btn').addEventListener('click', async (e) => {
         e.stopPropagation();
         await fetch('/api/conversations/' + c.id, { method: 'DELETE' });
-        if (c.id === activeConvId) startNewChat();
-        else loadConversationList();
+        if (c.id === activeConvId) { await startNewChat(); } else { loadConversationList(); }
       });
       convListEl.appendChild(item);
     });
-    return convs;
-  } catch { return []; }
-}
-
-async function openConversation(convId) {
-  activeConvId = convId;
-  try {
-    const r = await fetch('/api/conversations/' + convId);
-    if (!r.ok) return;
-    const d = await r.json();
-    messagesEl.innerHTML = '';
-    (d.messages || []).forEach(m => addMessage(m.role, m.text, m.attachment));
-    loadConversationList();
-  } catch {}
-}
-
-function startNewChat() {
-  activeConvId = null;
-  messagesEl.innerHTML = '';
-  showEmptyState();
-  loadConversationList();
-}
-
-// --- Send message ---
-async function sendMessage(text) {
-  const attachment = pendingFile;
-  pendingFile = null;
-  fileInput.value = ''; cameraInput.value = '';
-  pendingAttach.classList.remove('show');
-
-  showTyping();
-  sendBtn.disabled = true;
-
-  // Check if user wants an image
-  const wantsImage = IMAGE_KEYWORDS.test(text) && !attachment;
-
-  if (wantsImage) {
-    hideTyping();
-    const generated = await tryGenerateImage(text);
-    if (generated) { sendBtn.disabled = false; loadConversationList(); return; }
-    // If image gen fails, fall through to chat
-    showTyping();
   }
 
-  try {
-    const r = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, conversation_id: activeConvId, attachment })
-    });
-    if (!r.ok || !r.body) {
-      hideTyping();
-      addMessage('error', 'Something went wrong. Try again.');
+  async function openConversation(convId) {
+    activeConvId = convId;
+    try {
+      const res = await fetch('/api/conversations/' + convId);
+      if (!res.ok) return;
+      const data = await res.json();
+      messagesEl.innerHTML = '';
+      if (data.messages && data.messages.length > 0) {
+        data.messages.forEach(m => addMessage(m.role, m.text, m.attachment));
+      } else {
+        showEmptyState();
+      }
+      loadConversationList();
+    } catch (err) {
+      console.error('Could not open conversation:', err);
+    }
+  }
+
+  async function startNewChat() {
+    activeConvId = null;
+    messagesEl.innerHTML = '';
+    showEmptyState();
+    loadConversationList();
+  }
+
+  attachBtn.addEventListener('click', () => fileInput.click());
+
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    if (file.size > 8 * 1024 * 1024) {
+      alert('File is too big (max 8MB).');
+      fileInput.value = '';
       return;
     }
-    hideTyping();
-    const aiDiv = document.createElement('div');
-    aiDiv.className = 'msg ai';
-    messagesEl.appendChild(aiDiv);
+    const reader = new FileReader();
+    reader.onload = () => {
+      pendingFile = {
+        name: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        dataBase64: reader.result.split(',')[1]
+      };
+      pendingAttachName.textContent = '📎 ' + file.name;
+      pendingAttach.classList.add('show');
+    };
+    reader.readAsDataURL(file);
+  });
 
-    const convId = r.headers.get('X-Conversation-Id');
-    if (convId) activeConvId = convId;
+  pendingAttachRemove.addEventListener('click', () => {
+    pendingFile = null;
+    fileInput.value = '';
+    pendingAttach.classList.remove('show');
+  });
 
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
+  async function sendMessage(text, attachment) {
+    showTyping();
+    sendBtn.disabled = true;
+    let aiTextNode = null;
     let fullText = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      fullText += chunk;
-      aiDiv.textContent = fullText;
-      scrollToBottom();
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: text,
+          conversation_id: activeConvId,
+          attachment: attachment || null
+        })
+      });
+      if (!res.ok) {
+        hideTyping();
+        let errMsg = 'Something went wrong.';
+        try { const errData = await res.json(); errMsg = errData.error || errMsg; } catch (e) {}
+        addMessage('error', errMsg);
+        return;
+      }
+      const convId = res.headers.get('X-Conversation-Id');
+      if (convId) activeConvId = convId;
+
+      hideTyping();
+      aiTextNode = addMessage('ai', '');
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        fullText += chunk;
+        aiTextNode.textContent = fullText;
+        scrollToBottom();
+      }
+      loadConversationList();
+    } catch (err) {
+      hideTyping();
+      addMessage('error', 'Could not reach the server: ' + err.message);
+    } finally {
+      sendBtn.disabled = false;
     }
-    speak(fullText);
-    loadConversationList();
-  } catch (err) {
-    hideTyping();
-    addMessage('error', 'Network error: ' + err.message);
-  } finally {
-    sendBtn.disabled = false;
   }
-}
 
-form.addEventListener('submit', (e) => {
-  e.preventDefault();
-  const text = input.value.trim();
-  if (!text && !pendingFile) return;
-  addMessage('user', text, pendingFile);
-  input.value = '';
-  input.style.height = 'auto';
-  sendMessage(text);
-});
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text && !pendingFile) return;
+    const attachment = pendingFile;
+    addMessage('user', text, attachment);
+    input.value = '';
+    input.style.height = 'auto';
+    pendingFile = null;
+    fileInput.value = '';
+    pendingAttach.classList.remove('show');
+    sendMessage(text, attachment);
+  });
 
-input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
-});
-input.addEventListener('input', () => {
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 140) + 'px';
-});
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
+  });
+  input.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 140) + 'px';
+  });
 
-const sidebarOverlay = document.getElementById('sidebar-overlay');
+  clearBtn.addEventListener('click', async () => {
+    if (!activeConvId) return;
+    await fetch('/api/conversations/' + activeConvId, { method: 'DELETE' });
+    await startNewChat();
+  });
 
-function isMobile() { return window.innerWidth <= 768; }
+  newChatBtn.addEventListener('click', () => startNewChat());
+  sidebarToggle.addEventListener('click', () => sidebar.classList.toggle('hidden'));
 
-function openSidebar() {
-  sidebar.classList.remove('hidden');
-  if (isMobile()) sidebarOverlay.style.display = 'block';
-}
-function closeSidebar() {
-  sidebar.classList.add('hidden');
-  sidebarOverlay.style.display = 'none';
-}
-sidebarToggle.addEventListener('click', () => {
-  sidebar.classList.contains('hidden') ? openSidebar() : closeSidebar();
-});
-sidebarOverlay.addEventListener('click', closeSidebar);
-
-// Auto-close sidebar on mobile after picking a conversation
-const _origOpen = openConversation;
-async function openConversation(id) {
-  await _origOpen(id);
-  if (isMobile()) closeSidebar();
-}
-
-// Hide sidebar by default on mobile
-if (isMobile()) sidebar.classList.add('hidden');
-newChatBtn.addEventListener('click', startNewChat);
-clearBtn.addEventListener('click', async () => {
-  if (!activeConvId) return;
-  await fetch('/api/conversations/' + activeConvId, { method: 'DELETE' });
-  startNewChat();
-});
-
-// Initial load
-(async () => {
-  const convs = await loadConversationList();
-  if (convs.length > 0) openConversation(convs[0].id);
-  else showEmptyState();
-})();
+  (async () => {
+    const convs = await loadConversationList();
+    if (convs.length > 0) { openConversation(convs[0].id); } else { showEmptyState(); }
+  })();
 </script>
 </body>
 </html>
 """
 
+
 @app.route("/")
 @login_required
 def index():
-    return Response(PAGE, mimetype="text/html; charset=utf-8")
+    return Response(PAGE.replace("__USERNAME__", current_username()), mimetype="text/html")
 
 
 @app.route("/api/conversations", methods=["GET"])
@@ -1042,18 +1000,14 @@ def openrouter_stream_chunks(messages):
                     break
                 try:
                     obj = json.loads(data_str)
-                    content_chunk = obj["choices"][0]["delta"].get("content", "")
-                    if content_chunk:
-                        yield content_chunk
+                    content = obj["choices"][0]["delta"].get("content", "")
+                    if content:
+                        yield content
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
             return
-        else:
-            yield f"[OpenRouter error {resp.status_code}: {resp.text[:200]}]"
-            return
-    except requests.RequestException as e:
-        yield f"[OpenRouter connection error: {e}]"
-        return
+    except requests.RequestException:
+        pass
 
 
 def huggingface_stream_chunks(messages):
@@ -1077,118 +1031,50 @@ def huggingface_stream_chunks(messages):
                     break
                 try:
                     obj = json.loads(data_str)
-                    content_chunk = obj["choices"][0]["delta"].get("content", "")
-                    if content_chunk:
-                        yield content_chunk
+                    content = obj["choices"][0]["delta"].get("content", "")
+                    if content:
+                        yield content
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
             return
-        else:
-            yield f"[OpenRouter error {resp.status_code}: {resp.text[:200]}]"
-            return
-    except requests.RequestException as e:
-        yield f"[OpenRouter connection error: {e}]"
-        return
-
-
-
-def cerebras_stream_chunks(messages):
-    """Stream from Cerebras AI (very fast, generous free tier, works on servers)."""
-    if not CEREBRAS_API_KEY:
-        return
-    try:
-        resp = requests.post(
-            "https://api.cerebras.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"},
-            json={"model": CEREBRAS_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
-            stream=True, timeout=60,
-        )
-        if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data_str)
-                    chunk = obj["choices"][0]["delta"].get("content", "")
-                    if chunk:
-                        yield chunk
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-            return
-        else:
-            yield f"[Cerebras error {resp.status_code}: {resp.text[:300]}]"
-            return
-    except requests.RequestException as e:
-        yield f"[Cerebras connection error: {e}]"
-        return
-
-
-# --- Round-robin provider rotation ------------------------------------------
-# Tracks which provider index to try FIRST next time (persists for the life
-# of the process; resets on server restart, which is fine).
-_provider_index = [0]
+    except requests.RequestException:
+        pass
 
 
 def auto_stream_chunks(gemini_payload, gemini_messages):
-    """True round-robin rotation across all configured providers.
-    No provider is primary — starts from wherever the last successful call left off.
-    If the current provider fails/is rate-limited, moves to the next one and
-    remembers that position for the next request too."""
+    """Auto fallback chain: Gemini → Groq → OpenRouter → HuggingFace.
+    Tries each provider in order; falls through to the next if one fails/has no key."""
     openai_msgs = to_openai_messages(gemini_messages, SYSTEM_PROMPT)
-    ollama_msgs = to_ollama_messages(gemini_messages, SYSTEM_PROMPT)
 
-    # Build the full list of available providers (only those with keys)
-    all_providers = []
-    if PROVIDER in ("auto", "gemini") and GEMINI_API_KEY:
-        all_providers.append(("Gemini", lambda: gemini_stream_chunks(gemini_payload)))
-    if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
-        all_providers.append(("Groq", lambda: groq_stream_chunks(openai_msgs)))
-    if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
-        all_providers.append(("Cerebras", lambda: cerebras_stream_chunks(openai_msgs)))
-    if PROVIDER == "openrouter" and OPENROUTER_API_KEY:
-        all_providers.append(("OpenRouter", lambda: openrouter_stream_chunks(openai_msgs)))
-    if PROVIDER == "huggingface" and HF_API_KEY:
-        # HuggingFace free tier blocks server IPs (Render etc) — only use if explicitly set
-        all_providers.append(("HuggingFace", lambda: huggingface_stream_chunks(openai_msgs)))
+    providers = []
+    if PROVIDER in ("auto", "gemini"):
+        providers.append(("Gemini", lambda: gemini_stream_chunks(gemini_payload)))
+    if PROVIDER in ("auto", "groq"):
+        providers.append(("Groq", lambda: groq_stream_chunks(openai_msgs)))
+    if PROVIDER in ("auto", "openrouter"):
+        providers.append(("OpenRouter", lambda: openrouter_stream_chunks(openai_msgs)))
+    if PROVIDER in ("auto", "huggingface"):
+        providers.append(("HuggingFace", lambda: huggingface_stream_chunks(openai_msgs)))
     if PROVIDER == "ollama":
-        all_providers.append(("Ollama", lambda: ollama_stream_chunks(ollama_msgs)))
+        providers.append(("Ollama", lambda: ollama_stream_chunks(to_ollama_messages(gemini_messages, SYSTEM_PROMPT))))
 
-    if not all_providers:
-        yield "[No AI providers configured. Add at least one API key.]"
-        return
-
-    n = len(all_providers)
-    start = _provider_index[0] % n
-
-    # Try each provider starting from the current rotation position
-    for i in range(n):
-        idx = (start + i) % n
-        name, fn = all_providers[idx]
+    for name, fn in providers:
         collected = []
         try:
             for chunk in fn():
                 collected.append(chunk)
                 yield chunk
             if collected:
-                # Success — next request starts from the NEXT provider (true rotation)
-                _provider_index[0] = (idx + 1) % n
-                return
+                return  # got a real response — done
         except Exception:
             pass
-        # This provider failed — silently try the next one
+        # nothing yielded from this provider — try next
 
-    yield "[All AI providers failed or are rate-limited. Try again in a moment.]"
-
-
+    yield "[All AI providers failed or have no API keys configured. Add keys to try again.]"
 
 
 def gemini_stream_chunks(payload):
-    """Yields plain text increments from Gemini's SSE stream.
-    Returns nothing (silently) on auth/quota/rate-limit errors so the
-    round-robin rotation automatically falls through to the next provider."""
+    """Yields plain text increments from Gemini's SSE stream."""
     try:
         resp = requests.post(
             GEMINI_STREAM_URL,
@@ -1197,12 +1083,17 @@ def gemini_stream_chunks(payload):
             stream=True,
             timeout=60,
         )
-    except requests.RequestException:
-        return  # network error — silently fall through
+    except requests.RequestException as e:
+        yield f"[Error contacting Gemini: {e}]"
+        return
 
     if resp.status_code != 200:
-        # Auth errors (401/403), quota errors (429), and server errors (5xx)
-        # all mean "try the next provider" — don't yield anything.
+        try:
+            body = resp.json()
+            err_msg = body.get("error", {}).get("message", resp.text)
+        except ValueError:
+            err_msg = resp.text
+        yield f"[Gemini error: {err_msg}]"
         return
 
     for raw_line in resp.iter_lines(decode_unicode=True):
@@ -1290,37 +1181,9 @@ def chat():
         messages.append({"role": "model", "parts": [{"text": "".join(full_reply)}]})
         save_conversation(username, conv_id, conv)
 
-    resp = Response(stream_with_context(generate()), mimetype="text/plain; charset=utf-8")
+    resp = Response(stream_with_context(generate()), mimetype="text/plain")
     resp.headers["X-Conversation-Id"] = conv_id
     return resp
-
-
-@app.route("/api/generate-image", methods=["POST"])
-@app.route("/api/generate-image", methods=["POST"])
-@login_required
-def generate_image():
-    data = request.get_json(force=True) or {}
-    prompt = data.get("prompt", "").strip()
-    if not prompt:
-        return jsonify({"error": "prompt required"}), 400
-    if not HF_API_KEY:
-        return jsonify({"error": "No HuggingFace key configured"}), 503
-    # Use FLUX.1-schnell — fast, high quality, free on HF
-    model = "black-forest-labs/FLUX.1-schnell"
-    try:
-        resp = requests.post(
-            f"https://api-inference.huggingface.co/models/{model}",
-            headers={"Authorization": f"Bearer {HF_API_KEY}"},
-            json={"inputs": prompt},
-            timeout=60,
-        )
-        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
-            img_b64 = base64.b64encode(resp.content).decode("utf-8")
-            return jsonify({"image": img_b64})
-        else:
-            return jsonify({"error": f"Image generation failed ({resp.status_code})"}), 502
-    except requests.RequestException as e:
-        return jsonify({"error": str(e)}), 502
 
 
 if __name__ == "__main__":
@@ -1329,8 +1192,6 @@ if __name__ == "__main__":
         active.append(f"Gemini({GEMINI_MODEL})")
     if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
         active.append(f"Groq({GROQ_MODEL})")
-    if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
-        active.append(f"Cerebras({CEREBRAS_MODEL})")
     if PROVIDER in ("auto", "openrouter") and OPENROUTER_API_KEY:
         active.append(f"OpenRouter({OPENROUTER_MODEL})")
     if PROVIDER in ("auto", "huggingface") and HF_API_KEY:
