@@ -290,7 +290,7 @@ PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Aarav AI</title>
 <style>
   :root {
@@ -348,6 +348,23 @@ PAGE = r"""<!DOCTYPE html>
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
     display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
   #export-btn:hover { background:var(--panel); }
+
+  /* Mobile "more" menu — hidden on desktop, replaces the individual header
+     icon buttons on narrow screens to keep the header uncluttered and
+     each remaining tap target comfortably large. */
+  #more-btn { display:none; background:none; border:1px solid var(--border); color:var(--muted);
+    width:38px; height:38px; border-radius:6px; font-size:18px; cursor:pointer; flex-shrink:0;
+    align-items:center; justify-content:center; touch-action:manipulation;
+    -webkit-tap-highlight-color:transparent; }
+  #more-menu-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:149; }
+  #more-menu { display:none; position:fixed; top:calc(52px + env(safe-area-inset-top)); right:12px;
+    background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:6px;
+    flex-direction:column; gap:2px; z-index:150; box-shadow:0 10px 30px rgba(0,0,0,.4); min-width:190px; }
+  #more-menu button { display:flex; align-items:center; gap:10px; background:none; border:none;
+    color:var(--text); font-size:14px; padding:12px 14px; border-radius:8px; cursor:pointer;
+    text-align:left; width:100%; touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
+  #more-menu button:active { background:var(--accent-dim); }
+  #more-menu.show, #more-menu-overlay.show { display:flex; }
 
   /* Fullscreen toggle — lives in the header so it's reachable with one tap
      at the top of the screen, alongside the other header icon buttons. */
@@ -485,12 +502,16 @@ PAGE = r"""<!DOCTYPE html>
   @media(max-width:768px) {
     :root { --sidebar-w: 78vw; }
 
+    html, body { overscroll-behavior-y: contain; }
+    #messages-wrap { overscroll-behavior-y: contain; }
+
     /* Sidebar slides in as overlay — never pushes content */
     #sidebar { position:fixed; top:0; left:0; z-index:100; height:100%;
       height:-webkit-fill-available; width:var(--sidebar-w) !important;
       transform:translateX(0); transition:transform .25s ease;
       box-shadow:4px 0 24px rgba(0,0,0,.5); }
     #sidebar.hidden { transform:translateX(-105%); margin-left:0 !important; }
+    #sidebar-footer { padding-bottom:max(10px, env(safe-area-inset-bottom)); }
 
     /* Show overlay when sidebar open */
     #sidebar-overlay { display:block; }
@@ -498,35 +519,35 @@ PAGE = r"""<!DOCTYPE html>
     /* Main app always takes full width */
     .app { width:100% !important; flex:1; }
 
-    header { padding:calc(10px + env(safe-area-inset-top)) 12px 10px; }
+    header { padding:calc(10px + env(safe-area-inset-top)) 10px 10px; }
     header h1 { font-size:14px; }
-    #sidebar-toggle { width:38px; height:38px; font-size:14px; }
-    #name-btn { width:38px; height:38px; font-size:14px; }
-    #export-btn { width:38px; height:38px; font-size:14px; }
-    #fullscreen-btn { width:38px; height:38px; font-size:14px; }
-    #clear-btn { width:38px; height:38px; font-size:14px; }
+    #sidebar-toggle { width:40px; height:40px; font-size:15px; }
+
+    /* Collapse the individual header icons into a single "more" menu on mobile */
+    #header-actions { display:none; }
+    #more-btn { display:flex; }
 
     #messages-wrap { overflow-y:auto; -webkit-overflow-scrolling:touch; }
     #messages { padding:14px 10px; gap:12px; max-width:100%; }
     .msg { max-width:90%; font-size:14px; padding:10px 12px; }
     .msg-row { max-width:90%; }
-    .msg-actions { opacity:1; height:26px; } /* no hover on touch — keep always visible */
-    .msg-actions button { font-size:13px; padding:4px 9px; min-width:30px; min-height:26px; }
+    .msg-actions { opacity:1; height:28px; } /* no hover on touch — keep always visible */
+    .msg-actions button { font-size:14px; padding:5px 10px; min-width:36px; min-height:32px; }
 
     .input-area { padding:8px 10px max(10px,env(safe-area-inset-bottom)); }
     .input-row { padding:6px 8px; }
     textarea { font-size:16px; } /* 16px prevents iOS zoom */
-    .tool-btn { width:34px; height:34px; font-size:17px; }
-    #send-btn { width:34px; height:34px; font-size:16px; }
+    .tool-btn { width:40px; height:40px; font-size:18px; }
+    #send-btn { width:40px; height:40px; font-size:17px; }
 
     .empty-state h2 { font-size:19px; }
     .empty-state p { font-size:13px; }
-    #scroll-btn { bottom:80px; right:12px; width:34px; height:34px; }
+    #scroll-btn { bottom:calc(80px + env(safe-area-inset-bottom)); right:12px; width:38px; height:38px; }
 
-    #new-chat-btn { margin:10px; padding:10px 12px; font-size:13.5px; }
+    #new-chat-btn { margin:10px; padding:12px; font-size:14px; min-height:44px; }
     .conv-item { padding:10px 8px; font-size:13px; min-height:44px; }
-    .conv-item .rename-btn { opacity:1; }
-    .conv-item .del-btn { opacity:1; }
+    .conv-item .rename-btn { opacity:1; min-width:32px; min-height:32px; }
+    .conv-item .del-btn { opacity:1; min-width:32px; min-height:32px; }
     #sidebar-footer { font-size:11px; padding:10px 12px; }
   }
 
@@ -551,7 +572,7 @@ PAGE = r"""<!DOCTYPE html>
         <button id="sidebar-toggle" title="Toggle sidebar">☰</button>
         <h1>Aarav AI</h1>
       </div>
-      <div class="right">
+      <div class="right" id="header-actions">
         <button id="fullscreen-btn" type="button" title="Fullscreen">
           <span id="fullscreen-icon">⛶</span>
         </button>
@@ -559,7 +580,15 @@ PAGE = r"""<!DOCTYPE html>
         <button id="export-btn" title="Export this chat">⬇</button>
         <button id="clear-btn" title="Delete this chat">🗑</button>
       </div>
+      <button id="more-btn" type="button" title="More options">⋮</button>
     </header>
+    <div id="more-menu-overlay"></div>
+    <div id="more-menu">
+      <button id="more-fullscreen" type="button"><span id="more-fullscreen-icon">⛶</span> Fullscreen</button>
+      <button id="more-name" type="button">🙂 Your name</button>
+      <button id="more-export" type="button">⬇ Export chat</button>
+      <button id="more-clear" type="button">🗑 Delete chat</button>
+    </div>
 
     <div id="messages-wrap">
       <div id="messages">
@@ -650,6 +679,14 @@ const nameInput     = document.getElementById('name-input');
 const nameCancelBtn = document.getElementById('name-cancel-btn');
 const nameSaveBtn   = document.getElementById('name-save-btn');
 const exportBtn     = document.getElementById('export-btn');
+const moreBtn        = document.getElementById('more-btn');
+const moreMenu       = document.getElementById('more-menu');
+const moreMenuOverlay= document.getElementById('more-menu-overlay');
+const moreFullscreen = document.getElementById('more-fullscreen');
+const moreFullscreenIcon = document.getElementById('more-fullscreen-icon');
+const moreName        = document.getElementById('more-name');
+const moreExport      = document.getElementById('more-export');
+const moreClear       = document.getElementById('more-clear');
 const sidebar      = document.getElementById('sidebar');
 const fileInput    = document.getElementById('file-input');
 const attachBtn    = document.getElementById('attach-btn');
@@ -1157,13 +1194,15 @@ if (!localStorage.getItem('aarav_name_prompted')) {
 // Hide sidebar by default on mobile
 if (isMobile()) sidebar.classList.add('hidden');
 newChatBtn.addEventListener('click', startNewChat);
-clearBtn.addEventListener('click', async () => {
+
+async function doClearChat() {
   if (!activeConvId) return;
   await fetch('/api/conversations/' + activeConvId, { method: 'DELETE' });
   startNewChat();
-});
+}
+clearBtn.addEventListener('click', doClearChat);
 
-exportBtn.addEventListener('click', async () => {
+async function doExportChat() {
   if (!activeConvId) { alert('Start or open a chat first.'); return; }
   try {
     const r = await fetch('/api/conversations/' + activeConvId);
@@ -1187,7 +1226,35 @@ exportBtn.addEventListener('click', async () => {
   } catch (err) {
     alert('Export failed: ' + err.message);
   }
-});
+}
+exportBtn.addEventListener('click', doExportChat);
+
+// --- Mobile "more" menu: consolidates fullscreen/name/export/delete into one panel ---
+function openMoreMenu() {
+  if (moreFullscreenIcon) moreFullscreenIcon.textContent = fullscreenIcon.textContent;
+  moreMenu.classList.add('show');
+  moreMenuOverlay.classList.add('show');
+}
+function closeMoreMenu() {
+  moreMenu.classList.remove('show');
+  moreMenuOverlay.classList.remove('show');
+}
+moreBtn.addEventListener('click', openMoreMenu);
+moreMenuOverlay.addEventListener('click', closeMoreMenu);
+moreFullscreen.addEventListener('click', () => { closeMoreMenu(); toggleFullscreen(); });
+moreName.addEventListener('click', () => { closeMoreMenu(); openNameModal(); });
+moreExport.addEventListener('click', () => { closeMoreMenu(); doExportChat(); });
+moreClear.addEventListener('click', () => { closeMoreMenu(); doClearChat(); });
+
+// --- Swipe left to close the sidebar on mobile ---
+let touchStartX = null;
+sidebar.addEventListener('touchstart', (e) => { touchStartX = e.touches[0].clientX; }, { passive: true });
+sidebar.addEventListener('touchend', (e) => {
+  if (touchStartX === null) return;
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  if (dx < -60) closeSidebar();
+  touchStartX = null;
+}, { passive: true });
 
 // Initial load
 (async () => {
