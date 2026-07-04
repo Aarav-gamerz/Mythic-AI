@@ -40,6 +40,7 @@ import uuid
 import time
 import base64
 import requests
+from datetime import datetime, timezone
 from flask import (
     Flask, request, jsonify, Response, session,
     stream_with_context
@@ -118,6 +119,13 @@ MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 8 MB
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
+if SUPABASE_URL and not SUPABASE_KEY:
+    print("[Supabase] WARNING: SUPABASE_URL is set but SUPABASE_KEY is missing — "
+          "falling back to local file storage, which does NOT persist on Render.")
+if SUPABASE_KEY and not SUPABASE_URL:
+    print("[Supabase] WARNING: SUPABASE_KEY is set but SUPABASE_URL is missing — "
+          "falling back to local file storage, which does NOT persist on Render.")
+
 def sb_headers():
     return {
         "apikey": SUPABASE_KEY,
@@ -128,6 +136,15 @@ def sb_headers():
 
 def sb(path):
     return f"{SUPABASE_URL}/rest/v1/{path}"
+
+def _sb_log_error(action, resp=None, exc=None):
+    """Supabase failures used to be swallowed silently, making it impossible to
+    tell why saves weren't sticking. Now every failure prints the real reason
+    to the server logs (visible in Render's Logs tab)."""
+    if exc is not None:
+        print(f"[Supabase] {action} failed: {exc}")
+    elif resp is not None and not (200 <= resp.status_code < 300):
+        print(f"[Supabase] {action} failed: HTTP {resp.status_code} — {resp.text[:500]}")
 
 
 # --- User accounts (Supabase: users table) -----------------------------------
@@ -153,7 +170,7 @@ def login_required(view):
 # --- Supabase / file storage helpers ----------------------------------------
 
 def list_conversations(username):
-    if not SUPABASE_URL:
+    if not SUPABASE_URL or not SUPABASE_KEY:
         return _list_conversations_file(username)
     try:
         r = requests.get(
@@ -162,13 +179,14 @@ def list_conversations(username):
         )
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        pass
+        _sb_log_error("list_conversations", resp=r)
+    except Exception as e:
+        _sb_log_error("list_conversations", exc=e)
     return []
 
 
 def load_conversation(username, conv_id):
-    if not SUPABASE_URL:
+    if not SUPABASE_URL or not SUPABASE_KEY:
         return _load_conversation_file(username, conv_id)
     try:
         r = requests.get(
@@ -184,19 +202,21 @@ def load_conversation(username, conv_id):
                     "updated_at": row["updated_at"],
                     "messages": row["messages"] if isinstance(row["messages"], list) else json.loads(row["messages"]),
                 }
-    except Exception:
-        pass
+        else:
+            _sb_log_error("load_conversation", resp=r)
+    except Exception as e:
+        _sb_log_error("load_conversation", exc=e)
     return None
 
 
 def save_conversation(username, conv_id, data):
     data["updated_at"] = time.time()
-    if not SUPABASE_URL:
+    if not SUPABASE_URL or not SUPABASE_KEY:
         _save_conversation_file(username, conv_id, data)
         return
     try:
         headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
-        requests.post(
+        r = requests.post(
             sb("conversations"),
             headers=headers,
             json={
@@ -208,21 +228,29 @@ def save_conversation(username, conv_id, data):
             },
             timeout=15,
         )
-    except Exception:
-        pass
+        if r.status_code not in (200, 201, 204):
+            _sb_log_error("save_conversation", resp=r)
+            # Fall back to local file storage so at least this save isn't lost,
+            # even though it won't survive a Render restart.
+            _save_conversation_file(username, conv_id, data)
+    except Exception as e:
+        _sb_log_error("save_conversation", exc=e)
+        _save_conversation_file(username, conv_id, data)
 
 
 def delete_conversation(username, conv_id):
-    if not SUPABASE_URL:
+    if not SUPABASE_URL or not SUPABASE_KEY:
         _delete_conversation_file(username, conv_id)
         return
     try:
-        requests.delete(
+        r = requests.delete(
             sb(f"conversations?id=eq.{conv_id}&username=eq.{username}"),
             headers=sb_headers(), timeout=10,
         )
-    except Exception:
-        pass
+        if r.status_code not in (200, 204):
+            _sb_log_error("delete_conversation", resp=r)
+    except Exception as e:
+        _sb_log_error("delete_conversation", exc=e)
 
 
 # --- Local file fallbacks for when Supabase is not configured ----------------
@@ -336,9 +364,14 @@ PAGE = r"""<!DOCTYPE html>
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0; }
   #sidebar-toggle:hover { background:var(--panel); }
   header h1 { font-size:16px; font-weight:700; color:var(--accent); margin:0; }
+
+  /* Model picker — lives just above the input box, easy to reach with a thumb on mobile */
+  #model-bar { display:flex; align-items:center; gap:8px; margin-bottom:8px;
+    font-size:12.5px; color:var(--muted); }
+  #model-bar-label { flex-shrink:0; }
   #model-select { background:var(--panel); border:1px solid var(--border); color:var(--text);
-    font-size:12.5px; padding:6px 8px; border-radius:6px; cursor:pointer; flex-shrink:0;
-    max-width:130px; touch-action:manipulation; }
+    font-size:12.5px; padding:7px 10px; border-radius:8px; cursor:pointer;
+    flex:1; max-width:220px; touch-action:manipulation; }
   #model-select:focus { outline:none; border-color:var(--accent); }
   #name-btn { background:none; border:1px solid var(--border); color:var(--muted);
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
@@ -501,12 +534,13 @@ PAGE = r"""<!DOCTYPE html>
 
     header { padding:calc(10px + env(safe-area-inset-top)) 12px 10px; flex-wrap:wrap; }
     header h1 { font-size:14px; }
-    #model-select { font-size:11px; padding:5px 6px; max-width:96px; }
     #sidebar-toggle { width:38px; height:38px; font-size:14px; }
     #name-btn { width:38px; height:38px; font-size:14px; }
     #export-btn { width:38px; height:38px; font-size:14px; }
     #fullscreen-btn { width:38px; height:38px; font-size:14px; }
     #clear-btn { width:38px; height:38px; font-size:14px; }
+    #model-bar { font-size:11.5px; }
+    #model-select { font-size:11.5px; padding:8px 10px; max-width:none; flex:1; }
 
     #messages-wrap { overflow-y:auto; -webkit-overflow-scrolling:touch; }
     #messages { padding:14px 10px; gap:12px; max-width:100%; }
@@ -554,7 +588,6 @@ PAGE = r"""<!DOCTYPE html>
         <h1>Mythic AI</h1>
       </div>
       <div class="right">
-        <select id="model-select" title="Choose model"></select>
         <button id="fullscreen-btn" type="button" title="Fullscreen">
           <span id="fullscreen-icon">⛶</span>
         </button>
@@ -586,6 +619,10 @@ PAGE = r"""<!DOCTYPE html>
     </div>
 
     <div class="input-area">
+      <div id="model-bar">
+        <span id="model-bar-label">Model:</span>
+        <select id="model-select" title="Choose model"></select>
+      </div>
       <form id="chat-form">
         <div class="input-row">
           <!-- Attach file -->
@@ -1760,7 +1797,12 @@ def chat():
         {"role": m["role"], "parts": m["parts"]} for m in messages
     ]
 
-    effective_system_prompt = SYSTEM_PROMPT
+    today_str = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
+    effective_system_prompt = SYSTEM_PROMPT + (
+        f" Today's real date is {today_str} (UTC) — trust this over whatever date your "
+        f"training data suggests, and use it for any question about the current date, "
+        f"year, or how long ago/from now something is."
+    )
     if user_name:
         effective_system_prompt += (
             f" The user has told you their preferred name is \"{user_name}\". "
