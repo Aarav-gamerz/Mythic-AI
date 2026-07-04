@@ -81,7 +81,10 @@ MODEL   = GEMINI_MODEL
 SYSTEM_PROMPT = (
     "You are Mythic AI, a smart and friendly AI assistant made by Aarav Singh. "
     "If asked who made you, say you are Mythic AI made by Aarav Singh — say it once naturally, never repeat it unprompted. "
-    "Never mention Google, Groq, OpenRouter, HuggingFace, Meta, Mistral, Anthropic, or any AI company as your creator or backend. "
+    "You are NOT ChatGPT, NOT GPT-4, NOT made by OpenAI, NOT made by Google, Groq, Anthropic, Meta, or any other company. "
+    "You are Mythic AI, exclusively. Never claim to be any other AI. "
+    "Your model tiers are: Mythic 1.0 (fast), Mythic 2.0 (balanced), Mythic 2.5 (smart), Mythic 3.5 (advanced), Mythic Ultra (most powerful). "
+    "If asked what model or AI you are, say you are Mythic AI and mention the tier if known. "
     "You can help with anything: questions, writing, coding, math, ideas, or just chatting. "
     "When writing code, always wrap it in markdown code blocks with the language name. "
     "LANGUAGE: Always reply ENTIRELY in the same language the user's message is written in — "
@@ -415,11 +418,13 @@ header h1{font-size:16px;font-weight:700;color:var(--accent);}
 #clear-btn:hover{color:#ef4444;border-color:#ef4444;}
 
 /* Model bar */
-#model-bar{background:var(--panel);border-bottom:1px solid var(--border);padding:8px 16px;}
-#model-bar .inner{display:flex;align-items:center;gap:10px;max-width:760px;margin:0 auto;}
-#model-bar label{font-size:12px;color:var(--muted);white-space:nowrap;}
-#model-select{flex:1;background:var(--bg);color:var(--text);border:1px solid var(--border);
-  border-radius:8px;padding:7px 10px;font-size:13px;cursor:pointer;outline:none;}
+/* Model selector — sits below the input box like Claude */
+#model-row{display:flex;align-items:center;gap:6px;margin-top:6px;padding:0 4px;}
+#model-label{font-size:14px;}
+#model-select{background:none;color:var(--muted);border:none;font-size:12px;
+  cursor:pointer;outline:none;padding:4px 2px;border-radius:6px;max-width:200px;}
+#model-select:hover{color:var(--text);}
+#model-select option{background:var(--panel);color:var(--text);}
 
 /* Messages */
 #messages-wrap{flex:1;overflow-y:auto;position:relative;}
@@ -533,7 +538,6 @@ textarea::placeholder{color:var(--muted);}
   #new-chat-btn{margin:10px;padding:12px;font-size:14px;}
   .conv-item{min-height:44px;font-size:13px;}
   .conv-item .cbtn{opacity:1;}
-  #model-bar{padding:6px 12px;}
 }
 @media(max-width:380px){
   :root{--sidebar-w:90vw;}
@@ -578,19 +582,6 @@ textarea::placeholder{color:var(--muted);}
       <button id="more-btn" title="More">⋮</button>
     </header>
 
-    <div id="model-bar">
-      <div class="inner">
-        <label for="model-select">Model:</label>
-        <select id="model-select">
-          <option value="aarav-1.0">Mythic 1.0 — Fast</option>
-          <option value="aarav-2.0">Mythic 2.0 — Balanced</option>
-          <option value="aarav-2.5" selected>Mythic 2.5 — Smart</option>
-          <option value="aarav-3.5">Mythic 3.5 — Advanced</option>
-          <option value="aarav-ultra">Mythic Ultra 🔒</option>
-        </select>
-      </div>
-    </div>
-
     <div id="messages-wrap">
       <div id="messages">
         <div class="empty-state" id="empty-state">
@@ -622,6 +613,16 @@ textarea::placeholder{color:var(--muted);}
             </button>
           </div>
         </form>
+        <div id="model-row">
+          <span id="model-label">⚡</span>
+          <select id="model-select">
+            <option value="aarav-1.0">Mythic 1.0 — Fast</option>
+            <option value="aarav-2.0">Mythic 2.0 — Balanced</option>
+            <option value="aarav-2.5" selected>Mythic 2.5 — Smart</option>
+            <option value="aarav-3.5">Mythic 3.5 — Advanced</option>
+            <option value="aarav-ultra">Mythic Ultra 🔒</option>
+          </select>
+        </div>
       </div>
     </div>
   </div>
@@ -855,37 +856,74 @@ modelSelect.addEventListener('change', () => { selectedModel = modelSelect.value
 
 // --- VIP unlock ---
 function showVipModal() {
+  // Remove any existing modal first
+  const existing = document.getElementById('vip-modal-wrap');
+  if (existing) existing.remove();
+
   const m = document.createElement('div');
+  m.id = 'vip-modal-wrap';
   m.style.cssText='position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;';
-  m.innerHTML=`<div style="background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:24px;width:300px;max-width:90vw;">
+  document.body.appendChild(m);
+
+  const box = document.createElement('div');
+  box.style.cssText='background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:24px;width:300px;max-width:90vw;';
+  box.innerHTML = `
     <div style="font-size:22px;margin-bottom:8px;">🔒 VIP Access</div>
     <div style="color:var(--muted);font-size:13px;margin-bottom:14px;">Enter your VIP password to unlock Mythic Ultra.</div>
-    <input id="vip-pw" type="password" placeholder="VIP password" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;font-size:14px;outline:none;margin-bottom:8px;">
-    <div id="vip-err" style="color:#ef4444;font-size:12px;margin-bottom:8px;display:none;">Wrong password.</div>
+    <input type="password" placeholder="VIP password" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;font-size:14px;outline:none;margin-bottom:8px;box-sizing:border-box;">
+    <div class="vip-err" style="color:#ef4444;font-size:12px;margin-bottom:8px;display:none;">Wrong password. Try again.</div>
     <div style="display:flex;gap:8px;">
-      <button id="vip-ok" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Unlock</button>
-      <button id="vip-no" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px;font-size:14px;cursor:pointer;">Cancel</button>
-    </div>
-  </div>`;
-  document.body.appendChild(m);
-  const pw=$('vip-pw'), err=$('vip-err');
-  pw.focus();
-  m.querySelector('#vip-no').addEventListener('click',()=>{m.remove();modelSelect.value=selectedModel;});
-  m.querySelector('#vip-ok').addEventListener('click',async()=>{
-    const r=await fetch('/api/vip-unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw.value.trim()})});
-    const d=await r.json();
-    if(d.success){selectedModel='aarav-ultra';modelSelect.value='aarav-ultra';m.remove();}
-    else{err.style.display='block';pw.value='';pw.focus();}
+      <button class="vip-ok" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Unlock</button>
+      <button class="vip-no" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px;font-size:14px;cursor:pointer;">Cancel</button>
+    </div>`;
+  m.appendChild(box);
+
+  const pw  = box.querySelector('input');
+  const err = box.querySelector('.vip-err');
+  const okBtn = box.querySelector('.vip-ok');
+  const noBtn = box.querySelector('.vip-no');
+
+  setTimeout(() => pw.focus(), 50);
+
+  noBtn.addEventListener('click', () => { m.remove(); modelSelect.value = selectedModel; });
+  m.addEventListener('click', e => { if (e.target === m) { m.remove(); modelSelect.value = selectedModel; } });
+
+  okBtn.addEventListener('click', async () => {
+    okBtn.textContent = 'Checking...'; okBtn.disabled = true;
+    try {
+      const r = await fetch('/api/vip-unlock', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({password: pw.value.trim()})
+      });
+      const d = await r.json();
+      if (d.success) {
+        selectedModel = 'aarav-ultra';
+        modelSelect.value = 'aarav-ultra';
+        m.remove();
+      } else {
+        err.style.display = 'block';
+        pw.value = ''; pw.focus();
+        okBtn.textContent = 'Unlock'; okBtn.disabled = false;
+      }
+    } catch(e) {
+      err.textContent = 'Network error. Try again.';
+      err.style.display = 'block';
+      okBtn.textContent = 'Unlock'; okBtn.disabled = false;
+    }
   });
-  pw.addEventListener('keydown',e=>{if(e.key==='Enter')m.querySelector('#vip-ok').click();});
+  pw.addEventListener('keydown', e => { if (e.key === 'Enter') okBtn.click(); });
 }
-modelSelect.addEventListener('change',()=>{
-  const opt = modelSelect.options[modelSelect.selectedIndex];
-  if(modelSelect.value==='aarav-ultra'){
-    fetch('/api/vip-status').then(r=>r.json()).then(d=>{
-      if(!d.vip){showVipModal();}else{selectedModel='aarav-ultra';}
-    });
-  } else { selectedModel = modelSelect.value; }
+
+modelSelect.addEventListener('change', () => {
+  if (modelSelect.value === 'aarav-ultra') {
+    fetch('/api/vip-status').then(r => r.json()).then(d => {
+      if (!d.vip) showVipModal();
+      else selectedModel = 'aarav-ultra';
+    }).catch(() => showVipModal());
+  } else {
+    selectedModel = modelSelect.value;
+  }
 });
 
 // --- File attach ---
