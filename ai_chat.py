@@ -78,7 +78,7 @@ GEMINI_STREAM_URL = (
 # keep old name for compatibility with existing references below
 API_KEY = GEMINI_API_KEY
 MODEL   = GEMINI_MODEL
-NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "344a953f2d08489a865239c2f9f030e4")
+NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
 
 SYSTEM_PROMPT = (
     "You are Mythic AI, a smart and friendly AI assistant. "
@@ -336,6 +336,10 @@ PAGE = r"""<!DOCTYPE html>
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0; }
   #sidebar-toggle:hover { background:var(--panel); }
   header h1 { font-size:16px; font-weight:700; color:var(--accent); margin:0; }
+  #model-select { background:var(--panel); border:1px solid var(--border); color:var(--text);
+    font-size:12.5px; padding:6px 8px; border-radius:6px; cursor:pointer; flex-shrink:0;
+    max-width:130px; touch-action:manipulation; }
+  #model-select:focus { outline:none; border-color:var(--accent); }
   #name-btn { background:none; border:1px solid var(--border); color:var(--muted);
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
     display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
@@ -406,6 +410,7 @@ PAGE = r"""<!DOCTYPE html>
   .msg-row.ai { align-self:flex-start; align-items:flex-start; }
   .msg-row.error { align-self:center; align-items:center; max-width:90%; }
   .msg-row .msg { max-width:100%; }
+  .msg-meta { font-size:10.5px; color:var(--muted); margin-top:2px; padding:0 4px; }
   .msg-actions { display:flex; gap:4px; margin-top:3px; opacity:0; transition:opacity .15s;
     height:22px; }
   .msg-row:hover .msg-actions, .msg-row:focus-within .msg-actions { opacity:1; }
@@ -494,8 +499,9 @@ PAGE = r"""<!DOCTYPE html>
     /* Main app always takes full width */
     .app { width:100% !important; flex:1; }
 
-    header { padding:calc(10px + env(safe-area-inset-top)) 12px 10px; }
+    header { padding:calc(10px + env(safe-area-inset-top)) 12px 10px; flex-wrap:wrap; }
     header h1 { font-size:14px; }
+    #model-select { font-size:11px; padding:5px 6px; max-width:96px; }
     #sidebar-toggle { width:38px; height:38px; font-size:14px; }
     #name-btn { width:38px; height:38px; font-size:14px; }
     #export-btn { width:38px; height:38px; font-size:14px; }
@@ -535,7 +541,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 <div class="layout">
-  <div id="sidebar-overlay" style="display:none;position:fixed;inset:0;background:#0007;z-index:99" id="sidebar-overlay"></div>
+  <div id="sidebar-overlay"></div>
   <div id="sidebar">
     <button id="new-chat-btn">+ New chat</button>
     <div id="conv-list"></div>
@@ -548,6 +554,7 @@ PAGE = r"""<!DOCTYPE html>
         <h1>Mythic AI</h1>
       </div>
       <div class="right">
+        <select id="model-select" title="Choose model"></select>
         <button id="fullscreen-btn" type="button" title="Fullscreen">
           <span id="fullscreen-icon">⛶</span>
         </button>
@@ -596,8 +603,7 @@ PAGE = r"""<!DOCTYPE html>
               <circle cx="12" cy="13" r="4"/>
             </svg>
           </button>
-          <textarea id="input" rows="1" placeholder="Message Mythic Ai
-          ..."></textarea>
+          <textarea id="input" rows="1" placeholder="Message Mythic AI..."></textarea>
           <!-- Voice input -->
           <button class="tool-btn" id="voice-btn" type="button" title="Voice input">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -647,6 +653,7 @@ const nameInput     = document.getElementById('name-input');
 const nameCancelBtn = document.getElementById('name-cancel-btn');
 const nameSaveBtn   = document.getElementById('name-save-btn');
 const exportBtn     = document.getElementById('export-btn');
+const modelSelect   = document.getElementById('model-select');
 const sidebar      = document.getElementById('sidebar');
 const fileInput    = document.getElementById('file-input');
 const attachBtn    = document.getElementById('attach-btn');
@@ -664,6 +671,34 @@ let activeConvId = null;
 let pendingFile  = null;
 let recognition  = null;
 let currentUtterance = null;
+
+// --- Model picker ---
+const MODELS = [
+  { value: 'auto',       label: 'Mythic Auto' },
+  { value: 'mythic-1',   label: 'Mythic 1' },
+  { value: 'mythic-2',   label: 'Mythic 2' },
+  { value: 'mythic-3',   label: 'Mythic 3' },
+  { value: 'mythic-vip', label: 'Mythic VIP 🔒' },
+];
+MODELS.forEach(m => {
+  const opt = document.createElement('option');
+  opt.value = m.value; opt.textContent = m.label;
+  modelSelect.appendChild(opt);
+});
+function getModel() { return localStorage.getItem('mythic_model') || 'auto'; }
+function getVipPassword() { return localStorage.getItem('mythic_vip_password') || ''; }
+modelSelect.value = getModel();
+
+modelSelect.addEventListener('change', () => {
+  if (modelSelect.value === 'mythic-vip') {
+    const pw = prompt('Enter Mythic VIP password:');
+    if (pw === null) { modelSelect.value = getModel(); return; } // cancelled — revert
+    localStorage.setItem('mythic_vip_password', pw);
+    // Actual validation happens server-side on first message; if it's wrong
+    // we'll show an error and revert the selection then.
+  }
+  localStorage.setItem('mythic_model', modelSelect.value);
+});
 
 // --- Scroll button ---
 messagesWrap.addEventListener('scroll', () => {
@@ -717,7 +752,7 @@ function addMessage(role, text, attachment) {
 
   messagesEl.appendChild(row);
   scrollToBottom();
-  return textNode;
+  return { row, textNode };
 }
 
 function buildMsgActions(row, textNode, role) {
@@ -745,6 +780,16 @@ function buildMsgActions(row, textNode, role) {
     setTimeout(() => { copyBtn.textContent = orig; }, 1200);
   });
   actions.appendChild(copyBtn);
+
+  if (role === 'user') {
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'edit-btn';
+    editBtn.title = 'Edit and resend';
+    editBtn.textContent = '✎';
+    editBtn.addEventListener('click', () => editAndResend(row, textNode));
+    actions.appendChild(editBtn);
+  }
 
   if (role === 'ai') {
     const regenBtn = document.createElement('button');
@@ -940,7 +985,7 @@ function startNewChat() {
   if (isMobile()) closeSidebar();
 }
 
-// --- Send / regenerate / stop ---
+// --- Send / regenerate / stop / edit ---
 let isGenerating = false;
 let currentAbortController = null;
 
@@ -957,8 +1002,8 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
   showTyping();
   setGenerating(true);
   currentAbortController = new AbortController();
+  const startTime = performance.now();
 
-  // Check if user wants an image (only on fresh sends, not regenerate)
   if (!regenerate) {
     const wantsImage = IMAGE_KEYWORDS.test(message || '') && !attachment;
     if (wantsImage) {
@@ -969,7 +1014,6 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
     }
   }
 
-  // Fetch live news if user is asking about news/current events
   const NEWS_RE = /\b(news|khabar|khabren|headline|aaj ki|today.*news|latest.*news|cricket|score|match|weather|mausam|breaking|current events?)\b/i;
   let newsContext = null;
   if (!regenerate && message && NEWS_RE.test(message)) {
@@ -987,6 +1031,7 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
   }
 
   let aiTextNode = null;
+  let aiRow = null;
   try {
     const r = await fetch('/api/chat', {
       method: 'POST',
@@ -999,15 +1044,27 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
         user_name: getUserName(),
         regenerate: !!regenerate,
         news_context: newsContext,
+        model: getModel(),
+        vip_password: getVipPassword(),
       })
     });
+    if (r.status === 403) {
+      hideTyping();
+      addMessage('error', 'Incorrect Mythic VIP password — switched back to Mythic Auto.');
+      localStorage.removeItem('mythic_vip_password');
+      localStorage.setItem('mythic_model', 'auto');
+      modelSelect.value = 'auto';
+      return;
+    }
     if (!r.ok || !r.body) {
       hideTyping();
       addMessage('error', 'Something went wrong. Try again.');
       return;
     }
     hideTyping();
-    aiTextNode = addMessage('ai', '');
+    const created = addMessage('ai', '');
+    aiTextNode = created.textNode;
+    aiRow = created.row;
 
     const convId = r.headers.get('X-Conversation-Id');
     if (convId) activeConvId = convId;
@@ -1023,12 +1080,30 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
       aiTextNode.textContent = fullText;
       scrollToBottom();
     }
-    speak(fullText);
+
+    // Strip trailing \u0000META\u0000{...}\u0000 sentinel (which provider answered)
+    let displayText = fullText;
+    const metaMatch = fullText.match(/\u0000META\u0000(.*?)\u0000/s);
+    let meta = null;
+    if (metaMatch) {
+      try { meta = JSON.parse(metaMatch[1]); } catch {}
+      displayText = (fullText.slice(0, metaMatch.index) + fullText.slice(metaMatch.index + metaMatch[0].length)).trim();
+    }
+    aiTextNode.textContent = displayText;
+
+    const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+    if (aiRow) {
+      const metaLine = document.createElement('div');
+      metaLine.className = 'msg-meta';
+      metaLine.textContent = (meta && meta.model ? meta.model : 'Mythic AI') + ' · ' + elapsed + 's';
+      aiRow.appendChild(metaLine);
+    }
+
+    speak(displayText);
     loadConversationList();
   } catch (err) {
     hideTyping();
     if (err.name === 'AbortError') {
-      // User hit stop — keep whatever text streamed in so far, just mark it as stopped.
       if (aiTextNode && !aiTextNode.textContent.trim()) aiTextNode.textContent = '[Stopped]';
     } else {
       addMessage('error', 'Network error: ' + err.message);
@@ -1043,6 +1118,55 @@ function regenerateLast(row) {
   if (isGenerating) return;
   row.remove();
   streamReply({ regenerate: true });
+}
+
+function editAndResend(row, textNode) {
+  if (isGenerating) return;
+  const original = textNode.textContent;
+  const ta = document.createElement('textarea');
+  ta.value = original;
+  ta.style.width = '100%';
+  ta.style.minHeight = '60px';
+  ta.style.background = 'transparent';
+  ta.style.color = 'inherit';
+  ta.style.border = '1px solid var(--border)';
+  ta.style.borderRadius = '8px';
+  ta.style.padding = '8px';
+  ta.style.font = 'inherit';
+  ta.style.resize = 'vertical';
+  textNode.replaceWith(ta);
+  ta.focus();
+
+  const actionsRow = document.createElement('div');
+  actionsRow.style.display = 'flex';
+  actionsRow.style.gap = '6px';
+  actionsRow.style.marginTop = '6px';
+  const saveBtn = document.createElement('button');
+  saveBtn.textContent = 'Save & resend';
+  saveBtn.type = 'button';
+  saveBtn.style.cssText = 'background:var(--accent);color:#fff;border:none;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.type = 'button';
+  cancelBtn.style.cssText = 'background:none;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;';
+  actionsRow.appendChild(saveBtn);
+  actionsRow.appendChild(cancelBtn);
+  ta.after(actionsRow);
+
+  cancelBtn.addEventListener('click', () => {
+    actionsRow.remove();
+    ta.replaceWith(textNode);
+  });
+  saveBtn.addEventListener('click', () => {
+    const newText = ta.value.trim();
+    if (!newText) return;
+    // Remove everything from this user message onward (it + the AI reply that followed)
+    let next = row.nextElementSibling;
+    while (next) { const toRemove = next; next = next.nextElementSibling; toRemove.remove(); }
+    row.remove();
+    addMessage('user', newText);
+    streamReply({ message: newText });
+  });
 }
 
 form.addEventListener('submit', (e) => {
@@ -1124,14 +1248,11 @@ async function toggleFullscreen() {
         else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
       }
     } else {
-      // iOS Safari / in-app browsers: real Fullscreen API isn't available,
-      // so just maximize the app view (hides scroll bounce, fills the screen).
       document.body.classList.toggle('pseudo-fullscreen');
       updateFullscreenBtn();
     }
   } catch (err) {
     console.warn('Fullscreen request failed:', err);
-    // Even on failure, fall back to pseudo-fullscreen so the button still does something
     document.body.classList.toggle('pseudo-fullscreen');
     updateFullscreenBtn();
   }
@@ -1163,13 +1284,11 @@ nameInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); nameSaveBtn.click(); }
   else if (e.key === 'Escape') closeNameModal();
 });
-// First-time visitors get a gentle one-time prompt
 if (!localStorage.getItem('aarav_name_prompted')) {
   localStorage.setItem('aarav_name_prompted', '1');
   setTimeout(openNameModal, 600);
 }
 
-// Hide sidebar by default on mobile
 if (isMobile()) sidebar.classList.add('hidden');
 newChatBtn.addEventListener('click', startNewChat);
 clearBtn.addEventListener('click', async () => {
@@ -1204,7 +1323,8 @@ exportBtn.addEventListener('click', async () => {
   }
 });
 
-// Initial load
+window.addEventListener('error', (e) => console.error('Global error:', e.error || e.message));
+
 (async () => {
   const convs = await loadConversationList();
   if (convs.length > 0) openConversation(convs[0].id);
@@ -1362,7 +1482,7 @@ def ollama_stream_chunks(messages):
 
 def to_openai_messages(gemini_messages, system_prompt):
     """Convert stored Gemini-format messages to OpenAI-compatible chat format.
-    Used by Groq, OpenRouter, and HuggingFace (all use the same OpenAI-style API)."""
+    Used by Groq and Cerebras (both use the same OpenAI-style API)."""
     msgs = [{"role": "system", "content": system_prompt}]
     for m in gemini_messages:
         role = "user" if m["role"] == "user" else "assistant"
@@ -1371,15 +1491,17 @@ def to_openai_messages(gemini_messages, system_prompt):
     return msgs
 
 
-def groq_stream_chunks(messages):
-    """Stream from Groq API (OpenAI-compatible, very fast, generous free tier)."""
+def groq_stream_chunks(messages, max_tokens=2048):
+    """Stream from Groq API (OpenAI-compatible, very fast, generous free tier).
+    Yields nothing on failure so the caller can silently fall through to the
+    next provider — never leaks a raw error string into the visible reply."""
     if not GROQ_API_KEY:
         return
     try:
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": GROQ_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
+            json={"model": GROQ_MODEL, "messages": messages, "stream": True, "max_tokens": max_tokens},
             stream=True, timeout=60,
         )
         if resp.status_code == 200:
@@ -1402,86 +1524,16 @@ def groq_stream_chunks(messages):
         pass
 
 
-def openrouter_stream_chunks(messages):
-    """Stream from OpenRouter (aggregates many free models)."""
-    if not OPENROUTER_API_KEY:
-        return
-    try:
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json",
-                     "HTTP-Referer": "http://localhost:5000", "X-Title": "Mythic AI"},
-            json={"model": OPENROUTER_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
-            stream=True, timeout=60,
-        )
-        if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data_str)
-                    content_chunk = obj["choices"][0]["delta"].get("content", "")
-                    if content_chunk:
-                        yield content_chunk
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-            return
-        else:
-            yield f"[OpenRouter error {resp.status_code}: {resp.text[:200]}]"
-            return
-    except requests.RequestException as e:
-        yield f"[OpenRouter connection error: {e}]"
-        return
-
-
-def huggingface_stream_chunks(messages):
-    """Stream from Hugging Face Inference API (free tier available)."""
-    if not HF_API_KEY:
-        return
-    # HF uses the same OpenAI-compatible endpoint format
-    try:
-        resp = requests.post(
-            f"https://api-inference.huggingface.co/models/{HF_MODEL}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {HF_API_KEY}", "Content-Type": "application/json"},
-            json={"model": HF_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
-            stream=True, timeout=60,
-        )
-        if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data_str)
-                    content_chunk = obj["choices"][0]["delta"].get("content", "")
-                    if content_chunk:
-                        yield content_chunk
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-            return
-        else:
-            yield f"[OpenRouter error {resp.status_code}: {resp.text[:200]}]"
-            return
-    except requests.RequestException as e:
-        yield f"[OpenRouter connection error: {e}]"
-        return
-
-
-
-def cerebras_stream_chunks(messages):
-    """Stream from Cerebras AI (very fast, generous free tier, works on servers)."""
+def cerebras_stream_chunks(messages, max_tokens=2048):
+    """Stream from Cerebras AI (very fast, generous free tier, works on servers).
+    Yields nothing on failure — same silent-fallthrough contract as Groq above."""
     if not CEREBRAS_API_KEY:
         return
     try:
         resp = requests.post(
             "https://api.cerebras.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"},
-            json={"model": CEREBRAS_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
+            json={"model": CEREBRAS_MODEL, "messages": messages, "stream": True, "max_tokens": max_tokens},
             stream=True, timeout=60,
         )
         if resp.status_code == 200:
@@ -1499,72 +1551,9 @@ def cerebras_stream_chunks(messages):
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
             return
-        else:
-            yield f"[Cerebras error {resp.status_code}: {resp.text[:300]}]"
-            return
-    except requests.RequestException as e:
-        yield f"[Cerebras connection error: {e}]"
-        return
-
-
-# --- Round-robin provider rotation ------------------------------------------
-# Tracks which provider index to try FIRST next time (persists for the life
-# of the process; resets on server restart, which is fine).
-_provider_index = [0]
-
-
-def auto_stream_chunks(gemini_payload, gemini_messages, system_prompt=None):
-    """True round-robin rotation across all configured providers.
-    No provider is primary — starts from wherever the last successful call left off.
-    If the current provider fails/is rate-limited, moves to the next one and
-    remembers that position for the next request too."""
-    sp = system_prompt or SYSTEM_PROMPT
-    openai_msgs = to_openai_messages(gemini_messages, sp)
-    ollama_msgs = to_ollama_messages(gemini_messages, sp)
-
-    # Build the full list of available providers (only those with keys)
-    all_providers = []
-    if PROVIDER in ("auto", "gemini") and GEMINI_API_KEY:
-        all_providers.append(("Gemini", lambda: gemini_stream_chunks(gemini_payload)))
-    if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
-        all_providers.append(("Groq", lambda: groq_stream_chunks(openai_msgs)))
-    if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
-        all_providers.append(("Cerebras", lambda: cerebras_stream_chunks(openai_msgs)))
-    if PROVIDER == "openrouter" and OPENROUTER_API_KEY:
-        all_providers.append(("OpenRouter", lambda: openrouter_stream_chunks(openai_msgs)))
-    if PROVIDER == "huggingface" and HF_API_KEY:
-        # HuggingFace free tier blocks server IPs (Render etc) — only use if explicitly set
-        all_providers.append(("HuggingFace", lambda: huggingface_stream_chunks(openai_msgs)))
-    if PROVIDER == "ollama":
-        all_providers.append(("Ollama", lambda: ollama_stream_chunks(ollama_msgs)))
-
-    if not all_providers:
-        yield "[No AI providers configured. Add at least one API key.]"
-        return
-
-    n = len(all_providers)
-    start = _provider_index[0] % n
-
-    # Try each provider starting from the current rotation position
-    for i in range(n):
-        idx = (start + i) % n
-        name, fn = all_providers[idx]
-        collected = []
-        try:
-            for chunk in fn():
-                collected.append(chunk)
-                yield chunk
-            if collected:
-                # Success — next request starts from the NEXT provider (true rotation)
-                _provider_index[0] = (idx + 1) % n
-                return
-        except Exception:
-            pass
-        # This provider failed — silently try the next one
-
-    yield "[All AI providers failed or are rate-limited. Try again in a moment.]"
-
-
+        # rate limited or error — fall through silently, same as Groq
+    except requests.RequestException:
+        pass
 
 
 def gemini_stream_chunks(payload):
@@ -1580,11 +1569,9 @@ def gemini_stream_chunks(payload):
             timeout=60,
         )
     except requests.RequestException:
-        return  # network error — silently fall through
+        return
 
     if resp.status_code != 200:
-        # Auth errors (401/403), quota errors (429), and server errors (5xx)
-        # all mean "try the next provider" — don't yield anything.
         return
 
     for raw_line in resp.iter_lines(decode_unicode=True):
@@ -1605,6 +1592,102 @@ def gemini_stream_chunks(payload):
             continue
 
 
+# --- Model catalog (branded names shown in the UI model picker) -------------
+# "auto" isn't a real catalog entry — it means "let the server pick", using
+# whatever rotation/fallback order is already configured.
+# provider=None means "use normal auto rotation" (no forced provider) — used
+# by Mythic 3 and Mythic VIP, which differ in system-prompt flavor / token
+# budget rather than which backend serves them.
+MODEL_CATALOG = {
+    "mythic-1":     {"label": "Mythic 1",     "provider": "groq",     "max_tokens": 2048},
+    "mythic-2":     {"label": "Mythic 2",     "provider": "cerebras", "max_tokens": 2048},
+    "mythic-3":     {"label": "Mythic 3",     "provider": None,       "max_tokens": 3072},
+    "mythic-vip":   {"label": "Mythic VIP",   "provider": None,       "max_tokens": 4096, "vip": True},
+}
+
+# Password required to use Mythic VIP. Override with an env var in production
+# instead of relying on the default.
+MYTHIC_VIP_PASSWORD = os.environ.get("MYTHIC_VIP_PASSWORD", "1254")
+
+VIP_SYSTEM_ADDENDUM = (
+    " You are running in MYTHIC VIP mode: give the most thorough, detailed, and "
+    "polished answers you can — more depth, more examples, more care than usual — "
+    "while still following every other rule above exactly (language matching, "
+    "no filler, no repetition)."
+)
+
+
+# --- Provider rotation / fallback -------------------------------------------
+# Tracks which provider index to try FIRST next time (persists for the life
+# of the process; resets on server restart, which is fine).
+_provider_index = [0]
+
+
+def auto_stream_chunks(gemini_payload, gemini_messages, system_prompt=None,
+                        preferred_provider=None, result=None, max_tokens=2048):
+    """Streams a reply, trying providers in order and silently falling back
+    to the next one if the current one fails/is rate-limited/down.
+
+    - preferred_provider: if set (e.g. "groq"), try that one first, then fall
+      back to any other configured provider. Used when the user picks a
+      specific model in the UI (e.g. "Mythic 1"). None means normal rotation.
+    - max_tokens: passed through to Groq/Cerebras (Mythic 3 / Mythic VIP get
+      a bigger budget for longer, more thorough answers).
+    - result: an optional dict this function will populate with
+      result['provider'] = <name that actually answered>, so the caller can
+      report "Answered by Groq" etc. after the stream finishes.
+    """
+    sp = system_prompt or SYSTEM_PROMPT
+    openai_msgs = to_openai_messages(gemini_messages, sp)
+    ollama_msgs = to_ollama_messages(gemini_messages, sp)
+
+    # Build the full list of available providers (only those with keys configured)
+    all_providers = []
+    if PROVIDER in ("auto", "gemini") and GEMINI_API_KEY:
+        all_providers.append(("gemini", "Gemini", lambda: gemini_stream_chunks(gemini_payload)))
+    if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
+        all_providers.append(("groq", "Groq", lambda: groq_stream_chunks(openai_msgs, max_tokens=max_tokens)))
+    if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
+        all_providers.append(("cerebras", "Cerebras", lambda: cerebras_stream_chunks(openai_msgs, max_tokens=max_tokens)))
+    if PROVIDER == "ollama":
+        all_providers.append(("ollama", "Ollama", lambda: ollama_stream_chunks(ollama_msgs)))
+
+    if not all_providers:
+        yield "[No AI providers configured. Add at least one API key (GROQ_API_KEY / CEREBRAS_API_KEY).]"
+        return
+
+    n = len(all_providers)
+
+    # Decide the try-order: explicit model choice takes priority over rotation.
+    if preferred_provider:
+        ordered = [p for p in all_providers if p[0] == preferred_provider] + \
+                  [p for p in all_providers if p[0] != preferred_provider]
+    else:
+        start = _provider_index[0] % n
+        ordered = [all_providers[(start + i) % n] for i in range(n)]
+
+    for i, (key, name, fn) in enumerate(ordered):
+        collected = []
+        try:
+            for chunk in fn():
+                collected.append(chunk)
+                yield chunk
+            if collected:
+                if not preferred_provider:
+                    # advance rotation only in auto mode
+                    idx = all_providers.index((key, name, fn))
+                    _provider_index[0] = (idx + 1) % n
+                if result is not None:
+                    result["provider"] = name
+                return
+        except Exception:
+            pass
+        # This provider failed — silently try the next one (no error text
+        # leaks into the visible reply; that was the old bug).
+
+    yield "[All AI providers are busy or unavailable right now. Please try again in a moment.]"
+
+
 @app.route("/api/chat", methods=["POST"])
 @login_required
 def chat():
@@ -1615,6 +1698,15 @@ def chat():
     attachment = data.get("attachment")  # {name, mimeType, dataBase64} or None
     user_name = (data.get("user_name") or "").strip()[:60]  # what Mythic AI should call the user
     regenerate = bool(data.get("regenerate"))
+    model_choice = (data.get("model") or "auto").strip().lower()
+    vip_password = (data.get("vip_password") or "").strip()
+    model_info = MODEL_CATALOG.get(model_choice, {})
+    preferred_provider = model_info.get("provider")
+    max_tokens = model_info.get("max_tokens", 2048)
+    is_vip = bool(model_info.get("vip"))
+
+    if is_vip and vip_password != MYTHIC_VIP_PASSWORD:
+        return jsonify({"error": "Incorrect Mythic VIP password"}), 403
 
     if regenerate:
         if not conv_id:
@@ -1641,8 +1733,6 @@ def chat():
     messages = conv.setdefault("messages", [])
 
     if regenerate:
-        # Drop the most recent assistant reply (if any) so a fresh one replaces it.
-        # Leaves the preceding user message in place to regenerate against.
         if messages and messages[-1]["role"] == "model":
             messages.pop()
         if not messages or messages[-1]["role"] != "user":
@@ -1666,7 +1756,6 @@ def chat():
             user_entry["attachment_meta"] = attachment_meta
         messages.append(user_entry)
 
-    # Strip attachment_meta (frontend-only field) before sending to the model
     gemini_contents = [
         {"role": m["role"], "parts": m["parts"]} for m in messages
     ]
@@ -1678,9 +1767,8 @@ def chat():
             f"Address them as {user_name} naturally where it fits (e.g. greetings, "
             f"acknowledgements) — don't force it into every single reply."
         )
-    # Only the real Gemini call gets the "you have search" instruction — fallback
-    # providers don't have real search, so giving them that instruction makes them
-    # hallucinate fake tool-call JSON into the visible reply.
+    if is_vip:
+        effective_system_prompt += VIP_SYSTEM_ADDENDUM
     gemini_system_prompt = effective_system_prompt + GEMINI_SEARCH_ADDENDUM
 
     payload = {
@@ -1691,14 +1779,40 @@ def chat():
 
     def generate():
         full_reply = []
+        result = {"provider": None}
+        start_time = time.time()
+
         if PROVIDER == "ollama":
             chunk_source = ollama_stream_chunks(to_ollama_messages(messages, effective_system_prompt))
         else:
-            chunk_source = auto_stream_chunks(payload, messages, effective_system_prompt)
+            chunk_source = auto_stream_chunks(
+                payload, messages, effective_system_prompt,
+                preferred_provider=preferred_provider, result=result,
+                max_tokens=max_tokens,
+            )
 
         for chunk in chunk_source:
             full_reply.append(chunk)
             yield chunk
+
+        elapsed = round(time.time() - start_time, 2)
+        provider_name = result.get("provider")
+        # Figure out the branded label to show. If the user explicitly picked a
+        # Mythic tier, always show that tier's name (Mythic 3 / Mythic VIP don't
+        # map to one fixed provider, so we can't infer the label from the
+        # provider that happened to answer). Otherwise (Auto mode) show whichever
+        # provider actually served the reply, translated to its branded name.
+        if model_choice in MODEL_CATALOG:
+            label = MODEL_CATALOG[model_choice]["label"]
+        else:
+            label = "Mythic AI"
+            for mid, info in MODEL_CATALOG.items():
+                if info.get("provider") and info["provider"] == (provider_name or "").lower():
+                    label = info["label"]
+                    break
+        meta = {"model": label, "provider": provider_name, "time": elapsed}
+        yield f"\u0000META\u0000{json.dumps(meta)}\u0000"
+
         messages.append({"role": "model", "parts": [{"text": "".join(full_reply)}]})
         save_conversation(username, conv_id, conv)
 
@@ -1716,7 +1830,6 @@ def generate_image():
         return jsonify({"error": "prompt required"}), 400
     if not HF_API_KEY:
         return jsonify({"error": "No HuggingFace key configured"}), 503
-    # Use FLUX.1-schnell — fast, high quality, free on HF
     model = "black-forest-labs/FLUX.1-schnell"
     try:
         resp = requests.post(
@@ -1739,13 +1852,9 @@ if __name__ == "__main__":
     if PROVIDER in ("auto", "gemini") and GEMINI_API_KEY:
         active.append(f"Gemini({GEMINI_MODEL})")
     if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
-        active.append(f"Groq({GROQ_MODEL})")
+        active.append(f"Groq({GROQ_MODEL}) [Mythic 1]")
     if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
-        active.append(f"Cerebras({CEREBRAS_MODEL})")
-    if PROVIDER in ("auto", "openrouter") and OPENROUTER_API_KEY:
-        active.append(f"OpenRouter({OPENROUTER_MODEL})")
-    if PROVIDER in ("auto", "huggingface") and HF_API_KEY:
-        active.append(f"HuggingFace({HF_MODEL})")
+        active.append(f"Cerebras({CEREBRAS_MODEL}) [Mythic 1 Pro]")
     if PROVIDER == "ollama":
         active.append(f"Ollama({OLLAMA_MODEL}@{OLLAMA_URL})")
     providers_str = " → ".join(active) if active else "none configured!"
