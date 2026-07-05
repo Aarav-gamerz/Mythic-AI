@@ -90,7 +90,7 @@ AARAV_MAP = {
     "aarav-2.0":   ("groq",     "llama-3.3-70b-versatile"),
     "aarav-2.5":   ("cerebras", "llama3.1-8b"),
     "aarav-3.5":   ("cerebras", "llama-3.3-70b"),
-    "aarav-ultra": ("cerebras", "llama-3.3-70b"),
+    "aarav-ultra": ("groq",     "llama-3.3-70b-versatile"),
 }
 DEFAULT_MODEL = "aarav-2.5"
 MODEL_INFO = [
@@ -2033,6 +2033,61 @@ def cerebras_stream_chunks(messages):
     except requests.RequestException as e:
         yield f"[Cerebras connection error: {e}]"
         return
+
+
+
+# --- Model-specific streaming helpers (used by model selector) ---------------
+
+def groq_stream_chunks_with_model(messages, model):
+    """Stream from Groq with a specific model."""
+    if not GROQ_API_KEY:
+        yield "[Groq API key not configured]"; return
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
+            stream=True, timeout=60,
+        )
+        if resp.status_code == 200:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"): continue
+                d = line[5:].strip()
+                if d == "[DONE]": break
+                try:
+                    c = json.loads(d)["choices"][0]["delta"].get("content", "")
+                    if c: yield c
+                except: continue
+            return
+        yield f"[Groq error {resp.status_code}: {resp.text[:200]}]"
+    except requests.RequestException as e:
+        yield f"[Groq connection error: {e}]"
+
+
+def cerebras_stream_chunks_with_model(messages, model):
+    """Stream from Cerebras with a specific model."""
+    if not CEREBRAS_API_KEY:
+        yield "[Cerebras API key not configured]"; return
+    try:
+        resp = requests.post(
+            "https://api.cerebras.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
+            stream=True, timeout=60,
+        )
+        if resp.status_code == 200:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"): continue
+                d = line[5:].strip()
+                if d == "[DONE]": break
+                try:
+                    c = json.loads(d)["choices"][0]["delta"].get("content", "")
+                    if c: yield c
+                except: continue
+            return
+        yield f"[Cerebras error {resp.status_code}: {resp.text[:200]}]"
+    except requests.RequestException as e:
+        yield f"[Cerebras connection error: {e}]"
 
 
 # --- Round-robin provider rotation ------------------------------------------
