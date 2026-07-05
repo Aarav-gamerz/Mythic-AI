@@ -79,7 +79,27 @@ GEMINI_STREAM_URL = (
 API_KEY = GEMINI_API_KEY
 MODEL   = GEMINI_MODEL
 NEWS_API_KEY    = os.environ.get("NEWS_API_KEY",    "344a953f2d08489a865239c2f9f030e4")
-WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", "")  # Get free key at openweathermap.org
+WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", "")
+
+# --- VIP & Model config ------------------------------------------------------
+VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "1254")
+VIP_MODELS   = {"aarav-ultra"}
+
+AARAV_MAP = {
+    "aarav-1.0":   ("groq",     "llama-3.1-8b-instant"),
+    "aarav-2.0":   ("groq",     "llama-3.3-70b-versatile"),
+    "aarav-2.5":   ("cerebras", "llama3.1-8b"),
+    "aarav-3.5":   ("cerebras", "llama-3.3-70b"),
+    "aarav-ultra": ("cerebras", "llama-3.3-70b"),
+}
+DEFAULT_MODEL = "aarav-2.5"
+MODEL_INFO = [
+    {"id": "aarav-1.0",   "name": "Mythic 1.0",   "desc": "Fast — quick answers",       "vip": False},
+    {"id": "aarav-2.0",   "name": "Mythic 2.0",   "desc": "Balanced — everyday tasks",  "vip": False},
+    {"id": "aarav-2.5",   "name": "Mythic 2.5",   "desc": "Smart — best for most",      "vip": False},
+    {"id": "aarav-3.5",   "name": "Mythic 3.5",   "desc": "Advanced — complex tasks",   "vip": False},
+    {"id": "aarav-ultra", "name": "Mythic Ultra ✨","desc": "Most powerful — VIP only",  "vip": True},
+]
 
 SYSTEM_PROMPT = (
     "You are Mythic AI, a smart and friendly AI assistant. "
@@ -568,6 +588,13 @@ PAGE = r"""<!DOCTYPE html>
       <div class="left">
         <button id="sidebar-toggle" title="Toggle sidebar">☰</button>
         <h1>Mythic AI</h1>
+        <select id="model-select" title="Select model" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;cursor:pointer;outline:none;max-width:130px;font-family:inherit;">
+          <option value="aarav-1.0">Mythic 1.0</option>
+          <option value="aarav-2.0">Mythic 2.0</option>
+          <option value="aarav-2.5" selected>Mythic 2.5</option>
+          <option value="aarav-3.5">Mythic 3.5</option>
+          <option value="aarav-ultra">Mythic Ultra 🔒</option>
+        </select>
       </div>
       <div class="right">
         <button id="fullscreen-btn" type="button" title="Fullscreen">
@@ -651,7 +678,18 @@ PAGE = r"""<!DOCTYPE html>
   <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:420px;">
     <h3 style="margin:0 0 6px;font-size:17px;">🎨 Generate Image</h3>
     <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Describe the image you want to create</p>
-    <textarea id="img-prompt" rows="3" placeholder="e.g. A beautiful sunset over mountains in Ghibli style..."
+    <select id="img-style" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:10px;padding:10px 12px;font-size:14px;margin-bottom:10px;outline:none;cursor:pointer;">
+      <option value="ghibli">🌿 Studio Ghibli</option>
+      <option value="anime">🎌 Anime</option>
+      <option value="realistic">📷 Realistic / Photographic</option>
+      <option value="oil painting">🖼 Oil Painting</option>
+      <option value="watercolor">🎨 Watercolor</option>
+      <option value="3d render">🧊 3D Render</option>
+      <option value="cartoon">🐱 Cartoon</option>
+      <option value="digital art">💻 Digital Art</option>
+      <option value="">✨ No Style (auto)</option>
+    </select>
+    <textarea id="img-prompt" rows="3" placeholder="e.g. A girl walking through a forest..."
       style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;resize:none;outline:none;"></textarea>
     <div id="img-result" style="display:none;margin-top:12px;text-align:center;">
       <img id="img-output" style="max-width:100%;border-radius:10px;display:block;margin:0 auto;" alt="Generated image">
@@ -737,7 +775,83 @@ const scrollBtn    = document.getElementById('scroll-btn');
 const speakingIndicator = document.getElementById('speaking-indicator');
 const stopSpeakBtn = document.getElementById('stop-speak-btn');
 
-let activeConvId = null;
+let activeConvId  = null;
+let selectedModel = 'aarav-2.5';
+let vipUnlocked   = false;
+
+// --- Model selector ---
+const modelSelect = document.getElementById('model-select');
+
+function showVipModal() {
+  const existing = document.getElementById('vip-modal-overlay');
+  if (existing) { existing.style.display = 'flex'; return; }
+  const overlay = document.createElement('div');
+  overlay.id = 'vip-modal-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;display:flex;align-items:center;justify-content:center;';
+  overlay.innerHTML = `
+    <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:340px;">
+      <div style="font-size:22px;margin-bottom:6px;">🔒 VIP Access</div>
+      <div style="color:var(--muted);font-size:13px;margin-bottom:16px;">Mythic Ultra is for VIP users only. Enter your password to unlock it.</div>
+      <input id="vip-pw-in" type="password" placeholder="VIP password"
+        style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;margin-bottom:8px;font-family:inherit;">
+      <div id="vip-pw-err" style="color:#ef4444;font-size:12px;display:none;margin-bottom:8px;">Wrong password. Try again.</div>
+      <div style="display:flex;gap:8px;">
+        <button id="vip-pw-ok" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Unlock</button>
+        <button id="vip-pw-cancel" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px;font-size:14px;cursor:pointer;">Cancel</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const pwIn = overlay.querySelector('#vip-pw-in');
+  const pwErr = overlay.querySelector('#vip-pw-err');
+  pwIn.focus();
+  overlay.querySelector('#vip-pw-cancel').addEventListener('click', () => {
+    overlay.style.display = 'none';
+    modelSelect.value = selectedModel; // revert
+  });
+  overlay.querySelector('#vip-pw-ok').addEventListener('click', async () => {
+    const r = await fetch('/api/vip-unlock', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pwIn.value.trim() }) });
+    const d = await r.json();
+    if (d.success) {
+      vipUnlocked = true; overlay.style.display = 'none';
+      selectedModel = 'aarav-ultra'; modelSelect.value = 'aarav-ultra';
+      const opt = modelSelect.querySelector('option[value="aarav-ultra"]');
+      if (opt) opt.textContent = 'Mythic Ultra ✨';
+    } else { pwErr.style.display = 'block'; pwIn.value = ''; pwIn.focus(); }
+  });
+  pwIn.addEventListener('keydown', e => { if (e.key === 'Enter') overlay.querySelector('#vip-pw-ok').click(); });
+}
+
+// Load models from API and check VIP status
+(async () => {
+  try {
+    const [mr, vr] = await Promise.all([
+      fetch('/api/models').then(r => r.json()),
+      fetch('/api/vip-status').then(r => r.json()),
+    ]);
+    vipUnlocked = vr.vip;
+    modelSelect.innerHTML = '';
+    mr.models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.vip ? (vipUnlocked ? 'Mythic Ultra ✨' : 'Mythic Ultra 🔒') : m.name;
+      opt.dataset.vip = m.vip ? '1' : '0';
+      if (m.id === mr.default) opt.selected = true;
+      modelSelect.appendChild(opt);
+    });
+    selectedModel = mr.default;
+  } catch { /* keep static options */ }
+})();
+
+modelSelect.addEventListener('change', () => {
+  const opt = modelSelect.options[modelSelect.selectedIndex];
+  if (opt && opt.dataset.vip === '1' && !vipUnlocked) {
+    showVipModal();
+  } else {
+    selectedModel = modelSelect.value;
+  }
+});
 let pendingFile  = null;
 let recognition  = null;
 let currentUtterance = null;
@@ -1089,10 +1203,15 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
         user_name: getUserName(),
         regenerate: !!regenerate,
         news_context: newsContext,
+        model: selectedModel,
       })
     });
     if (!r.ok || !r.body) {
       hideTyping();
+      if (r.status === 403) {
+        const e = await r.json().catch(() => ({}));
+        if (e.error === 'vip_required') { showVipModal(); return; }
+      }
       addMessage('error', 'Something went wrong. Try again.');
       return;
     }
@@ -1305,6 +1424,8 @@ const imgGenerateBtn  = document.getElementById('img-generate-btn');
 const imgCloseBtn     = document.getElementById('img-close-btn');
 const imgGenBtn       = document.getElementById('img-gen-btn');
 
+const imgStyle        = document.getElementById('img-style');
+
 imgGenBtn.addEventListener('click', () => {
   imgModalOverlay.style.display = 'flex';
   imgPrompt.focus();
@@ -1317,6 +1438,7 @@ imgModalOverlay.addEventListener('click', e => { if (e.target === imgModalOverla
 
 imgGenerateBtn.addEventListener('click', async () => {
   const prompt = imgPrompt.value.trim();
+  const style = imgStyle ? imgStyle.value : '';
   if (!prompt) return;
   imgResult.style.display = 'none';
   imgError.style.display = 'none';
@@ -1325,7 +1447,7 @@ imgGenerateBtn.addEventListener('click', async () => {
   try {
     const r = await fetch('/api/generate-image', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt })
+      body: JSON.stringify({ prompt, style })
     });
     const d = await r.json();
     imgLoading.style.display = 'none';
@@ -1399,33 +1521,7 @@ async function fetchWeather(location) {
     const d = await r.json();
     weatherLoading.style.display = 'none';
     if (d.weather) {
-      const w = d.weather;
-      const iconUrl = `https://openweathermap.org/img/wn/${w.icon}@2x.png`;
-      weatherContent.innerHTML = `
-        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
-          <img src="${iconUrl}" width="60" height="60" alt="${w.condition}" style="border-radius:8px;">
-          <div>
-            <div style="font-size:18px;font-weight:700;">${w.location}</div>
-            <div style="font-size:13px;color:var(--muted);">${w.condition}</div>
-          </div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-          <div style="background:var(--panel);border-radius:8px;padding:10px;">
-            <div style="font-size:11px;color:var(--muted);">TEMPERATURE</div>
-            <div style="font-size:22px;font-weight:700;">${w.temp}°C</div>
-            <div style="font-size:11px;color:var(--muted);">Feels like ${w.feels_like}°C</div>
-          </div>
-          <div style="background:var(--panel);border-radius:8px;padding:10px;">
-            <div style="font-size:11px;color:var(--muted);">HUMIDITY</div>
-            <div style="font-size:22px;font-weight:700;">${w.humidity}%</div>
-            <div style="font-size:11px;color:var(--muted);">Wind ${w.wind_speed} km/h</div>
-          </div>
-        </div>`;
-      weatherResult.style.display = 'block';
-      // Send to chat too
-      const summary = `🌤 Weather in ${w.location}: ${w.temp}°C, ${w.condition}. Humidity: ${w.humidity}%, Wind: ${w.wind_speed} km/h, Feels like: ${w.feels_like}°C.`;
-      inputEl.value = summary;
-      autoResize();
+      renderWeather(d.weather);
     } else {
       weatherError.textContent = d.error || 'Could not fetch weather.';
       weatherError.style.display = 'block';
@@ -1437,6 +1533,34 @@ async function fetchWeather(location) {
   } finally {
     weatherSearchBtn.disabled = false;
   }
+}
+
+function renderWeather(w) {
+  weatherContent.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+      <div style="font-size:48px;line-height:1;">${w.icon}</div>
+      <div>
+        <div style="font-size:18px;font-weight:700;">${w.location}</div>
+        <div style="font-size:13px;color:var(--muted);">${w.condition}</div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+      <div style="background:var(--bg);border-radius:8px;padding:10px;">
+        <div style="font-size:11px;color:var(--muted);">TEMPERATURE</div>
+        <div style="font-size:22px;font-weight:700;">${w.temp}°C</div>
+        <div style="font-size:11px;color:var(--muted);">Feels like ${w.feels_like}°C</div>
+      </div>
+      <div style="background:var(--bg);border-radius:8px;padding:10px;">
+        <div style="font-size:11px;color:var(--muted);">HUMIDITY</div>
+        <div style="font-size:22px;font-weight:700;">${w.humidity}%</div>
+        <div style="font-size:11px;color:var(--muted);">Wind ${w.wind_speed} km/h</div>
+      </div>
+    </div>`;
+  weatherResult.style.display = 'block';
+  // Also paste summary into chat input
+  const summary = `${w.icon} Weather in ${w.location}: ${w.temp}°C, ${w.condition}. Humidity: ${w.humidity}%, Wind: ${w.wind_speed} km/h, Feels like: ${w.feels_like}°C.`;
+  inputEl.value = summary;
+  autoResize();
 }
 
 weatherSearchBtn.addEventListener('click', () => {
@@ -1452,7 +1576,24 @@ weatherLocationBtn.addEventListener('click', () => {
     async pos => {
       const { latitude: lat, longitude: lon } = pos.coords;
       weatherLocationBtn.disabled = false;
-      await fetchWeather(`${lat},${lon}`);
+      // Send lat/lon separately so backend can reverse-geocode properly
+      weatherResult.style.display = 'none';
+      weatherError.style.display = 'none';
+      weatherLoading.style.display = 'block';
+      weatherSearchBtn.disabled = true;
+      try {
+        const r = await fetch('/api/weather', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ lat, lon })
+        });
+        const d = await r.json();
+        weatherLoading.style.display = 'none';
+        if (d.weather) { renderWeather(d.weather); }
+        else { weatherError.textContent = d.error || 'Could not fetch weather.'; weatherError.style.display = 'block'; }
+      } catch(e) {
+        weatherLoading.style.display = 'none';
+        weatherError.textContent = 'Error: ' + e.message; weatherError.style.display = 'block';
+      } finally { weatherSearchBtn.disabled = false; }
     },
     err => {
       weatherLocationBtn.disabled = false;
@@ -1528,36 +1669,77 @@ def get_news():
 @app.route("/api/weather", methods=["POST"])
 @login_required
 def get_weather():
-    """Fetch weather using OpenWeatherMap API (free tier)."""
+    """Fetch weather using Open-Meteo — free, no API key, supports city names and coordinates."""
     d = request.get_json(force=True) or {}
     location = (d.get("location") or "").strip()
-    if not location:
-        return jsonify({"error": "location required"}), 400
+    lat = d.get("lat")
+    lon = d.get("lon")
 
-    # Use OpenWeatherMap free API
-    api_key = WEATHER_API_KEY or "bd5e378503939ddaee76f12ad7a97608"  # demo key fallback
+    if not location and (lat is None or lon is None):
+        return jsonify({"error": "location or coordinates required"}), 400
+
     try:
-        r = requests.get(
-            "https://api.openweathermap.org/data/2.5/weather",
-            params={"q": location, "appid": api_key, "units": "metric", "lang": "en"},
+        if lat is not None and lon is not None:
+            # Reverse geocode coordinates to get city name
+            geo_r = requests.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={"lat": lat, "lon": lon, "format": "json"},
+                headers={"User-Agent": "MythicAI/1.0"},
+                timeout=8,
+            )
+            if geo_r.status_code == 200:
+                addr = geo_r.json().get("address", {})
+                city = addr.get("city") or addr.get("town") or addr.get("village") or "Your Location"
+                location_name = city
+            else:
+                location_name = "Your Location"
+        else:
+            # Geocode city name
+            geo_r = requests.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": location, "count": 1, "language": "en", "format": "json"},
+                timeout=8,
+            )
+            if geo_r.status_code != 200 or not geo_r.json().get("results"):
+                return jsonify({"error": f"City '{location}' not found. Try a different spelling."}), 404
+            result = geo_r.json()["results"][0]
+            lat = result["latitude"]
+            lon = result["longitude"]
+            location_name = result["name"] + ", " + result.get("country", "")
+
+        # Fetch weather from Open-Meteo (no API key needed)
+        weather_r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat, "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+                "wind_speed_unit": "kmh", "timezone": "auto",
+            },
             timeout=8,
         )
-        if r.status_code == 200:
-            data = r.json()
-            weather = {
-                "location": data["name"] + ", " + data["sys"]["country"],
-                "temp": round(data["main"]["temp"]),
-                "feels_like": round(data["main"]["feels_like"]),
-                "condition": data["weather"][0]["description"].capitalize(),
-                "humidity": data["main"]["humidity"],
-                "wind_speed": round(data["wind"]["speed"] * 3.6),  # m/s to km/h
-                "icon": data["weather"][0]["icon"],
-            }
-            return jsonify({"weather": weather})
-        elif r.status_code == 404:
-            return jsonify({"error": f"City '{location}' not found"}), 404
-        else:
+        if weather_r.status_code != 200:
             return jsonify({"error": "Weather service unavailable"}), 502
+
+        current = weather_r.json()["current"]
+        wmo = {0:"Clear sky",1:"Mainly clear",2:"Partly cloudy",3:"Overcast",
+               45:"Foggy",48:"Icy fog",51:"Light drizzle",53:"Drizzle",55:"Heavy drizzle",
+               61:"Light rain",63:"Rain",65:"Heavy rain",71:"Light snow",73:"Snow",
+               75:"Heavy snow",80:"Rain showers",81:"Heavy showers",82:"Violent showers",
+               95:"Thunderstorm",96:"Thunderstorm with hail",99:"Heavy thunderstorm"}
+        code = current.get("weather_code", 0)
+        icons = {0:"☀️",1:"🌤",2:"⛅",3:"☁️",45:"🌫",48:"🌫",
+                 51:"🌦",53:"🌧",55:"🌧",61:"🌦",63:"🌧",65:"🌧",
+                 71:"🌨",73:"❄️",75:"❄️",80:"🌧",81:"🌧",82:"⛈",
+                 95:"⛈",96:"⛈",99:"⛈"}
+        return jsonify({"weather": {
+            "location": location_name,
+            "temp": round(current["temperature_2m"]),
+            "feels_like": round(current["apparent_temperature"]),
+            "condition": wmo.get(code, "Unknown"),
+            "humidity": current["relative_humidity_2m"],
+            "wind_speed": round(current["wind_speed_10m"]),
+            "icon": icons.get(code, "🌡"),
+        }})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
@@ -1565,25 +1747,42 @@ def get_weather():
 @app.route("/api/generate-image", methods=["POST"])
 @login_required
 def generate_image():
-    """Generate image using HuggingFace FLUX model."""
+    """Generate image using Pollinations.ai — free, no API key, works on all servers."""
+    import urllib.parse
     d = request.get_json(force=True) or {}
     prompt = (d.get("prompt") or "").strip()
+    style  = (d.get("style") or "").strip()
     if not prompt:
         return jsonify({"error": "prompt required"}), 400
-    if not HF_API_KEY:
-        return jsonify({"error": "Image generation not configured"}), 503
+    full_prompt = f"{prompt}, {style} style, highly detailed, beautiful" if style else f"{prompt}, highly detailed, beautiful, 4k"
+    encoded = urllib.parse.quote(full_prompt)
+    image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&enhance=true"
     try:
-        resp = requests.post(
-            "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
-            headers={"Authorization": f"Bearer {HF_API_KEY}"},
-            json={"inputs": prompt},
-            timeout=60,
-        )
+        resp = requests.get(image_url, timeout=90)
         if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
             return jsonify({"image": base64.b64encode(resp.content).decode()})
         return jsonify({"error": f"Generation failed ({resp.status_code})"}), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/models")
+def get_models():
+    return jsonify({"models": MODEL_INFO, "default": DEFAULT_MODEL})
+
+
+@app.route("/api/vip-unlock", methods=["POST"])
+def vip_unlock():
+    d = request.get_json(force=True) or {}
+    if d.get("password") == VIP_PASSWORD:
+        session["vip"] = True
+        return jsonify({"success": True})
+    return jsonify({"success": False}), 403
+
+
+@app.route("/api/vip-status")
+def vip_status():
+    return jsonify({"vip": bool(session.get("vip"))})
 
 
 @app.route("/api/conversations", methods=["GET"])
@@ -1942,8 +2141,15 @@ def chat():
     news_context = (data.get("news_context") or "").strip()
     conv_id = data.get("conversation_id")
     attachment = data.get("attachment")  # {name, mimeType, dataBase64} or None
-    user_name = (data.get("user_name") or "").strip()[:60]  # what Aarav AI should call the user
+    user_name = (data.get("user_name") or "").strip()[:60]
     regenerate = bool(data.get("regenerate"))
+    aarav_id = (data.get("model") or DEFAULT_MODEL).strip()
+
+    # VIP gate
+    if aarav_id in VIP_MODELS and not session.get("vip"):
+        return jsonify({"error": "vip_required"}), 403
+
+    provider, model_name = AARAV_MAP.get(aarav_id, AARAV_MAP[DEFAULT_MODEL])
 
     if regenerate:
         if not conv_id:
@@ -2020,11 +2226,15 @@ def chat():
 
     def generate():
         full_reply = []
-        if PROVIDER == "ollama":
+        openai_msgs = to_openai_messages(messages, effective_system_prompt)
+        if provider == "groq":
+            chunk_source = groq_stream_chunks_with_model(openai_msgs, model_name)
+        elif provider == "cerebras":
+            chunk_source = cerebras_stream_chunks_with_model(openai_msgs, model_name)
+        elif PROVIDER == "ollama":
             chunk_source = ollama_stream_chunks(to_ollama_messages(messages, effective_system_prompt))
         else:
             chunk_source = auto_stream_chunks(payload, messages, effective_system_prompt)
-
         for chunk in chunk_source:
             full_reply.append(chunk)
             yield chunk
