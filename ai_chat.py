@@ -40,7 +40,6 @@ import uuid
 import time
 import base64
 import requests
-from datetime import datetime, timezone
 from flask import (
     Flask, request, jsonify, Response, session,
     stream_with_context
@@ -54,14 +53,13 @@ PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
 # "huggingface" = Hugging Face only
 # "ollama"      = local Ollama only
 
-# --- API Keys ------------------------------------------------------------
-# WARNING: never commit a file with real keys to a public GitHub repo, and
-# never hardcode them as defaults here — set them as environment variables
-# on Render (or wherever you deploy) instead.
-GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "")
-CEREBRAS_API_KEY  = os.environ.get("CEREBRAS_API_KEY",  "")
-OPENROUTER_API_KEY= os.environ.get("OPENROUTER_API_KEY","")
-HF_API_KEY        = os.environ.get("HF_API_KEY",        "")
+# --- API Keys (hardcoded fallbacks — override via environment variables) ------
+# WARNING: don't commit a file with real keys to a public GitHub repo.
+# Set these as environment variables on Render instead.
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "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")
+CEREBRAS_API_KEY  = os.environ.get("CEREBRAS_API_KEY",  "csk-2ph5f5nxt3jrtwj5edcehpr5xh96628268fvjh4e658m4t6h")
+OPENROUTER_API_KEY= os.environ.get("OPENROUTER_API_KEY","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")
+HF_API_KEY        = os.environ.get("HF_API_KEY",        "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")
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY",    "")
 
 # --- Model names -------------------------------------------------------------
@@ -80,21 +78,18 @@ GEMINI_STREAM_URL = (
 # keep old name for compatibility with existing references below
 API_KEY = GEMINI_API_KEY
 MODEL   = GEMINI_MODEL
-NEWS_API_KEY    = os.environ.get("NEWS_API_KEY",    "")
+NEWS_API_KEY    = os.environ.get("NEWS_API_KEY",    "344a953f2d08489a865239c2f9f030e4")
 WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", "")
 
 # --- VIP & Model config ------------------------------------------------------
 VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "1254")
 VIP_MODELS   = {"aarav-ultra"}
 
-# Every tier has a PRIMARY provider/model, but will automatically fall back to
-# the other provider (with that provider's default model) if the primary one
-# fails — so one bad key/model name doesn't take every tier down with it.
 AARAV_MAP = {
-    "aarav-1.0":   ("cerebras", "llama3.1-8b"),
-    "aarav-2.0":   ("cerebras", "llama-3.3-70b"),
-    "aarav-2.5":   ("groq",     GROQ_MODEL),
-    "aarav-3.5":   ("cerebras", "llama-4-scout-17b-16e-instruct"),
+    "aarav-1.0":   ("groq",     "llama-3.1-8b-instant"),
+    "aarav-2.0":   ("groq",     "llama-3.3-70b-versatile"),
+    "aarav-2.5":   ("groq",     "llama-3.3-70b-versatile"),
+    "aarav-3.5":   ("cerebras", "llama3.1-70b"),
     "aarav-ultra": ("cerebras", "llama-3.3-70b"),
 }
 DEFAULT_MODEL = "aarav-2.5"
@@ -113,6 +108,10 @@ SYSTEM_PROMPT = (
     "Never say you were made by Google, Meta, Groq, Cerebras, Mistral, Anthropic, OpenAI, or any other company. "
 
     "NEWS: You have access to real-time news. When the system provides news headlines, present them naturally. "
+
+    "WEB SEARCH: You have access to real web search via DuckDuckGo. When the system provides search results, "
+    "use them to answer the user's question accurately. Present the information naturally — don't just list URLs. "
+    "If asked to search for something or about current events, the system will fetch results for you. "
 
     "WEATHER: When the system provides weather data, present it clearly and naturally. "
     "Include temperature, condition, humidity, and wind. Make it friendly and useful. "
@@ -156,13 +155,6 @@ MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 8 MB
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-if SUPABASE_URL and not SUPABASE_KEY:
-    print("[Supabase] WARNING: SUPABASE_URL is set but SUPABASE_KEY is missing — "
-          "falling back to local file storage, which does NOT persist on Render.")
-if SUPABASE_KEY and not SUPABASE_URL:
-    print("[Supabase] WARNING: SUPABASE_KEY is set but SUPABASE_URL is missing — "
-          "falling back to local file storage, which does NOT persist on Render.")
-
 def sb_headers():
     return {
         "apikey": SUPABASE_KEY,
@@ -174,16 +166,8 @@ def sb_headers():
 def sb(path):
     return f"{SUPABASE_URL}/rest/v1/{path}"
 
-def _sb_log_error(action, resp=None, exc=None):
-    """Every Supabase failure now prints the real reason to the server logs
-    (visible in Render's Logs tab) instead of failing completely silently."""
-    if exc is not None:
-        print(f"[Supabase] {action} failed: {exc}")
-    elif resp is not None and not (200 <= resp.status_code < 300):
-        print(f"[Supabase] {action} failed: HTTP {resp.status_code} — {resp.text[:500]}")
 
-
-# --- User accounts -----------------------------------------------------------
+# --- User accounts (Supabase: users table) -----------------------------------
 
 def current_username():
     """Each visitor gets a unique anonymous ID stored in their browser cookie.
@@ -206,7 +190,7 @@ def login_required(view):
 # --- Supabase / file storage helpers ----------------------------------------
 
 def list_conversations(username):
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not SUPABASE_URL:
         return _list_conversations_file(username)
     try:
         r = requests.get(
@@ -215,14 +199,13 @@ def list_conversations(username):
         )
         if r.status_code == 200:
             return r.json()
-        _sb_log_error("list_conversations", resp=r)
-    except Exception as e:
-        _sb_log_error("list_conversations", exc=e)
+    except Exception:
+        pass
     return []
 
 
 def load_conversation(username, conv_id):
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not SUPABASE_URL:
         return _load_conversation_file(username, conv_id)
     try:
         r = requests.get(
@@ -238,21 +221,19 @@ def load_conversation(username, conv_id):
                     "updated_at": row["updated_at"],
                     "messages": row["messages"] if isinstance(row["messages"], list) else json.loads(row["messages"]),
                 }
-        else:
-            _sb_log_error("load_conversation", resp=r)
-    except Exception as e:
-        _sb_log_error("load_conversation", exc=e)
+    except Exception:
+        pass
     return None
 
 
 def save_conversation(username, conv_id, data):
     data["updated_at"] = time.time()
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not SUPABASE_URL:
         _save_conversation_file(username, conv_id, data)
         return
     try:
         headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
-        r = requests.post(
+        requests.post(
             sb("conversations"),
             headers=headers,
             json={
@@ -264,27 +245,21 @@ def save_conversation(username, conv_id, data):
             },
             timeout=15,
         )
-        if r.status_code not in (200, 201, 204):
-            _sb_log_error("save_conversation", resp=r)
-            _save_conversation_file(username, conv_id, data)
-    except Exception as e:
-        _sb_log_error("save_conversation", exc=e)
-        _save_conversation_file(username, conv_id, data)
+    except Exception:
+        pass
 
 
 def delete_conversation(username, conv_id):
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not SUPABASE_URL:
         _delete_conversation_file(username, conv_id)
         return
     try:
-        r = requests.delete(
+        requests.delete(
             sb(f"conversations?id=eq.{conv_id}&username=eq.{username}"),
             headers=sb_headers(), timeout=10,
         )
-        if r.status_code not in (200, 204):
-            _sb_log_error("delete_conversation", resp=r)
-    except Exception as e:
-        _sb_log_error("delete_conversation", exc=e)
+    except Exception:
+        pass
 
 
 # --- Local file fallbacks for when Supabase is not configured ----------------
@@ -606,11 +581,11 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 <div class="layout">
-  <div id="sidebar-overlay"></div>
+  <div id="sidebar-overlay" style="display:none;position:fixed;inset:0;background:#0007;z-index:99" id="sidebar-overlay"></div>
   <div id="sidebar">
     <button id="new-chat-btn">+ New chat</button>
     <div id="conv-list"></div>
-    <div id="sidebar-footer">Mythic AI &middot; by Aarav Singh</div>
+    <div id="sidebar-footer">Aarav AI &middot; by Aarav Singh</div>
   </div>
   <div class="app">
     <header>
@@ -661,6 +636,7 @@ PAGE = r"""<!DOCTYPE html>
       <button class="quick-btn" id="img-gen-btn" title="Generate Image">🎨 Image</button>
       <button class="quick-btn" id="homework-btn" title="Homework Help">📚 Homework</button>
       <button class="quick-btn" id="weather-btn" title="Weather Forecast">🌤 Weather</button>
+      <button class="quick-btn" id="search-btn" title="Web Search">🔍 Search</button>
     </div>
 
     <div class="input-area">
@@ -1019,8 +995,10 @@ function speak(text) {
   if (!plain) return;
   currentUtterance = new SpeechSynthesisUtterance(plain);
   currentUtterance.rate = 1.0;
+  // Auto-detect Hindi and use Hindi voice
   const hindiText = isHindi(plain);
   currentUtterance.lang = hindiText ? 'hi-IN' : 'en-US';
+  // Try to pick a matching voice
   const voices = window.speechSynthesis.getVoices();
   const langVoice = voices.find(v => v.lang.startsWith(hindiText ? 'hi' : 'en'));
   if (langVoice) currentUtterance.voice = langVoice;
@@ -1029,6 +1007,7 @@ function speak(text) {
   currentUtterance.onerror = () => speakingIndicator.classList.remove('show');
   window.speechSynthesis.speak(currentUtterance);
 }
+// Load voices (Chrome loads them async)
 if (window.speechSynthesis) window.speechSynthesis.onvoiceschanged = () => {};
 
 stopSpeakBtn.addEventListener('click', () => {
@@ -1043,7 +1022,7 @@ function setupVoice() {
   recognition = new SR();
   recognition.continuous = false;
   recognition.interimResults = true;
-  recognition.lang = 'hi-IN';
+  recognition.lang = 'hi-IN';  // supports both Hindi and English on most browsers
   let finalTranscript = '';
   recognition.onstart  = () => { voiceBtn.classList.add('active', 'listening'); finalTranscript = ''; };
   recognition.onresult = (e) => {
@@ -1188,6 +1167,7 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
   setGenerating(true);
   currentAbortController = new AbortController();
 
+  // Check if user wants an image (only on fresh sends, not regenerate)
   if (!regenerate) {
     const wantsImage = IMAGE_KEYWORDS.test(message || '') && !attachment;
     if (wantsImage) {
@@ -1198,7 +1178,9 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
     }
   }
 
+  // Fetch live news if user is asking about news/current events
   const NEWS_RE = /\b(news|khabar|khabren|headline|aaj ki|today.*news|latest.*news|cricket|score|match|weather|mausam|breaking|current events?)\b/i;
+  const SEARCH_RE = /^(search:|search for|google|find|look up|what is|who is|tell me about|how to|kya hai|kaun hai|batao|dhundho)/i;
   let newsContext = null;
   if (!regenerate && message && NEWS_RE.test(message)) {
     try {
@@ -1209,7 +1191,22 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
       });
       const nd = await nr.json();
       if (nd.articles && nd.articles.length > 0) {
-        newsContext = nd.articles.map((a, i) => `${i+1}. ${a.title} (${a.source})`).join('\n');
+        newsContext = "Live news headlines:\n" + nd.articles.map((a, i) => `${i+1}. ${a.title} (${a.source})`).join('\n');
+      }
+    } catch {}
+  } else if (!regenerate && message && SEARCH_RE.test(message)) {
+    // Web search via DuckDuckGo
+    const searchQuery = message.replace(/^(search:|search for)\s*/i, '').trim();
+    try {
+      const sr = await fetch('/api/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: searchQuery })
+      });
+      const sd = await sr.json();
+      if (sd.results && sd.results.length > 0) {
+        newsContext = "Web search results for \"" + searchQuery + "\":\n" +
+          sd.results.map((r, i) => `${i+1}. ${r.title}: ${r.snippet}`).join('\n');
       }
     } catch {}
   }
@@ -1261,6 +1258,7 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
   } catch (err) {
     hideTyping();
     if (err.name === 'AbortError') {
+      // User hit stop — keep whatever text streamed in so far, just mark it as stopped.
       if (aiTextNode && !aiTextNode.textContent.trim()) aiTextNode.textContent = '[Stopped]';
     } else {
       addMessage('error', 'Network error: ' + err.message);
@@ -1356,11 +1354,14 @@ async function toggleFullscreen() {
         else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
       }
     } else {
+      // iOS Safari / in-app browsers: real Fullscreen API isn't available,
+      // so just maximize the app view (hides scroll bounce, fills the screen).
       document.body.classList.toggle('pseudo-fullscreen');
       updateFullscreenBtn();
     }
   } catch (err) {
     console.warn('Fullscreen request failed:', err);
+    // Even on failure, fall back to pseudo-fullscreen so the button still does something
     document.body.classList.toggle('pseudo-fullscreen');
     updateFullscreenBtn();
   }
@@ -1392,11 +1393,13 @@ nameInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); nameSaveBtn.click(); }
   else if (e.key === 'Escape') closeNameModal();
 });
+// First-time visitors get a gentle one-time prompt
 if (!localStorage.getItem('aarav_name_prompted')) {
   localStorage.setItem('aarav_name_prompted', '1');
   setTimeout(openNameModal, 600);
 }
 
+// Hide sidebar by default on mobile
 if (isMobile()) sidebar.classList.add('hidden');
 newChatBtn.addEventListener('click', startNewChat);
 clearBtn.addEventListener('click', async () => {
@@ -1411,7 +1414,7 @@ exportBtn.addEventListener('click', async () => {
     const r = await fetch('/api/conversations/' + activeConvId);
     if (!r.ok) return;
     const d = await r.json();
-    const lines = [`# ${d.title || 'Mythic AI chat'}`, ''];
+    const lines = [`# ${d.title || 'Aarav AI chat'}`, ''];
     (d.messages || []).forEach(m => {
       lines.push(m.role === 'user' ? 'You:' : 'Mythic AI:');
       lines.push(m.text || (m.attachment ? `[attachment: ${m.attachment.name}]` : ''));
@@ -1472,6 +1475,7 @@ imgGenerateBtn.addEventListener('click', async () => {
     if (d.image) {
       imgOutput.src = 'data:image/png;base64,' + d.image;
       imgResult.style.display = 'block';
+      // Also add to chat
       clearEmptyState();
       const div = document.createElement('div');
       div.className = 'msg-row ai';
@@ -1574,6 +1578,7 @@ function renderWeather(w) {
       </div>
     </div>`;
   weatherResult.style.display = 'block';
+  // Also paste summary into chat input
   const summary = `${w.icon} Weather in ${w.location}: ${w.temp}°C, ${w.condition}. Humidity: ${w.humidity}%, Wind: ${w.wind_speed} km/h, Feels like: ${w.feels_like}°C.`;
   inputEl.value = summary;
   autoResize();
@@ -1592,6 +1597,7 @@ weatherLocationBtn.addEventListener('click', () => {
     async pos => {
       const { latitude: lat, longitude: lon } = pos.coords;
       weatherLocationBtn.disabled = false;
+      // Send lat/lon separately so backend can reverse-geocode properly
       weatherResult.style.display = 'none';
       weatherError.style.display = 'none';
       weatherLoading.style.display = 'block';
@@ -1625,6 +1631,17 @@ homeworkBtn.addEventListener('click', () => {
   inputEl.focus();
   autoResize();
   inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+});
+
+// --- Web Search button ---
+const searchBtn = document.getElementById('search-btn');
+searchBtn.addEventListener('click', () => {
+  const q = prompt('What do you want to search for?');
+  if (!q || !q.trim()) return;
+  inputEl.value = 'Search: ' + q.trim();
+  inputEl.focus();
+  autoResize();
+  form.requestSubmit();
 });
 
 // Initial load
@@ -1680,7 +1697,105 @@ def get_news():
     return jsonify({"articles": arts})
 
 
-@app.route("/api/weather", methods=["POST"])
+@app.route("/api/search", methods=["POST"])
+@login_required
+def web_search():
+    """Web search using DuckDuckGo — free, no API key needed."""
+    d = request.get_json(force=True) or {}
+    query = (d.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "query required"}), 400
+    try:
+        # DuckDuckGo instant answer API
+        r = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+            headers={"User-Agent": "MythicAI/1.0"},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            results = []
+            # Abstract (main answer)
+            if data.get("AbstractText"):
+                results.append({
+                    "title": data.get("Heading", query),
+                    "snippet": data["AbstractText"],
+                    "url": data.get("AbstractURL", ""),
+                    "source": data.get("AbstractSource", ""),
+                })
+            # Related topics
+            for topic in data.get("RelatedTopics", [])[:5]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    results.append({
+                        "title": topic.get("Text", "")[:80],
+                        "snippet": topic.get("Text", ""),
+                        "url": topic.get("FirstURL", ""),
+                        "source": "DuckDuckGo",
+                    })
+            # Answer box
+            if data.get("Answer"):
+                results.insert(0, {
+                    "title": "Answer",
+                    "snippet": data["Answer"],
+                    "url": "",
+                    "source": data.get("AnswerType", ""),
+                })
+            if results:
+                return jsonify({"results": results[:6], "query": query})
+            # Fallback: try DuckDuckGo HTML scrape for more results
+            r2 = requests.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers={"User-Agent": "Mozilla/5.0 (compatible; MythicAI/1.0)"},
+                timeout=8,
+            )
+            if r2.status_code == 200:
+                from html.parser import HTMLParser
+                class DDGParser(HTMLParser):
+                    def __init__(self):
+                        super().__init__()
+                        self.results = []
+                        self.in_result = False
+                        self.in_snippet = False
+                        self.current = {}
+                        self.capture = False
+                        self.text = ""
+                    def handle_starttag(self, tag, attrs):
+                        attrs = dict(attrs)
+                        if tag == "a" and "result__a" in attrs.get("class",""):
+                            self.current = {"url": attrs.get("href",""), "title": "", "snippet": ""}
+                            self.capture = True
+                            self.text = ""
+                        elif tag == "a" and self.capture:
+                            pass
+                        elif tag == "td" and "result__snippet" in attrs.get("class",""):
+                            self.in_snippet = True
+                            self.text = ""
+                    def handle_endtag(self, tag):
+                        if tag == "a" and self.capture:
+                            self.current["title"] = self.text.strip()
+                            self.capture = False
+                        elif tag == "td" and self.in_snippet:
+                            self.current["snippet"] = self.text.strip()
+                            self.in_snippet = False
+                            if self.current.get("title"):
+                                self.current["source"] = "DuckDuckGo"
+                                self.results.append(dict(self.current))
+                                self.current = {}
+                    def handle_data(self, data):
+                        if self.capture or self.in_snippet:
+                            self.text += data
+                parser = DDGParser()
+                parser.feed(r2.text)
+                if parser.results:
+                    return jsonify({"results": parser.results[:6], "query": query})
+        return jsonify({"results": [], "query": query, "error": "No results found"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+
 @login_required
 def get_weather():
     """Fetch weather using Open-Meteo — free, no API key, supports city names and coordinates."""
@@ -1694,6 +1809,7 @@ def get_weather():
 
     try:
         if lat is not None and lon is not None:
+            # Reverse geocode coordinates to get city name
             geo_r = requests.get(
                 "https://nominatim.openstreetmap.org/reverse",
                 params={"lat": lat, "lon": lon, "format": "json"},
@@ -1707,6 +1823,7 @@ def get_weather():
             else:
                 location_name = "Your Location"
         else:
+            # Geocode city name
             geo_r = requests.get(
                 "https://geocoding-api.open-meteo.com/v1/search",
                 params={"name": location, "count": 1, "language": "en", "format": "json"},
@@ -1719,6 +1836,7 @@ def get_weather():
             lon = result["longitude"]
             location_name = result["name"] + ", " + result.get("country", "")
 
+        # Fetch weather from Open-Meteo (no API key needed)
         weather_r = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
@@ -1910,19 +2028,15 @@ def to_openai_messages(gemini_messages, system_prompt):
     return msgs
 
 
-def groq_stream_chunks_with_model(messages, model):
-    """Stream from Groq with a specific model. Yields NOTHING on any failure —
-    logs the real reason server-side instead of leaking raw error text into
-    the visible chat, so a calling wrapper can silently fall back to another
-    provider/model instead of the user seeing garbage like '[Groq error 400]'."""
+def groq_stream_chunks(messages):
+    """Stream from Groq API (OpenAI-compatible, very fast, generous free tier)."""
     if not GROQ_API_KEY:
-        print("[Groq] skipped: GROQ_API_KEY is not set")
         return
     try:
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
+            json={"model": GROQ_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
             stream=True, timeout=60,
         )
         if resp.status_code == 200:
@@ -1939,71 +2053,14 @@ def groq_stream_chunks_with_model(messages, model):
                         yield content
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
-            return
-        print(f"[Groq] model={model} failed: HTTP {resp.status_code} — {resp.text[:400]}")
-    except requests.RequestException as e:
-        print(f"[Groq] model={model} connection error: {e}")
-
-
-def cerebras_stream_chunks_with_model(messages, model):
-    """Stream from Cerebras with a specific model. Same silent-failure /
-    server-side-logging contract as groq_stream_chunks_with_model above."""
-    if not CEREBRAS_API_KEY:
-        print("[Cerebras] skipped: CEREBRAS_API_KEY is not set")
-        return
-    try:
-        resp = requests.post(
-            "https://api.cerebras.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"},
-            json={"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
-            stream=True, timeout=60,
-        )
-        if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data_str)
-                    content = obj["choices"][0]["delta"].get("content", "")
-                    if content:
-                        yield content
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-            return
-        print(f"[Cerebras] model={model} failed: HTTP {resp.status_code} — {resp.text[:400]}")
-    except requests.RequestException as e:
-        print(f"[Cerebras] model={model} connection error: {e}")
-
-
-def model_stream_with_fallback(provider, model_name, openai_msgs):
-    """Try the tier's assigned provider/model first. If it fails for any
-    reason (bad key, bad model name, rate limit, network error — all logged
-    server-side above), automatically retry on the OTHER provider using that
-    provider's default model, so one broken tier doesn't take the whole app
-    down. Only shows an error to the user if BOTH providers fail."""
-    other_provider = "groq" if provider == "cerebras" else "cerebras"
-    other_model = GROQ_MODEL if other_provider == "groq" else CEREBRAS_MODEL
-
-    attempts = [(provider, model_name), (other_provider, other_model)]
-    for p, m in attempts:
-        fn = groq_stream_chunks_with_model if p == "groq" else cerebras_stream_chunks_with_model
-        collected = []
-        for chunk in fn(openai_msgs, m):
-            collected.append(chunk)
-            yield chunk
-        if collected:
-            return
-
-    yield ("[Mythic AI's backend is unavailable right now — both Groq and Cerebras "
-           "failed to respond. Check the server logs for the exact reason (bad/expired "
-           "API key, invalid model name, or rate limit), or try again in a moment.]")
+            return  # success — stop here
+        # rate limited or error — fall through (return without yielding)
+    except requests.RequestException:
+        pass
 
 
 def openrouter_stream_chunks(messages):
-    """Stream from OpenRouter (aggregates many free models). Silent on failure."""
+    """Stream from OpenRouter (aggregates many free models)."""
     if not OPENROUTER_API_KEY:
         return
     try:
@@ -2029,15 +2086,19 @@ def openrouter_stream_chunks(messages):
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
             return
-        print(f"[OpenRouter] failed: HTTP {resp.status_code} — {resp.text[:300]}")
+        else:
+            yield f"[OpenRouter error {resp.status_code}: {resp.text[:200]}]"
+            return
     except requests.RequestException as e:
-        print(f"[OpenRouter] connection error: {e}")
+        yield f"[OpenRouter connection error: {e}]"
+        return
 
 
 def huggingface_stream_chunks(messages):
-    """Stream from Hugging Face Inference API. Silent on failure."""
+    """Stream from Hugging Face Inference API (free tier available)."""
     if not HF_API_KEY:
         return
+    # HF uses the same OpenAI-compatible endpoint format
     try:
         resp = requests.post(
             f"https://api-inference.huggingface.co/models/{HF_MODEL}/v1/chat/completions",
@@ -2060,9 +2121,190 @@ def huggingface_stream_chunks(messages):
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
             return
-        print(f"[HuggingFace] failed: HTTP {resp.status_code} — {resp.text[:300]}")
+        else:
+            yield f"[OpenRouter error {resp.status_code}: {resp.text[:200]}]"
+            return
     except requests.RequestException as e:
-        print(f"[HuggingFace] connection error: {e}")
+        yield f"[OpenRouter connection error: {e}]"
+        return
+
+
+
+def openrouter_stream_chunks_with_model(messages, model):
+    """Stream from OpenRouter with a specific model."""
+    if not OPENROUTER_API_KEY:
+        yield "[OpenRouter API key not configured]"; return
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                     "Content-Type": "application/json",
+                     "HTTP-Referer": "https://aarav-ai.onrender.com",
+                     "X-Title": "Mythic AI"},
+            json={"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
+            stream=True, timeout=60,
+        )
+        if resp.status_code == 200:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"): continue
+                d = line[5:].strip()
+                if d == "[DONE]": break
+                try:
+                    c = json.loads(d)["choices"][0]["delta"].get("content", "")
+                    if c: yield c
+                except: continue
+            return
+        yield f"[OpenRouter error {resp.status_code}: {resp.text[:200]}]"
+    except requests.RequestException as e:
+        yield f"[OpenRouter error: {e}]"
+
+
+    """Stream from Cerebras AI (very fast, generous free tier, works on servers)."""
+    if not CEREBRAS_API_KEY:
+        return
+    try:
+        resp = requests.post(
+            "https://api.cerebras.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"},
+            json={"model": CEREBRAS_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
+            stream=True, timeout=60,
+        )
+        if resp.status_code == 200:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data_str)
+                    chunk = obj["choices"][0]["delta"].get("content", "")
+                    if chunk:
+                        yield chunk
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+            return
+        else:
+            yield f"[Cerebras error {resp.status_code}: {resp.text[:300]}]"
+            return
+    except requests.RequestException as e:
+        yield f"[Cerebras connection error: {e}]"
+        return
+
+
+
+# --- Model-specific streaming helpers (used by model selector) ---------------
+
+def groq_stream_chunks_with_model(messages, model):
+    """Stream from Groq with a specific model."""
+    if not GROQ_API_KEY:
+        yield "[Groq API key not configured]"; return
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
+            stream=True, timeout=60,
+        )
+        if resp.status_code == 200:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"): continue
+                d = line[5:].strip()
+                if d == "[DONE]": break
+                try:
+                    c = json.loads(d)["choices"][0]["delta"].get("content", "")
+                    if c: yield c
+                except: continue
+            return
+        yield f"[Groq error {resp.status_code}: {resp.text[:200]}]"
+    except requests.RequestException as e:
+        yield f"[Groq connection error: {e}]"
+
+
+def cerebras_stream_chunks_with_model(messages, model):
+    """Stream from Cerebras with a specific model."""
+    if not CEREBRAS_API_KEY:
+        yield "[Cerebras API key not configured]"; return
+    try:
+        resp = requests.post(
+            "https://api.cerebras.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
+            stream=True, timeout=60,
+        )
+        if resp.status_code == 200:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"): continue
+                d = line[5:].strip()
+                if d == "[DONE]": break
+                try:
+                    c = json.loads(d)["choices"][0]["delta"].get("content", "")
+                    if c: yield c
+                except: continue
+            return
+        yield f"[Cerebras error {resp.status_code}: {resp.text[:200]}]"
+    except requests.RequestException as e:
+        yield f"[Cerebras connection error: {e}]"
+
+
+# --- Round-robin provider rotation ------------------------------------------
+# Tracks which provider index to try FIRST next time (persists for the life
+# of the process; resets on server restart, which is fine).
+_provider_index = [0]
+
+
+def auto_stream_chunks(gemini_payload, gemini_messages, system_prompt=None):
+    """True round-robin rotation across all configured providers.
+    No provider is primary — starts from wherever the last successful call left off.
+    If the current provider fails/is rate-limited, moves to the next one and
+    remembers that position for the next request too."""
+    sp = system_prompt or SYSTEM_PROMPT
+    openai_msgs = to_openai_messages(gemini_messages, sp)
+    ollama_msgs = to_ollama_messages(gemini_messages, sp)
+
+    # Build the full list of available providers (only those with keys)
+    all_providers = []
+    if PROVIDER in ("auto", "gemini") and GEMINI_API_KEY:
+        all_providers.append(("Gemini", lambda: gemini_stream_chunks(gemini_payload)))
+    if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
+        all_providers.append(("Cerebras", lambda: cerebras_stream_chunks(openai_msgs)))
+    if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
+        all_providers.append(("Groq", lambda: groq_stream_chunks(openai_msgs)))
+    if PROVIDER == "openrouter" and OPENROUTER_API_KEY:
+        all_providers.append(("OpenRouter", lambda: openrouter_stream_chunks(openai_msgs)))
+    if PROVIDER == "huggingface" and HF_API_KEY:
+        # HuggingFace free tier blocks server IPs (Render etc) — only use if explicitly set
+        all_providers.append(("HuggingFace", lambda: huggingface_stream_chunks(openai_msgs)))
+    if PROVIDER == "ollama":
+        all_providers.append(("Ollama", lambda: ollama_stream_chunks(ollama_msgs)))
+
+    if not all_providers:
+        yield "[No AI providers configured. Add at least one API key.]"
+        return
+
+    n = len(all_providers)
+    start = _provider_index[0] % n
+
+    # Try each provider starting from the current rotation position
+    for i in range(n):
+        idx = (start + i) % n
+        name, fn = all_providers[idx]
+        collected = []
+        try:
+            for chunk in fn():
+                collected.append(chunk)
+                yield chunk
+            if collected:
+                # Success — next request starts from the NEXT provider (true rotation)
+                _provider_index[0] = (idx + 1) % n
+                return
+        except Exception:
+            pass
+        # This provider failed — silently try the next one
+
+    yield "[All AI providers failed or are rate-limited. Try again in a moment.]"
+
+
 
 
 def gemini_stream_chunks(payload):
@@ -2077,12 +2319,12 @@ def gemini_stream_chunks(payload):
             stream=True,
             timeout=60,
         )
-    except requests.RequestException as e:
-        print(f"[Gemini] connection error: {e}")
-        return
+    except requests.RequestException:
+        return  # network error — silently fall through
 
     if resp.status_code != 200:
-        print(f"[Gemini] failed: HTTP {resp.status_code} — {resp.text[:300]}")
+        # Auth errors (401/403), quota errors (429), and server errors (5xx)
+        # all mean "try the next provider" — don't yield anything.
         return
 
     for raw_line in resp.iter_lines(decode_unicode=True):
@@ -2101,51 +2343,6 @@ def gemini_stream_chunks(payload):
                     yield part["text"]
         except (KeyError, IndexError):
             continue
-
-
-# --- Round-robin provider rotation (used only when PROVIDER="auto" and no
-# specific model tier applies — kept for backwards compatibility) -----------
-_provider_index = [0]
-
-
-def auto_stream_chunks(gemini_payload, gemini_messages, system_prompt=None):
-    sp = system_prompt or SYSTEM_PROMPT
-    openai_msgs = to_openai_messages(gemini_messages, sp)
-    ollama_msgs = to_ollama_messages(gemini_messages, sp)
-
-    all_providers = []
-    if PROVIDER in ("auto", "gemini") and GEMINI_API_KEY:
-        all_providers.append(("Gemini", lambda: gemini_stream_chunks(gemini_payload)))
-    if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
-        all_providers.append(("Cerebras", lambda: cerebras_stream_chunks_with_model(openai_msgs, CEREBRAS_MODEL)))
-    if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
-        all_providers.append(("Groq", lambda: groq_stream_chunks_with_model(openai_msgs, GROQ_MODEL)))
-    if PROVIDER == "openrouter" and OPENROUTER_API_KEY:
-        all_providers.append(("OpenRouter", lambda: openrouter_stream_chunks(openai_msgs)))
-    if PROVIDER == "huggingface" and HF_API_KEY:
-        all_providers.append(("HuggingFace", lambda: huggingface_stream_chunks(openai_msgs)))
-    if PROVIDER == "ollama":
-        all_providers.append(("Ollama", lambda: ollama_stream_chunks(ollama_msgs)))
-
-    if not all_providers:
-        yield "[No AI providers configured. Add at least one API key.]"
-        return
-
-    n = len(all_providers)
-    start = _provider_index[0] % n
-
-    for i in range(n):
-        idx = (start + i) % n
-        name, fn = all_providers[idx]
-        collected = []
-        for chunk in fn():
-            collected.append(chunk)
-            yield chunk
-        if collected:
-            _provider_index[0] = (idx + 1) % n
-            return
-
-    yield "[All AI providers failed or are rate-limited. Try again in a moment.]"
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -2191,6 +2388,8 @@ def chat():
     messages = conv.setdefault("messages", [])
 
     if regenerate:
+        # Drop the most recent assistant reply (if any) so a fresh one replaces it.
+        # Leaves the preceding user message in place to regenerate against.
         if messages and messages[-1]["role"] == "model":
             messages.pop()
         if not messages or messages[-1]["role"] != "user":
@@ -2214,22 +2413,21 @@ def chat():
             user_entry["attachment_meta"] = attachment_meta
         messages.append(user_entry)
 
+    # Strip attachment_meta (frontend-only field) before sending to the model
     gemini_contents = [
         {"role": m["role"], "parts": m["parts"]} for m in messages
     ]
 
-    today_str = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
-    effective_system_prompt = SYSTEM_PROMPT + (
-        f" Today's real date is {today_str} (UTC) — trust this over whatever date your "
-        f"training data suggests, and use it for any question about the current date, "
-        f"year, or how long ago/from now something is."
-    )
+    effective_system_prompt = SYSTEM_PROMPT
     if user_name:
         effective_system_prompt += (
             f" The user has told you their preferred name is \"{user_name}\". "
             f"Address them as {user_name} naturally where it fits (e.g. greetings, "
             f"acknowledgements) — don't force it into every single reply."
         )
+    # Only the real Gemini call gets the "you have search" instruction — fallback
+    # providers don't have real search, so giving them that instruction makes them
+    # hallucinate fake tool-call JSON into the visible reply.
     gemini_system_prompt = effective_system_prompt + GEMINI_SEARCH_ADDENDUM
 
     payload = {
@@ -2241,13 +2439,23 @@ def chat():
     def generate():
         full_reply = []
         openai_msgs = to_openai_messages(messages, effective_system_prompt)
-        if PROVIDER == "ollama":
-            chunk_source = ollama_stream_chunks(to_ollama_messages(messages, effective_system_prompt))
-        elif provider in ("groq", "cerebras"):
-            chunk_source = model_stream_with_fallback(provider, model_name, openai_msgs)
-        else:
-            chunk_source = auto_stream_chunks(payload, messages, effective_system_prompt)
-        for chunk in chunk_source:
+
+        def try_chunks():
+            if provider == "groq":
+                yield from groq_stream_chunks_with_model(openai_msgs, model_name)
+            elif provider == "cerebras":
+                chunks = list(cerebras_stream_chunks_with_model(openai_msgs, model_name))
+                # If Cerebras returned only an error message, fall back to Groq
+                if chunks and len(chunks) == 1 and chunks[0].startswith("[Cerebras error"):
+                    yield from groq_stream_chunks_with_model(openai_msgs, "llama-3.3-70b-versatile")
+                else:
+                    yield from chunks
+            elif provider == "openrouter":
+                yield from openrouter_stream_chunks_with_model(openai_msgs, model_name)
+            else:
+                yield from auto_stream_chunks(payload, messages, effective_system_prompt)
+
+        for chunk in try_chunks():
             full_reply.append(chunk)
             yield chunk
         messages.append({"role": "model", "parts": [{"text": "".join(full_reply)}]})
@@ -2256,6 +2464,7 @@ def chat():
     resp = Response(stream_with_context(generate()), mimetype="text/plain; charset=utf-8")
     resp.headers["X-Conversation-Id"] = conv_id
     return resp
+
 
 
 if __name__ == "__main__":
@@ -2275,7 +2484,4 @@ if __name__ == "__main__":
     providers_str = " → ".join(active) if active else "none configured!"
     print(f"Starting Mythic AI at http://localhost:5000")
     print(f"Providers (fallback order): {providers_str}")
-    if not GROQ_API_KEY and not CEREBRAS_API_KEY:
-        print("[WARNING] Neither GROQ_API_KEY nor CEREBRAS_API_KEY is set — "
-              "every model tier will fail. Set at least one.")
     app.run(host="0.0.0.0", port=5000, debug=False)
