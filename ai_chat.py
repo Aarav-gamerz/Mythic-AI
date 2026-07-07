@@ -1,7 +1,11 @@
 """
 Mythic AI Ultra — single-file Flask app.
-Multi-model chat (Groq / Cerebras / OpenRouter / HuggingFace / Gemini / Ollama)
-with image generation, weather, web search, news, voice, and persistent history.
+Providers: Groq + Cerebras only.
+Image gen: Pollinations (no key)
+Weather:   Open-Meteo (no key)
+Search:    DuckDuckGo (no key)
+News:      NewsAPI
+Voice, history, VIP, markdown rendering, rate limiting.
 
 Run dev:    python mythic.py
 Run prod:   gunicorn -w 2 -k gthread --threads 4 -b 0.0.0.0:$PORT mythic:app
@@ -21,7 +25,6 @@ import requests
 from flask import Flask, request, jsonify, Response, session, stream_with_context
 from dotenv import load_dotenv
 
-# Load .env first so all the keys below pick up real values
 load_dotenv()
 
 try:
@@ -31,33 +34,17 @@ try:
 except ImportError:
     LIMITER_ENABLED = False
 
-# --- Provider + model config -----------------------------------------
+# --- Provider + model config ---------------------------------------
 PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
 
-GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
-CEREBRAS_API_KEY   = os.environ.get("CEREBRAS_API_KEY", "")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-HF_API_KEY         = os.environ.get("HF_API_KEY", "")
-GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
-NEWS_API_KEY       = os.environ.get("NEWS_API_KEY", "")
-WEATHER_API_KEY    = os.environ.get("WEATHER_API_KEY", "")
+GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+NEWS_API_KEY     = os.environ.get("NEWS_API_KEY", "")
 
-GROQ_MODEL       = os.environ.get("GROQ_MODEL",       "llama-3.1-8b-instant")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemma-3-4b-it:free")
-HF_MODEL         = os.environ.get("HF_MODEL",         "mistralai/Mistral-7B-Instruct-v0.3")
-CEREBRAS_MODEL   = os.environ.get("CEREBRAS_MODEL",   "llama-3.3-70b")
-GEMINI_MODEL     = os.environ.get("GEMINI_MODEL",     "gemini-2.5-flash")
-OLLAMA_MODEL     = os.environ.get("OLLAMA_MODEL",     "llama3.1")
-OLLAMA_URL       = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+GROQ_MODEL     = os.environ.get("GROQ_MODEL",     "llama-3.1-8b-instant")
+CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
 
-GEMINI_STREAM_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:streamGenerateContent"
-)
-
-API_KEY = GEMINI_API_KEY  # legacy alias used inside gemini_stream_chunks
-MODEL   = GEMINI_MODEL
-
-# --- VIP / model registry --------------------------------------------
+# --- VIP / model registry ------------------------------------------
 VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "1254")
 VIP_MODELS   = {"aarav-ultra"}
 
@@ -124,28 +111,16 @@ SYSTEM_PROMPT = (
     "For code, always use markdown code blocks."
 )
 
-GEMINI_SEARCH_ADDENDUM = (
-    " WEB SEARCH: You have access to Google Search. When the user asks about current events, "
-    "live prices, news, sports scores, weather, or anything that needs up-to-date information, "
-    "use the search tool to find the answer. Do not say you cannot search the web. When you use "
-    "search results, translate/summarize them into the reply language — never paste a mix of languages."
-)
-
 # --- Flask app + security -------------------------------------------
 app = Flask(__name__)
-# IMPORTANT: set FLASK_SECRET_KEY in .env, otherwise sessions reset on every restart
-# and users lose all their conversation history.
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or ("dev-secret-CHANGE-ME-" + str(uuid.uuid4()))
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8 MB request cap
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
-
-# How many of the most-recent user/assistant turns to actually send to the model.
-# Prevents token explosion and protects free-tier context windows.
 MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "20"))
 
-# Supabase (optional) + local-file storage
+# --- Optional Supabase storage --------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
@@ -199,7 +174,6 @@ def _delete_conversation_file(username, conv_id):
     if fp.exists():
         fp.unlink()
 
-# --- Conversation storage (Supabase OR local) -----------------------
 def list_conversations(username):
     if not SUPABASE_URL:
         return _list_conversations_file(username)
@@ -263,13 +237,12 @@ def delete_conversation(username, conv_id):
     except Exception:
         pass
 
-# --- Auth (login-less, just gives every visitor a session) ----------
+# --- Auth (login-less sessions) -------------------------------------
 def current_username():
     if "user_id" not in session:
         session["user_id"] = str(uuid.uuid4())
         session.permanent = True
     return session["user_id"]
-
 def with_session(view):
     def wrapped(*a, **kw):
         current_username()
@@ -281,11 +254,10 @@ def make_title(first_message):
     t = (first_message or "Attachment").strip().replace("\n", " ")
     return t[:40] + ("…" if len(t) > 40 else "")
 
-# --- Rate limiter (optional) ----------------------------------------
+# --- Rate limiter ---------------------------------------------------
 if LIMITER_ENABLED:
     limiter = Limiter(
-        get_remote_address,
-        app=app,
+        get_remote_address, app=app,
         default_limits=["240 per hour", "30 per minute"],
         storage_uri="memory://",
     )
@@ -293,35 +265,17 @@ else:
     limiter = None
 
 # ============================================================
-# Streaming helpers (one per provider)
+# Streaming helpers (Groq + Cerebras)
 # ============================================================
-
-def to_openai_messages(gemini_messages, system_prompt):
+def to_openai_messages(messages, system_prompt):
     msgs = [{"role": "system", "content": system_prompt}]
-    for m in gemini_messages:
+    for m in messages:
         role = "user" if m["role"] == "user" else "assistant"
-        text = "".join(p.get("text", "") for p in m["parts"] if "text" in p)
+        text = "".join(p.get("text", "") for p in m.get("parts", []) if "text" in p)
         msgs.append({"role": role, "content": text})
     return msgs
 
-def to_ollama_messages(gemini_messages, system_prompt):
-    msgs = [{"role": "system", "content": system_prompt}]
-    for m in gemini_messages:
-        role = "user" if m["role"] == "user" else "assistant"
-        text = "".join(p.get("text", "") for p in m["parts"] if "text" in p)
-        entry = {"role": role, "content": text}
-        images = [
-            p["inline_data"]["data"]
-            for p in m["parts"]
-            if "inline_data" in p and p["inline_data"].get("mime_type", "").startswith("image/")
-        ]
-        if images:
-            entry["images"] = images
-        msgs.append(entry)
-    return msgs
-
 def _iter_sse_lines(resp):
-    """Yield decoded content from `data: ...` SSE lines, robust to leading/trailing spaces."""
     for raw in resp.iter_lines(decode_unicode=True):
         if not raw or not raw.startswith("data:"):
             continue
@@ -331,7 +285,6 @@ def _iter_sse_lines(resp):
         yield payload
 
 def _openai_stream(url, headers, body):
-    """Generic OpenAI-compatible SSE stream; yields content deltas."""
     try:
         resp = requests.post(url, headers=headers, json=body, stream=True, timeout=60)
     except requests.RequestException as e:
@@ -349,7 +302,7 @@ def _openai_stream(url, headers, body):
         except (json.JSONDecodeError, KeyError, IndexError):
             continue
 
-def groq_stream_chunks_with_model(messages, model):
+def groq_stream(messages, model):
     if not GROQ_API_KEY:
         yield "[Groq API key not configured]"; return
     yield from _openai_stream(
@@ -358,7 +311,7 @@ def groq_stream_chunks_with_model(messages, model):
         {"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
     )
 
-def cerebras_stream_chunks_with_model(messages, model):
+def cerebras_stream(messages, model):
     if not CEREBRAS_API_KEY:
         yield "[Cerebras API key not configured]"; return
     yield from _openai_stream(
@@ -367,88 +320,9 @@ def cerebras_stream_chunks_with_model(messages, model):
         {"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
     )
 
-def openrouter_stream_chunks_with_model(messages, model):
-    if not OPENROUTER_API_KEY:
-        yield "[OpenRouter API key not configured]"; return
-    yield from _openai_stream(
-        "https://openrouter.ai/api/v1/chat/completions",
-        {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://aarav-ai.onrender.com",
-            "X-Title": "Mythic AI",
-        },
-        {"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
-    )
-
-def huggingface_stream_chunks(messages):
-    if not HF_API_KEY:
-        return
-    yield from _openai_stream(
-        f"https://api-inference.huggingface.co/models/{HF_MODEL}/v1/chat/completions",
-        {"Authorization": f"Bearer {HF_API_KEY}", "Content-Type": "application/json"},
-        {"model": HF_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
-    )
-
-def ollama_stream_chunks(messages):
-    try:
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={"model": OLLAMA_MODEL, "messages": messages, "stream": True},
-            stream=True, timeout=120,
-        )
-    except requests.RequestException as e:
-        yield (f"[Could not reach Ollama at {OLLAMA_URL}: {e}. "
-               f"Make sure Ollama is running (`ollama serve`) and "
-               f"you've pulled the model (`ollama pull {OLLAMA_MODEL}`).]")
-        return
-    if resp.status_code != 200:
-        yield f"[Ollama error ({resp.status_code}): {resp.text}]"
-        return
-    for raw in resp.iter_lines(decode_unicode=True):
-        if not raw:
-            continue
-        try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("error"):
-            yield f"[Ollama error: {obj['error']}]"; return
-        chunk = obj.get("message", {}).get("content", "")
-        if chunk:
-            yield chunk
-        if obj.get("done"):
-            break
-
-def gemini_stream_chunks(payload):
-    if not API_KEY:
-        return
-    try:
-        resp = requests.post(
-            GEMINI_STREAM_URL,
-            params={"key": API_KEY, "alt": "sse"},
-            json=payload, stream=True, timeout=60,
-        )
-    except requests.RequestException:
-        return
-    if resp.status_code != 200:
-        return
-    for payload_str in _iter_sse_lines(resp):
-        try:
-            obj = json.loads(payload_str)
-        except json.JSONDecodeError:
-            continue
-        try:
-            for part in obj["candidates"][0]["content"]["parts"]:
-                if "text" in part:
-                    yield part["text"]
-        except (KeyError, IndexError):
-            continue
-
 # ============================================================
-# API routes
+# Routes
 # ============================================================
-
 @app.route("/")
 @with_session
 def index():
@@ -512,7 +386,7 @@ def api_rename_conversation(conv_id):
     save_conversation(username, conv_id, conv)
     return jsonify({"status": "renamed", "title": new_title})
 
-# --- News ----------------------------------------------------------
+# --- News -----------------------------------------------------------
 def fetch_news(query=None, category=None):
     if not NEWS_API_KEY:
         return None
@@ -585,47 +459,6 @@ def web_search():
                     })
             if results:
                 return jsonify({"results": results[:6], "query": query})
-
-        # Fallback: scrape html.duckduckgo.com
-        r2 = requests.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            headers={"User-Agent": "Mozilla/5.0 (compatible; MythicAI/1.0)"},
-            timeout=8,
-        )
-        if r2.status_code == 200:
-            from html.parser import HTMLParser
-            class DDGParser(HTMLParser):
-                def __init__(self):
-                    super().__init__()
-                    self.results, self.current, self.text = [], {}, ""
-                    self.capture = False
-                def handle_starttag(self, tag, attrs):
-                    a = dict(attrs)
-                    cls = a.get("class", "")
-                    if tag == "a" and "result__a" in cls:
-                        self.current = {"url": a.get("href", ""), "title": "", "snippet": ""}
-                        self.capture, self.text = True, ""
-                    elif tag == "td" and "result__snippet" in cls:
-                        self.text = ""
-                        self._snip = True
-                def handle_endtag(self, tag):
-                    if tag == "a" and self.capture:
-                        self.current["title"] = self.text.strip()
-                        self.capture = False
-                    elif tag == "td" and getattr(self, "_snip", False):
-                        self.current["snippet"] = self.text.strip()
-                        self._snip = False
-                        if self.current.get("title"):
-                            self.current["source"] = "DuckDuckGo"
-                            self.results.append(dict(self.current))
-                            self.current = {}
-                def handle_data(self, data):
-                    if self.capture or getattr(self, "_snip", False):
-                        self.text += data
-            p = DDGParser(); p.feed(r2.text)
-            if p.results:
-                return jsonify({"results": p.results[:6], "query": query})
         return jsonify({"results": [], "query": query, "error": "No results found"})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
@@ -653,10 +486,8 @@ def get_weather():
     d = request.get_json(force=True) or {}
     location = (d.get("location") or "").strip()
     lat, lon = d.get("lat"), d.get("lon")
-
     if not location and (lat is None or lon is None):
         return jsonify({"error": "location or coordinates required"}), 400
-
     try:
         if lat is not None and lon is not None:
             geo_r = requests.get(
@@ -671,7 +502,6 @@ def get_weather():
             else:
                 location_name = "Your Location"
         else:
-            # Try progressively simpler variants of the city name
             candidates = [location]
             words = location.replace(",", " ").split()
             if len(words) > 1:
@@ -693,9 +523,7 @@ def get_weather():
                 except Exception:
                     continue
             if result is None:
-                return jsonify({
-                    "error": f"City '{location}' not found. Try just the city name (e.g. 'Chhapra')."
-                }), 404
+                return jsonify({"error": f"City '{location}' not found. Try just the city name."}), 404
             lat, lon = result["latitude"], result["longitude"]
             location_name = result["name"] + ", " + result.get("country", "")
 
@@ -714,23 +542,6 @@ def get_weather():
         wjson = wr.json()
         cur = wjson["current"]
         code = cur.get("weather_code", 0)
-
-        hourly = []
-        try:
-            h = wjson.get("hourly", {})
-            times, temps, codes, pops = h.get("time", []), h.get("temperature_2m", []), h.get("weather_code", []), h.get("precipitation_probability", [])
-            now_iso = wjson.get("current", {}).get("time")
-            start = times.index(now_iso) if now_iso in times else 0
-            for i in range(start, min(start + 6, len(times))):
-                hourly.append({
-                    "time": times[i],
-                    "temp": round(temps[i]) if i < len(temps) else None,
-                    "condition": WMO_CODES.get(codes[i], "Unknown") if i < len(codes) else None,
-                    "rain_chance": pops[i] if i < len(pops) else None,
-                })
-        except Exception:
-            pass
-
         return jsonify({"weather": {
             "location": location_name,
             "temp": round(cur["temperature_2m"]),
@@ -739,12 +550,11 @@ def get_weather():
             "humidity": cur["relative_humidity_2m"],
             "wind_speed": round(cur["wind_speed_10m"]),
             "icon": WMO_ICONS.get(code, "🌡"),
-            "hourly_forecast": hourly,
         }})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
-# --- Image generation (Pollinations, no key) ------------------------
+# --- Image generation (Pollinations) --------------------------------
 @app.route("/api/generate-image", methods=["POST"])
 @with_session
 def generate_image():
@@ -753,16 +563,13 @@ def generate_image():
     style  = (d.get("style") or "").strip()
     if not prompt:
         return jsonify({"error": "prompt required"}), 400
-
     quality = "masterpiece, best quality, ultra detailed, sharp focus, intricate details, professional, cinematic lighting, high resolution"
     full = f"{prompt}, {style} style, {quality}" if style else f"{prompt}, {quality}"
     encoded = urllib.parse.quote(full)
     seed = random.randint(1, 999_999)
-
     candidates = [
         f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&model=flux&nologo=true&enhance=true&seed={seed}&nofeed=true",
         f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&model=flux-realism&nologo=true&enhance=true&seed={seed}&nofeed=true",
-        f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&model=flux&nologo=true&enhance=true&seed={seed + 1}&nofeed=true",
     ]
     last_err = None
     for url in candidates:
@@ -779,16 +586,14 @@ def generate_image():
             last_err = str(e)
     return jsonify({"error": f"Generation failed ({last_err}). Try a shorter, simpler prompt."}), 502
 
-# --- Chat (the main streaming endpoint) ----------------------------
+# --- Chat (streaming) ----------------------------------------------
 def _trim_history(messages):
-    """Keep only the last N user+model turns to control token usage."""
     if MAX_HISTORY_TURNS <= 0:
         return messages
-    keep = MAX_HISTORY_TURNS * 2  # user + model per turn
+    keep = MAX_HISTORY_TURNS * 2
     return messages[-keep:] if len(messages) > keep else messages
 
 def _detect_lang_reminder(text: str) -> str:
-    """Build a one-line nudge so the model replies in the same language as the user."""
     if re.search(r"[\u0900-\u097F]", text):
         return "[Reply ENTIRELY in Hindi Devanagari script for this message.] "
     if re.search(r"\b(hai|nahi|kya|kaise|kaha|kyun|mujhe|tumhe|aap|acha|theek|haan|nahin|bhi|karo|kar)\b", text, re.IGNORECASE):
@@ -858,7 +663,6 @@ def chat():
             user_entry["attachment_meta"] = attachment_meta
         messages.append(user_entry)
 
-    # Limit history size before sending to the model (full history is still saved)
     history_for_model = _trim_history(messages)
 
     effective_system_prompt = SYSTEM_PROMPT
@@ -867,48 +671,30 @@ def chat():
             f" The user has told you their preferred name is \"{user_name}\". "
             f"Address them as {user_name} naturally where it fits — don't force it into every reply."
         )
-    gemini_system_prompt = effective_system_prompt + GEMINI_SEARCH_ADDENDUM
-
-    gemini_payload = {
-        "contents": [{"role": m["role"], "parts": m["parts"]} for m in history_for_model],
-        "systemInstruction": {"parts": [{"text": gemini_system_prompt}]},
-        "tools": [{"google_search": {}}],
-    }
+    openai_msgs = to_openai_messages(history_for_model, effective_system_prompt)
 
     def generate():
         full_reply = []
-        openai_msgs = to_openai_messages(history_for_model, effective_system_prompt)
-        ollama_msgs = to_ollama_messages(history_for_model, effective_system_prompt)
-
         def try_chunks():
             if provider == "groq":
-                yield from groq_stream_chunks_with_model(openai_msgs, model_name)
+                yield from groq_stream(openai_msgs, model_name)
             elif provider == "cerebras":
-                chunks = list(cerebras_stream_chunks_with_model(openai_msgs, model_name))
+                chunks = list(cerebras_stream(openai_msgs, model_name))
                 if chunks and len(chunks) == 1 and chunks[0].startswith("[Cerebras"):
-                    # Cerebras failed, fall back to Groq 70B
-                    yield from groq_stream_chunks_with_model(openai_msgs, "llama-3.3-70b-versatile")
+                    # Cerebras failed -> fall back to Groq 70B
+                    yield from groq_stream(openai_msgs, "llama-3.3-70b-versatile")
                 else:
                     yield from chunks
-            elif provider == "openrouter":
-                yield from openrouter_stream_chunks_with_model(openai_msgs, model_name)
             else:
-                # auto: try each configured provider in order
                 providers = []
-                if GEMINI_API_KEY:
-                    providers.append(("gemini", lambda: gemini_stream_chunks(gemini_payload)))
-                if CEREBRAS_API_KEY:
-                    providers.append(("cerebras", lambda: cerebras_stream_chunks_with_model(openai_msgs, CEREBRAS_MODEL)))
                 if GROQ_API_KEY:
-                    providers.append(("groq", lambda: groq_stream_chunks_with_model(openai_msgs, GROQ_MODEL)))
-                if OPENROUTER_API_KEY:
-                    providers.append(("openrouter", lambda: openrouter_stream_chunks_with_model(openai_msgs, OPENROUTER_MODEL)))
-                if HF_API_KEY:
-                    providers.append(("huggingface", lambda: huggingface_stream_chunks(openai_msgs)))
+                    providers.append(("groq", lambda: groq_stream(openai_msgs, GROQ_MODEL)))
+                if CEREBRAS_API_KEY:
+                    providers.append(("cerebras", lambda: cerebras_stream(openai_msgs, CEREBRAS_MODEL)))
                 if not providers:
-                    yield "[No AI providers configured. Add at least one API key to .env.]"
+                    yield "[No AI providers configured. Add GROQ_API_KEY and/or CEREBRAS_API_KEY to .env.]"
                     return
-                for name, fn in providers:
+                for _, fn in providers:
                     yielded_any = False
                     for chunk in fn():
                         yielded_any = True
@@ -928,9 +714,8 @@ def chat():
     return resp
 
 # ============================================================
-# HTML page (single-file inline CSS + JS)
+# HTML page
 # ============================================================
-
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -965,49 +750,41 @@ PAGE = r"""<!DOCTYPE html>
   #sidebar.hidden { margin-left:calc(-1 * var(--sidebar-w)); }
   #new-chat-btn { margin:12px; padding:10px 14px; background:var(--accent); color:#fff;
     border:none; border-radius:8px; font-size:13.5px; font-weight:600; cursor:pointer; text-align:left; }
-  #new-chat-btn:hover { opacity:.9; }
   #conv-list { flex:1; overflow-y:auto; padding:0 8px; display:flex; flex-direction:column; gap:2px; }
   .conv-item { display:flex; align-items:center; justify-content:space-between; gap:6px;
     padding:9px 10px; border-radius:7px; cursor:pointer; font-size:13px; color:var(--muted); }
   .conv-item:hover { background:var(--accent-dim); color:var(--text); }
   .conv-item.active { background:var(--accent-dim); color:var(--accent); font-weight:500; }
   .conv-item .title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
-  .conv-item .rename-btn { opacity:0; background:none; border:none; color:var(--muted);
+  .conv-item .rename-btn, .conv-item .del-btn { opacity:0; background:none; border:none; color:var(--muted);
     cursor:pointer; font-size:12px; padding:2px 5px; flex-shrink:0; touch-action:manipulation; }
-  .conv-item .del-btn { opacity:0; background:none; border:none; color:var(--muted);
-    cursor:pointer; font-size:13px; padding:2px 5px; flex-shrink:0; touch-action:manipulation; }
-  .conv-item:hover .rename-btn { opacity:1; }
-  .conv-item:hover .del-btn { opacity:1; }
-  .conv-item .rename-btn:hover { color:var(--accent); }
+  .conv-item:hover .rename-btn, .conv-item:hover .del-btn { opacity:1; }
   .conv-item .del-btn:hover { color:#ef4444; }
+  .conv-item .rename-btn:hover { color:var(--accent); }
   #sidebar-footer { padding:12px; font-size:11px; color:var(--muted); border-top:1px solid var(--border); }
   .app { display:flex; flex-direction:column; height:100vh; flex:1; min-width:0; }
   header { padding:calc(14px + env(safe-area-inset-top)) 20px 14px; border-bottom:1px solid var(--border);
-    display:flex; align-items:center; justify-content:space-between; gap:10px;
-    background:var(--bg); position:relative; z-index:20; }
+    display:flex; align-items:center; justify-content:space-between; gap:10px; background:var(--bg); }
   header .left { display:flex; align-items:center; gap:10px; min-width:0; }
   header .right { display:flex; align-items:center; gap:8px; flex-shrink:0; }
   header button { touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
   #sidebar-toggle { background:none; border:1px solid var(--border); color:var(--muted);
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0; }
-  #sidebar-toggle:hover { background:var(--panel); }
   header h1 { font-size:16px; font-weight:700; color:var(--accent); margin:0; }
   #name-btn, #settings-btn, #export-btn, #fullscreen-btn, #clear-btn {
     background:none; border:1px solid var(--border); color:var(--muted);
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; touch-action:manipulation;
+    display:flex; align-items:center; justify-content:center;
     -webkit-tap-highlight-color:transparent; }
   #name-btn:hover, #settings-btn:hover, #export-btn:hover, #fullscreen-btn:hover { background:var(--panel); }
   #settings-btn:hover, #name-btn:hover { color:var(--accent); }
   #clear-btn:hover { background:var(--panel); color:#ef4444; border-color:#ef4444; }
-  body.pseudo-fullscreen #sidebar-toggle, body.pseudo-fullscreen header .left h1 { display:none; }
-  body.pseudo-fullscreen header { padding-top:calc(6px + env(safe-area-inset-top)); padding-bottom:6px; }
   #name-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
     z-index:200; align-items:center; justify-content:center; }
   #name-modal-overlay.show { display:flex; }
   #name-modal { background:var(--bg); border:1px solid var(--border); border-radius:14px;
-    padding:22px; width:90%; max-width:360px; box-shadow:0 10px 40px rgba(0,0,0,.3); }
-  #name-modal h3 { margin:0 0 6px; font-size:16px; color:var(--text); }
+    padding:22px; width:90%; max-width:360px; }
+  #name-modal h3 { margin:0 0 6px; font-size:16px; }
   #name-modal p { margin:0 0 14px; font-size:12.5px; color:var(--muted); }
   #name-input { width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px;
     border:1.5px solid var(--border); background:var(--panel); color:var(--text);
@@ -1016,16 +793,14 @@ PAGE = r"""<!DOCTYPE html>
   #name-modal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }
   #name-modal-actions button { padding:8px 14px; border-radius:8px; font-size:13px;
     cursor:pointer; border:1px solid var(--border); background:none; color:var(--text); }
-  #name-cancel-btn:hover { background:var(--panel); }
   #name-save-btn { background:var(--accent); color:#fff; border-color:var(--accent); }
-  #name-save-btn:hover { opacity:.9; }
   #messages-wrap { flex:1; overflow-y:auto; position:relative; }
   #messages { padding:24px 20px; display:flex; flex-direction:column; gap:16px;
     max-width:760px; margin:0 auto; width:100%; min-height:100%; }
   .msg { max-width:80%; padding:11px 15px; border-radius:18px; line-height:1.6;
     font-size:var(--msg-font-size); white-space:pre-wrap; word-wrap:break-word; }
   .msg.user { align-self:flex-end; background:var(--user-bubble); color:var(--user-text);
-    border-bottom-right-radius:4px; white-space:pre-wrap; }
+    border-bottom-right-radius:4px; }
   .msg.ai { align-self:flex-start; background:var(--ai-bubble); color:var(--text);
     border-bottom-left-radius:4px; }
   .msg-text code { background:var(--panel); border:1px solid var(--border); border-radius:4px;
@@ -1034,11 +809,8 @@ PAGE = r"""<!DOCTYPE html>
     padding:10px 12px; overflow-x:auto; margin:6px 0; white-space:pre; }
   .msg-text pre code { background:none; border:none; padding:0; }
   .msg-text ul, .msg-text ol { margin:4px 0 4px 20px; }
-  .msg-text p { margin:0 0 6px; }
-  .msg-text p:last-child { margin-bottom:0; }
-  .msg-text strong { font-weight:700; }
-  .msg-text em { font-style:italic; }
-  .msg-text a { color:var(--accent); }
+  .msg-text p { margin:0 0 6px; } .msg-text p:last-child { margin-bottom:0; }
+  .msg-text strong { font-weight:700; } .msg-text em { font-style:italic; } .msg-text a { color:var(--accent); }
   .msg.error { align-self:center; background:#fef2f2; border:1px solid #fecaca;
     color:#dc2626; font-size:13px; border-radius:10px; max-width:90%; }
   .msg img { max-width:100%; border-radius:10px; display:block; margin-top:8px; }
@@ -1048,11 +820,10 @@ PAGE = r"""<!DOCTYPE html>
   .msg-row.ai { align-self:flex-start; align-items:flex-start; }
   .msg-row.error { align-self:center; align-items:center; max-width:90%; }
   .msg-row .msg { max-width:100%; }
-  .msg-actions { display:flex; gap:4px; margin-top:3px; opacity:0; transition:opacity .15s;
-    height:22px; }
+  .msg-actions { display:flex; gap:4px; margin-top:3px; opacity:0; height:22px; }
   .msg-row:hover .msg-actions, .msg-row:focus-within .msg-actions { opacity:1; }
   .msg-actions button { background:none; border:none; color:var(--muted); cursor:pointer;
-    font-size:12px; padding:2px 7px; border-radius:5px; touch-action:manipulation;
+    font-size:12px; padding:2px 7px; border-radius:5px;
     -webkit-tap-highlight-color:transparent; }
   .msg-actions button:hover { background:var(--panel); color:var(--text); }
   .empty-state { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
@@ -1084,7 +855,7 @@ PAGE = r"""<!DOCTYPE html>
   .tool-btn { background:none; border:none; color:var(--muted); cursor:pointer;
     width:36px; height:36px; border-radius:8px; font-size:18px; flex-shrink:0;
     display:flex; align-items:center; justify-content:center;
-    touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
+    -webkit-tap-highlight-color:transparent; }
   .tool-btn:hover { background:var(--accent-dim); color:var(--accent); }
   textarea { flex:1; resize:none; background:transparent; border:none; color:var(--text);
     font-size:14.5px; font-family:inherit; line-height:1.4; max-height:140px;
@@ -1093,10 +864,8 @@ PAGE = r"""<!DOCTYPE html>
   #send-btn { background:var(--accent); color:#fff; border:none; border-radius:10px;
     width:36px; height:36px; font-size:18px; cursor:pointer; flex-shrink:0;
     display:flex; align-items:center; justify-content:center;
-    touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
-  #send-btn:disabled { background:var(--accent-dim); color:var(--muted); cursor:not-allowed; }
+    -webkit-tap-highlight-color:transparent; }
   #send-btn.generating { background:#ef4444; }
-  #send-btn.generating:hover { opacity:.9; }
   #voice-btn.listening { color:#ef4444; animation:pulse 1s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
   #speaking-indicator { display:none; align-items:center; gap:6px; font-size:12px;
@@ -1110,8 +879,6 @@ PAGE = r"""<!DOCTYPE html>
     font-size:12.5px; padding:6px 14px; border-radius:20px; cursor:pointer;
     transition:all .15s ease; white-space:nowrap; font-family:inherit; }
   .quick-btn:hover { background:var(--accent-dim); border-color:var(--accent); color:var(--accent); }
-  #messages-wrap::-webkit-scrollbar, #conv-list::-webkit-scrollbar { width:6px; }
-  #messages-wrap::-webkit-scrollbar-thumb, #conv-list::-webkit-scrollbar-thumb { background:var(--border); border-radius:4px; }
   @media(max-width:768px) {
     :root { --sidebar-w: 78vw; }
     #sidebar { position:fixed; top:0; left:0; z-index:100; height:100%;
@@ -1123,25 +890,17 @@ PAGE = r"""<!DOCTYPE html>
     .app { width:100% !important; flex:1; }
     header { padding:calc(10px + env(safe-area-inset-top)) 12px 10px; }
     header h1 { font-size:14px; }
-    #messages-wrap { overflow-y:auto; -webkit-overflow-scrolling:touch; }
     #messages { padding:14px 10px; gap:12px; max-width:100%; }
     .msg { max-width:90%; font-size:14px; padding:10px 12px; }
     .msg-row { max-width:90%; }
     .msg-actions { opacity:1; height:26px; }
-    .msg-actions button { font-size:13px; padding:4px 9px; min-width:30px; min-height:26px; }
     .input-area { padding:8px 10px max(10px,env(safe-area-inset-bottom)); }
-    .input-row { padding:6px 8px; }
     textarea { font-size:16px; }
     .tool-btn { width:34px; height:34px; font-size:17px; }
     #send-btn { width:34px; height:34px; font-size:16px; }
-    .empty-state h2 { font-size:19px; }
-    .empty-state p { font-size:13px; }
-    #scroll-btn { bottom:80px; right:12px; width:34px; height:34px; }
-    .conv-item { padding:10px 8px; font-size:13px; min-height:44px; }
-    .conv-item .rename-btn { opacity:1; }
-    .conv-item .del-btn { opacity:1; }
+    .conv-item .rename-btn, .conv-item .del-btn { opacity:1; }
   }
-  @media(max-width:380px) { :root { --sidebar-w: 88vw; } .msg { font-size:13.5px; } header h1 { font-size:13px; } }
+  @media(max-width:380px) { :root { --sidebar-w: 88vw; } .msg { font-size:13.5px; } }
 </style>
 </head>
 <body>
@@ -1157,7 +916,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="left">
         <button id="sidebar-toggle" title="Toggle sidebar">☰</button>
         <h1>Mythic AI</h1>
-        <select id="model-select" title="Select model" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;cursor:pointer;outline:none;max-width:130px;font-family:inherit;">
+        <select id="model-select" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;cursor:pointer;outline:none;max-width:130px;font-family:inherit;">
           <option value="aarav-1.0">Mythic 1.0</option>
           <option value="aarav-2.0">Mythic 2.0</option>
           <option value="aarav-2.5" selected>Mythic 2.5</option>
@@ -1167,13 +926,12 @@ PAGE = r"""<!DOCTYPE html>
       </div>
       <div class="right">
         <button id="settings-btn" title="Settings">⚙</button>
-        <button id="fullscreen-btn" type="button" title="Fullscreen">⛶</button>
+        <button id="fullscreen-btn" title="Fullscreen">⛶</button>
         <button id="name-btn" title="What should Mythic AI call you?">🙂</button>
         <button id="export-btn" title="Export this chat">⬇</button>
         <button id="clear-btn" title="Delete this chat">🗑</button>
       </div>
     </header>
-
     <div id="messages-wrap">
       <div id="messages">
         <div class="empty-state" id="empty-state">
@@ -1182,26 +940,15 @@ PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
     </div>
-
     <button id="scroll-btn" title="Scroll to bottom">↓</button>
-
-    <div id="pending-attach">
-      📎 <span id="pending-attach-name"></span>
-      <button id="pending-attach-remove">✕</button>
-    </div>
-
-    <div id="speaking-indicator">
-      🔊 Speaking...
-      <button id="stop-speak-btn">Stop</button>
-    </div>
-
+    <div id="pending-attach">📎 <span id="pending-attach-name"></span> <button id="pending-attach-remove">✕</button></div>
+    <div id="speaking-indicator">🔊 Speaking... <button id="stop-speak-btn">Stop</button></div>
     <div id="quick-actions">
-      <button class="quick-btn" id="img-gen-btn" title="Generate Image">🎨 Image</button>
-      <button class="quick-btn" id="homework-btn" title="Homework Help">📚 Homework</button>
-      <button class="quick-btn" id="weather-btn" title="Weather Forecast">🌤 Weather</button>
-      <button class="quick-btn" id="search-btn" title="Web Search">🔍 Search</button>
+      <button class="quick-btn" id="img-gen-btn">🎨 Image</button>
+      <button class="quick-btn" id="homework-btn">📚 Homework</button>
+      <button class="quick-btn" id="weather-btn">🌤 Weather</button>
+      <button class="quick-btn" id="search-btn">🔍 Search</button>
     </div>
-
     <div class="input-area">
       <form id="chat-form">
         <div class="input-row">
@@ -1213,27 +960,11 @@ PAGE = r"""<!DOCTYPE html>
           </button>
           <input type="file" id="camera-input" accept="image/*" capture="environment" style="display:none">
           <input type="file" id="selfie-input" accept="image/*" capture="user" style="display:none">
-          <button class="tool-btn" id="camera-btn" type="button" title="Take photo (rear camera)">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-              <circle cx="12" cy="13" r="4"/>
-            </svg>
-          </button>
-          <button class="tool-btn" id="selfie-btn" type="button" title="Take selfie (front camera)">🤳</button>
+          <button class="tool-btn" id="camera-btn" type="button" title="Take photo">📷</button>
+          <button class="tool-btn" id="selfie-btn" type="button" title="Selfie">🤳</button>
           <textarea id="input" rows="1" placeholder="Message Mythic AI..."></textarea>
-          <button class="tool-btn" id="voice-btn" type="button" title="Voice input">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-              <line x1="12" y1="19" x2="12" y2="23"/>
-              <line x1="8" y1="23" x2="16" y2="23"/>
-            </svg>
-          </button>
-          <button id="send-btn" type="submit" title="Send">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
-            </svg>
-          </button>
+          <button class="tool-btn" id="voice-btn" type="button" title="Voice">🎤</button>
+          <button id="send-btn" type="submit" title="Send">➤</button>
         </div>
       </form>
     </div>
@@ -1244,25 +975,22 @@ PAGE = r"""<!DOCTYPE html>
   <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:420px;">
     <h3 style="margin:0 0 6px;font-size:17px;">🎨 Generate Image</h3>
     <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Describe the image you want to create</p>
-    <select id="img-style" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:10px;padding:10px 12px;font-size:14px;margin-bottom:10px;outline:none;cursor:pointer;font-family:inherit;">
+    <select id="img-style" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:10px;padding:10px 12px;font-size:14px;margin-bottom:10px;outline:none;font-family:inherit;">
       <option value="ghibli">🌿 Studio Ghibli</option>
       <option value="anime">🎌 Anime</option>
-      <option value="realistic">📷 Realistic / Photographic</option>
+      <option value="realistic">📷 Realistic</option>
       <option value="oil painting">🖼 Oil Painting</option>
       <option value="watercolor">🎨 Watercolor</option>
       <option value="3d render">🧊 3D Render</option>
       <option value="cartoon">🐱 Cartoon</option>
       <option value="digital art">💻 Digital Art</option>
-      <option value="">✨ No Style (auto)</option>
+      <option value="">✨ No Style</option>
     </select>
-    <textarea id="img-prompt" rows="3" placeholder="e.g. A girl walking through a forest..."
-      style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;resize:none;outline:none;"></textarea>
+    <textarea id="img-prompt" rows="3" placeholder="e.g. A girl walking through a forest..." style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;resize:none;outline:none;"></textarea>
     <div id="img-result" style="display:none;margin-top:12px;text-align:center;">
-      <img id="img-output" style="max-width:100%;border-radius:10px;display:block;margin:0 auto;" alt="Generated image">
+      <img id="img-output" style="max-width:100%;border-radius:10px;display:block;margin:0 auto;">
     </div>
-    <div id="img-loading" style="display:none;text-align:center;padding:20px;color:var(--muted);font-size:13px;">
-      ⏳ Generating your image... (usually 10-20 seconds, longer on slow connections)
-    </div>
+    <div id="img-loading" style="display:none;text-align:center;padding:20px;color:var(--muted);font-size:13px;">⏳ Generating...</div>
     <div id="img-error" style="display:none;color:#ef4444;font-size:12px;margin-top:8px;"></div>
     <div style="display:flex;gap:8px;margin-top:14px;">
       <button id="img-generate-btn" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Generate</button>
@@ -1273,18 +1001,14 @@ PAGE = r"""<!DOCTYPE html>
 
 <div id="weather-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:300;align-items:center;justify-content:center;">
   <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:380px;">
-    <h3 style="margin:0 0 6px;font-size:17px;">🌤 Weather Forecast</h3>
-    <p style="color:var(--muted);font-size:13px;margin:0 0 14px;">Enter city name or allow location access</p>
+    <h3 style="margin:0 0 6px;font-size:17px;">🌤 Weather</h3>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 14px;">Enter city name or use your location</p>
     <div style="display:flex;gap:8px;margin-bottom:10px;">
-      <input id="weather-city" type="text" placeholder="e.g. Delhi, Mumbai, London..."
-        style="flex:1;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;font-family:inherit;">
-      <button id="weather-location-btn" title="Use my location"
-        style="background:var(--panel);border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:8px 12px;font-size:18px;cursor:pointer;">📍</button>
+      <input id="weather-city" type="text" placeholder="e.g. Delhi, Mumbai, London..." style="flex:1;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;font-family:inherit;">
+      <button id="weather-location-btn" style="background:var(--panel);border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:8px 12px;font-size:18px;cursor:pointer;">📍</button>
     </div>
-    <div id="weather-result" style="display:none;background:var(--bg);border-radius:12px;padding:16px;margin-bottom:12px;">
-      <div id="weather-content"></div>
-    </div>
-    <div id="weather-loading" style="display:none;text-align:center;padding:16px;color:var(--muted);font-size:13px;">⏳ Fetching weather...</div>
+    <div id="weather-result" style="display:none;background:var(--bg);border-radius:12px;padding:16px;margin-bottom:12px;"><div id="weather-content"></div></div>
+    <div id="weather-loading" style="display:none;text-align:center;padding:16px;color:var(--muted);font-size:13px;">⏳ Fetching...</div>
     <div id="weather-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;"></div>
     <div style="display:flex;gap:8px;">
       <button id="weather-search-btn" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Get Weather</button>
@@ -1296,7 +1020,7 @@ PAGE = r"""<!DOCTYPE html>
 <div id="name-modal-overlay">
   <div id="name-modal">
     <h3>What should Mythic AI call you?</h3>
-    <p>Enter your preferred name — Mythic AI will use it when it talks to you.</p>
+    <p>Enter your preferred name.</p>
     <input type="text" id="name-input" maxlength="60" placeholder="e.g. Aarav" autocomplete="off">
     <div id="name-modal-actions">
       <button id="name-cancel-btn" type="button">Cancel</button>
@@ -1335,1048 +1059,419 @@ PAGE = r"""<!DOCTYPE html>
     <div style="margin-bottom:16px;">
       <label style="font-size:12.5px;color:var(--muted);display:block;margin-bottom:6px;">Tone</label>
       <select id="tone-select" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px;font-size:13px;font-family:inherit;">
-        <option value="default">Default</option>
-        <option value="formal">Formal</option>
-        <option value="casual">Casual</option>
-        <option value="funny">Funny</option>
+        <option value="default">Default</option><option value="formal">Formal</option>
+        <option value="casual">Casual</option><option value="funny">Funny</option>
         <option value="professional">Professional</option>
       </select>
     </div>
     <div style="margin-bottom:16px;">
       <label style="font-size:12.5px;color:var(--muted);display:block;margin-bottom:6px;">Response length</label>
       <select id="length-select" style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px;font-size:13px;font-family:inherit;">
-        <option value="default">Default</option>
-        <option value="short">Short</option>
-        <option value="medium">Medium</option>
-        <option value="long">Long / detailed</option>
+        <option value="default">Default</option><option value="short">Short</option>
+        <option value="medium">Medium</option><option value="long">Long</option>
       </select>
     </div>
     <div style="margin-bottom:16px;">
       <label style="font-size:12.5px;color:var(--muted);display:block;margin-bottom:6px;">Custom instructions (persona)</label>
-      <textarea id="custom-instructions-input" rows="3" placeholder="e.g. Always answer like a strict but kind teacher..."
-        style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px;font-size:13px;font-family:inherit;resize:none;"></textarea>
+      <textarea id="custom-instructions-input" rows="3" placeholder="e.g. Always answer like a strict but kind teacher..." style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px;font-size:13px;font-family:inherit;resize:none;"></textarea>
     </div>
     <button id="settings-close-btn" style="width:100%;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Done</button>
   </div>
 </div>
 
 <script>
-/* ============================================================
-   Tiny inline markdown renderer
-   Handles: ```lang code```, `code`, **bold**, *italic*, headings, lists, links
-   Escapes HTML first to prevent XSS.
-   ============================================================ */
-function escapeHTML(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-          .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-function renderMarkdown(raw) {
-  if (!raw) return '';
+function escapeHTML(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+function renderMarkdown(raw){
+  if(!raw) return '';
   let s = escapeHTML(raw);
-  // code fences ```...```
-  s = s.replace(/```([a-zA-Z0-9_+\-]*)\n?([\s\S]*?)```/g, (m, lang, code) =>
-    '<pre><code class="lang-' + (lang || '') + '">' + code.replace(/\n$/, '') + '</code></pre>');
-  // inline code `...`
-  s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-  // headings (#, ##, ###)
-  s = s.replace(/^######\s+(.*)$/gm, '<h6>$1</h6>')
-       .replace(/^#####\s+(.*)$/gm,  '<h5>$1</h5>')
-       .replace(/^####\s+(.*)$/gm,   '<h4>$1</h4>')
-       .replace(/^###\s+(.*)$/gm,    '<h3>$1</h3>')
-       .replace(/^##\s+(.*)$/gm,     '<h2>$1</h2>')
-       .replace(/^#\s+(.*)$/gm,      '<h1>$1</h1>');
-  // links [text](url)
-  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-                '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-  // bold then italic (order matters)
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-       .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
-  // unordered lists: lines starting with - or *
-  s = s.replace(/(^|\n)((?:[-*]\s+.+(?:\n|$))+)/g, (m, pre, block) => {
-    const items = block.trim().split(/\n/).map(l => '<li>' + l.replace(/^[-*]\s+/, '') + '</li>').join('');
-    return pre + '<ul>' + items + '</ul>';
-  });
-  // ordered lists
-  s = s.replace(/(^|\n)((?:\d+\.\s+.+(?:\n|$))+)/g, (m, pre, block) => {
-    const items = block.trim().split(/\n/).map(l => '<li>' + l.replace(/^\d+\.\s+/, '') + '</li>').join('');
-    return pre + '<ol>' + items + '</ol>';
-  });
-  // paragraphs (split on double newlines, leave block-level tags alone)
-  s = s.split(/\n{2,}/).map(chunk => {
-    if (/^\s*<(h\d|ul|ol|pre|p|blockquote)/.test(chunk)) return chunk;
-    return '<p>' + chunk.replace(/\n/g, '<br>') + '</p>';
-  }).join('\n');
+  s = s.replace(/```([a-zA-Z0-9_+\-]*)\n?([\s\S]*?)```/g,(m,lang,code)=>'<pre><code class="lang-'+(lang||'')+'">'+code.replace(/\n$/,'')+'</code></pre>');
+  s = s.replace(/`([^`\n]+)`/g,'<code>$1</code>');
+  s = s.replace(/^######\s+(.*)$/gm,'<h6>$1</h6>').replace(/^#####\s+(.*)$/gm,'<h5>$1</h5>').replace(/^####\s+(.*)$/gm,'<h4>$1</h4>').replace(/^###\s+(.*)$/gm,'<h3>$1</h3>').replace(/^##\s+(.*)$/gm,'<h2>$1</h2>').replace(/^#\s+(.*)$/gm,'<h1>$1</h1>');
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  s = s.replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>').replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<em>$2</em>');
+  s = s.replace(/(^|\n)((?:[-*]\s+.+(?:\n|$))+)/g,(m,pre,block)=>{const items=block.trim().split(/\n/).map(l=>'<li>'+l.replace(/^[-*]\s+/,'')+'</li>').join('');return pre+'<ul>'+items+'</ul>'});
+  s = s.replace(/(^|\n)((?:\d+\.\s+.+(?:\n|$))+)/g,(m,pre,block)=>{const items=block.trim().split(/\n/).map(l=>'<li>'+l.replace(/^\d+\.\s+/,'')+'</li>').join('');return pre+'<ol>'+items+'</ol>'});
+  s = s.split(/\n{2,}/).map(chunk=>/^\s*<(h\d|ul|ol|pre|p|blockquote)/.test(chunk)?chunk:'<p>'+chunk.replace(/\n/g,'<br>')+'</p>').join('\n');
   return s;
 }
 
-/* ============================================================
-   State + DOM refs
-   ============================================================ */
-const messagesWrap = document.getElementById('messages-wrap');
-const messagesEl   = document.getElementById('messages');
-const form         = document.getElementById('chat-form');
-const input        = document.getElementById('input');
-const sendBtn      = document.getElementById('send-btn');
-const clearBtn     = document.getElementById('clear-btn');
-const convListEl   = document.getElementById('conv-list');
-const newChatBtn   = document.getElementById('new-chat-btn');
-const sidebarToggle= document.getElementById('sidebar-toggle');
-const fullscreenBtn= document.getElementById('fullscreen-btn');
-const fullscreenIcon = document.getElementById ? null : null;
-const nameBtn       = document.getElementById('name-btn');
-const nameModalOverlay = document.getElementById('name-modal-overlay');
-const nameInput     = document.getElementById('name-input');
-const nameCancelBtn = document.getElementById('name-cancel-btn');
-const nameSaveBtn   = document.getElementById('name-save-btn');
-const exportBtn     = document.getElementById('export-btn');
-const sidebar      = document.getElementById('sidebar');
-const fileInput    = document.getElementById('file-input');
-const attachBtn    = document.getElementById('attach-btn');
-const cameraInput  = document.getElementById('camera-input');
-const selfieInput  = document.getElementById('selfie-input');
-const cameraBtn    = document.getElementById('camera-btn');
-const selfieBtn    = document.getElementById('selfie-btn');
-const voiceBtn     = document.getElementById('voice-btn');
-const pendingAttach= document.getElementById('pending-attach');
-const pendingName  = document.getElementById('pending-attach-name');
-const pendingRemove= document.getElementById('pending-attach-remove');
-const scrollBtn    = document.getElementById('scroll-btn');
-const speakingIndicator = document.getElementById('speaking-indicator');
-const stopSpeakBtn = document.getElementById('stop-speak-btn');
-const sidebarOverlay = document.getElementById('sidebar-overlay');
-const modelSelect  = document.getElementById('model-select');
+const messagesWrap=document.getElementById('messages-wrap');
+const messagesEl=document.getElementById('messages');
+const form=document.getElementById('chat-form');
+const input=document.getElementById('input');
+const sendBtn=document.getElementById('send-btn');
+const clearBtn=document.getElementById('clear-btn');
+const convListEl=document.getElementById('conv-list');
+const newChatBtn=document.getElementById('new-chat-btn');
+const sidebarToggle=document.getElementById('sidebar-toggle');
+const sidebar=document.getElementById('sidebar');
+const sidebarOverlay=document.getElementById('sidebar-overlay');
+const fullscreenBtn=document.getElementById('fullscreen-btn');
+const nameBtn=document.getElementById('name-btn');
+const nameModalOverlay=document.getElementById('name-modal-overlay');
+const nameInput=document.getElementById('name-input');
+const nameCancelBtn=document.getElementById('name-cancel-btn');
+const nameSaveBtn=document.getElementById('name-save-btn');
+const exportBtn=document.getElementById('export-btn');
+const fileInput=document.getElementById('file-input');
+const attachBtn=document.getElementById('attach-btn');
+const cameraInput=document.getElementById('camera-input');
+const selfieInput=document.getElementById('selfie-input');
+const cameraBtn=document.getElementById('camera-btn');
+const selfieBtn=document.getElementById('selfie-btn');
+const voiceBtn=document.getElementById('voice-btn');
+const pendingAttach=document.getElementById('pending-attach');
+const pendingName=document.getElementById('pending-attach-name');
+const pendingRemove=document.getElementById('pending-attach-remove');
+const scrollBtn=document.getElementById('scroll-btn');
+const speakingIndicator=document.getElementById('speaking-indicator');
+const stopSpeakBtn=document.getElementById('stop-speak-btn');
+const modelSelect=document.getElementById('model-select');
 
-let activeConvId  = null;
-let selectedModel = 'aarav-2.5';
-let vipUnlocked   = false;
-let pendingFile   = null;
-let recognition   = null;
-let isGenerating  = false;
-let currentAbortController = null;
+let activeConvId=null, selectedModel='aarav-2.5', vipUnlocked=false;
+let pendingFile=null, recognition=null, isGenerating=false, currentAbortController=null;
 
-function autoResize() {
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 140) + 'px';
-}
+function autoResize(){input.style.height='auto';input.style.height=Math.min(input.scrollHeight,140)+'px'}
 
-/* ============================================================
-   VIP modal
-   ============================================================ */
-function showVipModal() {
-  const existing = document.getElementById('vip-modal-overlay');
-  if (existing) { existing.style.display = 'flex'; return; }
-  const overlay = document.createElement('div');
-  overlay.id = 'vip-modal-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;display:flex;align-items:center;justify-content:center;';
-  overlay.innerHTML = `
+function showVipModal(){
+  const existing=document.getElementById('vip-modal-overlay');
+  if(existing){existing.style.display='flex';return}
+  const overlay=document.createElement('div');
+  overlay.id='vip-modal-overlay';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;display:flex;align-items:center;justify-content:center;';
+  overlay.innerHTML=`
     <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:340px;">
       <div style="font-size:22px;margin-bottom:6px;">🔒 VIP Access</div>
-      <div style="color:var(--muted);font-size:13px;margin-bottom:16px;">Mythic Ultra is for VIP users only. Enter your password to unlock it.</div>
-      <input id="vip-pw-in" type="password" placeholder="VIP password"
-        style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;margin-bottom:8px;font-family:inherit;">
-      <div id="vip-pw-err" style="color:#ef4444;font-size:12px;display:none;margin-bottom:8px;">Wrong password. Try again.</div>
+      <div style="color:var(--muted);font-size:13px;margin-bottom:16px;">Mythic Ultra is for VIP users only.</div>
+      <input id="vip-pw-in" type="password" placeholder="VIP password" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;margin-bottom:8px;font-family:inherit;">
+      <div id="vip-pw-err" style="color:#ef4444;font-size:12px;display:none;margin-bottom:8px;">Wrong password.</div>
       <div style="display:flex;gap:8px;">
         <button id="vip-pw-ok" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Unlock</button>
         <button id="vip-pw-cancel" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px;font-size:14px;cursor:pointer;">Cancel</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
-  const pwIn = overlay.querySelector('#vip-pw-in');
-  const pwErr = overlay.querySelector('#vip-pw-err');
+  const pwIn=overlay.querySelector('#vip-pw-in');
+  const pwErr=overlay.querySelector('#vip-pw-err');
   pwIn.focus();
-  overlay.querySelector('#vip-pw-cancel').addEventListener('click', () => {
-    overlay.style.display = 'none';
-    modelSelect.value = selectedModel;
+  overlay.querySelector('#vip-pw-cancel').addEventListener('click',()=>{overlay.style.display='none';modelSelect.value=selectedModel});
+  overlay.querySelector('#vip-pw-ok').addEventListener('click',async()=>{
+    const r=await fetch('/api/vip-unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwIn.value.trim()})});
+    const d=await r.json();
+    if(d.success){vipUnlocked=true;overlay.style.display='none';selectedModel='aarav-ultra';modelSelect.value='aarav-ultra';const opt=modelSelect.querySelector('option[value="aarav-ultra"]');if(opt)opt.textContent='Mythic Ultra ✨'}
+    else{pwErr.style.display='block';pwIn.value='';pwIn.focus()}
   });
-  overlay.querySelector('#vip-pw-ok').addEventListener('click', async () => {
-    const r = await fetch('/api/vip-unlock', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: pwIn.value.trim() }) });
-    const d = await r.json();
-    if (d.success) {
-      vipUnlocked = true; overlay.style.display = 'none';
-      selectedModel = 'aarav-ultra'; modelSelect.value = 'aarav-ultra';
-      const opt = modelSelect.querySelector('option[value="aarav-ultra"]');
-      if (opt) opt.textContent = 'Mythic Ultra ✨';
-    } else { pwErr.style.display = 'block'; pwIn.value = ''; pwIn.focus(); }
-  });
-  pwIn.addEventListener('keydown', e => { if (e.key === 'Enter') overlay.querySelector('#vip-pw-ok').click(); });
+  pwIn.addEventListener('keydown',e=>{if(e.key==='Enter')overlay.querySelector('#vip-pw-ok').click()});
 }
 
-/* ============================================================
-   Model select
-   ============================================================ */
-(async () => {
-  try {
-    const [mr, vr] = await Promise.all([
-      fetch('/api/models').then(r => r.json()),
-      fetch('/api/vip-status').then(r => r.json()),
-    ]);
-    vipUnlocked = vr.vip;
-    modelSelect.innerHTML = '';
-    mr.models.forEach(m => {
-      const opt = document.createElement('option');
-      opt.value = m.id;
-      opt.textContent = m.vip ? (vipUnlocked ? 'Mythic Ultra ✨' : 'Mythic Ultra 🔒') : m.name;
-      opt.dataset.vip = m.vip ? '1' : '0';
-      if (m.id === mr.default) opt.selected = true;
+(async()=>{
+  try{
+    const [mr,vr]=await Promise.all([fetch('/api/models').then(r=>r.json()),fetch('/api/vip-status').then(r=>r.json())]);
+    vipUnlocked=vr.vip;
+    modelSelect.innerHTML='';
+    mr.models.forEach(m=>{
+      const opt=document.createElement('option');
+      opt.value=m.id;
+      opt.textContent=m.vip?(vipUnlocked?'Mythic Ultra ✨':'Mythic Ultra 🔒'):m.name;
+      opt.dataset.vip=m.vip?'1':'0';
+      if(m.id===mr.default)opt.selected=true;
       modelSelect.appendChild(opt);
     });
-    selectedModel = mr.default;
-  } catch { /* keep static options */ }
+    selectedModel=mr.default;
+  }catch{}
 })();
-
-modelSelect.addEventListener('change', () => {
-  const opt = modelSelect.options[modelSelect.selectedIndex];
-  if (opt && opt.dataset.vip === '1' && !vipUnlocked) {
-    showVipModal();
-  } else {
-    selectedModel = modelSelect.value;
-  }
+modelSelect.addEventListener('change',()=>{
+  const opt=modelSelect.options[modelSelect.selectedIndex];
+  if(opt&&opt.dataset.vip==='1'&&!vipUnlocked)showVipModal();
+  else selectedModel=modelSelect.value;
 });
 
-/* ============================================================
-   Scrolling
-   ============================================================ */
-messagesWrap.addEventListener('scroll', () => {
-  const nearBottom = messagesWrap.scrollHeight - messagesWrap.scrollTop - messagesWrap.clientHeight < 120;
-  scrollBtn.classList.toggle('show', !nearBottom);
-});
-scrollBtn.addEventListener('click', () => {
-  messagesWrap.scrollTo({ top: messagesWrap.scrollHeight, behavior: 'smooth' });
-});
-function scrollToBottom() {
-  requestAnimationFrame(() => {
-    messagesWrap.scrollTo({ top: messagesWrap.scrollHeight, behavior: 'smooth' });
-  });
-}
-function clearEmptyState() {
-  const es = document.getElementById('empty-state');
-  if (es) es.remove();
-}
-function showEmptyState() {
-  messagesEl.innerHTML = '<div class="empty-state" id="empty-state"><h2>Mythic AI</h2><p>Ask me anything, generate images, or just chat 👋</p></div>';
-}
+messagesWrap.addEventListener('scroll',()=>{const nearBottom=messagesWrap.scrollHeight-messagesWrap.scrollTop-messagesWrap.clientHeight<120;scrollBtn.classList.toggle('show',!nearBottom)});
+scrollBtn.addEventListener('click',()=>messagesWrap.scrollTo({top:messagesWrap.scrollHeight,behavior:'smooth'}));
+function scrollToBottom(){requestAnimationFrame(()=>messagesWrap.scrollTo({top:messagesWrap.scrollHeight,behavior:'smooth'}))}
+function clearEmptyState(){const es=document.getElementById('empty-state');if(es)es.remove()}
+function showEmptyState(){messagesEl.innerHTML='<div class="empty-state" id="empty-state"><h2>Mythic AI</h2><p>Ask me anything 👋</p></div>'}
 
-/* ============================================================
-   Message rendering
-   ============================================================ */
-function addMessage(role, text, attachment) {
+function addMessage(role,text,attachment){
   clearEmptyState();
-  const row = document.createElement('div');
-  row.className = 'msg-row ' + role;
-
-  const div = document.createElement('div');
-  div.className = 'msg ' + role;
-  if (attachment) {
-    const chip = document.createElement('div');
-    chip.className = 'attach-chip';
-    chip.textContent = '📎 ' + attachment.name;
-    div.appendChild(chip);
-    if (attachment.mimeType && attachment.mimeType.startsWith('image/') && attachment.dataBase64) {
-      const img = document.createElement('img');
-      img.src = 'data:' + attachment.mimeType + ';base64,' + attachment.dataBase64;
-      div.appendChild(img);
+  const row=document.createElement('div');row.className='msg-row '+role;
+  const div=document.createElement('div');div.className='msg '+role;
+  if(attachment){
+    const chip=document.createElement('div');chip.className='attach-chip';chip.textContent='📎 '+attachment.name;div.appendChild(chip);
+    if(attachment.mimeType&&attachment.mimeType.startsWith('image/')&&attachment.dataBase64){
+      const img=document.createElement('img');img.src='data:'+attachment.mimeType+';base64,'+attachment.dataBase64;div.appendChild(img);
     }
   }
-  const textNode = document.createElement('div');
-  textNode.className = 'msg-text';
-  if (role === 'ai') {
-    textNode.innerHTML = renderMarkdown(text || '');
-  } else {
-    textNode.textContent = text || '';
-  }
-  div.appendChild(textNode);
-  row.appendChild(div);
-
-  if (role === 'user' || role === 'ai') {
-    row.appendChild(buildMsgActions(row, textNode, role, text || ''));
-  }
-
-  messagesEl.appendChild(row);
-  scrollToBottom();
-  return textNode;
+  const textNode=document.createElement('div');textNode.className='msg-text';
+  if(role==='ai')textNode.innerHTML=renderMarkdown(text||'');
+  else textNode.textContent=text||'';
+  div.appendChild(textNode);row.appendChild(div);
+  if(role==='user'||role==='ai')row.appendChild(buildMsgActions(row,textNode,role,text||''));
+  messagesEl.appendChild(row);scrollToBottom();return textNode;
 }
-
-function buildMsgActions(row, textNode, role, rawText) {
-  const actions = document.createElement('div');
-  actions.className = 'msg-actions';
-  const copyBtn = document.createElement('button');
-  copyBtn.type = 'button';
-  copyBtn.title = 'Copy';
-  copyBtn.textContent = '📋';
-  copyBtn.addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText(rawText);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = rawText; document.body.appendChild(ta); ta.select();
-      try { document.execCommand('copy'); } catch {} ta.remove();
-    }
-    const orig = copyBtn.textContent;
-    copyBtn.textContent = '✓';
-    setTimeout(() => { copyBtn.textContent = orig; }, 1200);
+function buildMsgActions(row,textNode,role,rawText){
+  const actions=document.createElement('div');actions.className='msg-actions';
+  const copyBtn=document.createElement('button');copyBtn.type='button';copyBtn.title='Copy';copyBtn.textContent='📋';
+  copyBtn.addEventListener('click',async()=>{
+    try{await navigator.clipboard.writeText(rawText)}catch{const ta=document.createElement('textarea');ta.value=rawText;document.body.appendChild(ta);ta.select();try{document.execCommand('copy')}catch{}ta.remove()}
+    const orig=copyBtn.textContent;copyBtn.textContent='✓';setTimeout(()=>copyBtn.textContent=orig,1200);
   });
   actions.appendChild(copyBtn);
-  if (role === 'ai') {
-    const regenBtn = document.createElement('button');
-    regenBtn.type = 'button';
-    regenBtn.title = 'Regenerate response';
-    regenBtn.textContent = '↻';
-    regenBtn.addEventListener('click', () => regenerateLast(row));
-    actions.appendChild(regenBtn);
+  if(role==='ai'){
+    const regenBtn=document.createElement('button');regenBtn.type='button';regenBtn.title='Regenerate';regenBtn.textContent='↻';
+    regenBtn.addEventListener('click',()=>regenerateLast(row));actions.appendChild(regenBtn);
   }
   return actions;
 }
+function showTyping(){const div=document.createElement('div');div.className='typing';div.id='typing-indicator';div.innerHTML='<span></span><span></span><span></span>';messagesEl.appendChild(div);scrollToBottom()}
+function hideTyping(){const el=document.getElementById('typing-indicator');if(el)el.remove()}
 
-function addImageMessage(role, base64, caption) {
-  clearEmptyState();
-  const div = document.createElement('div');
-  div.className = 'msg ' + role;
-  if (caption) {
-    const cap = document.createElement('div');
-    cap.style.cssText = 'font-size:12px;opacity:.7;margin-bottom:8px;';
-    cap.textContent = caption;
-    div.appendChild(cap);
+function isHindi(text){return /[\u0900-\u097F]/.test(text)}
+function speak(text){
+  if(!window.speechSynthesis)return;window.speechSynthesis.cancel();
+  const plain=text.replace(/[#*`_~>]/g,'').trim();if(!plain)return;
+  const utt=new SpeechSynthesisUtterance(plain);utt.rate=0.95;utt.pitch=1.1;
+  const hindi=isHindi(plain);utt.lang=hindi?'hi-IN':'en-IN';
+  const voices=window.speechSynthesis.getVoices();
+  if(voices.length){
+    let chosen=null;
+    if(hindi){chosen=voices.find(v=>v.lang.startsWith('hi')&&/female|woman|lekha|kalpana|aditi|riya|priya|sunita/i.test(v.name))||voices.find(v=>v.lang.startsWith('hi'))}
+    else{chosen=voices.find(v=>v.lang==='en-IN'&&/female|woman|aditi|riya/i.test(v.name))||voices.find(v=>v.lang==='en-IN')||voices.find(v=>v.lang.startsWith('en')&&/female|woman|samantha|victoria|karen|sonia|aria|jenny|zira|hazel|susan/i.test(v.name))||voices.find(v=>v.lang.startsWith('en'))}
+    if(chosen)utt.voice=chosen;
   }
-  const img = document.createElement('img');
-  img.className = 'gen-img';
-  img.src = 'data:image/png;base64,' + base64;
-  div.appendChild(img);
-  messagesEl.appendChild(div);
-  scrollToBottom();
-}
-
-function showTyping() {
-  const div = document.createElement('div');
-  div.className = 'typing'; div.id = 'typing-indicator';
-  div.innerHTML = '<span></span><span></span><span></span>';
-  messagesEl.appendChild(div);
-  scrollToBottom();
-}
-function hideTyping() {
-  const el = document.getElementById('typing-indicator');
-  if (el) el.remove();
-}
-
-/* ============================================================
-   Voice (TTS + STT)
-   ============================================================ */
-function isHindi(text) { return /[\u0900-\u097F]/.test(text); }
-function speak(text) {
-  if (!window.speechSynthesis) return;
-  window.speechSynthesis.cancel();
-  const plain = text.replace(/[#*`_~>]/g, '').trim();
-  if (!plain) return;
-  const utt = new SpeechSynthesisUtterance(plain);
-  utt.rate = 0.95; utt.pitch = 1.1;
-  const hindi = isHindi(plain);
-  utt.lang = hindi ? 'hi-IN' : 'en-IN';
-  const voices = window.speechSynthesis.getVoices();
-  if (voices.length) {
-    let chosen = null;
-    if (hindi) {
-      chosen = voices.find(v => v.lang.startsWith('hi') &&
-        /female|woman|lekha|kalpana|aditi|riya|priya|sunita/i.test(v.name)) ||
-        voices.find(v => v.lang.startsWith('hi'));
-    } else {
-      chosen = voices.find(v => v.lang === 'en-IN' && /female|woman|aditi|riya/i.test(v.name)) ||
-        voices.find(v => v.lang === 'en-IN') ||
-        voices.find(v => v.lang.startsWith('en') &&
-          /female|woman|samantha|victoria|karen|sonia|aria|jenny|zira|hazel|susan/i.test(v.name)) ||
-        voices.find(v => v.lang.startsWith('en'));
-    }
-    if (chosen) utt.voice = chosen;
-  }
-  utt.onstart  = () => speakingIndicator.classList.add('show');
-  utt.onend    = () => speakingIndicator.classList.remove('show');
-  utt.onerror  = () => speakingIndicator.classList.remove('show');
+  utt.onstart=()=>speakingIndicator.classList.add('show');
+  utt.onend=()=>speakingIndicator.classList.remove('show');
+  utt.onerror=()=>speakingIndicator.classList.remove('show');
   window.speechSynthesis.speak(utt);
 }
-if (window.speechSynthesis) {
-  window.speechSynthesis.getVoices();
-  window.speechSynthesis.onvoiceschanged = () => { window.speechSynthesis.getVoices(); };
-}
-stopSpeakBtn.addEventListener('click', () => {
-  window.speechSynthesis && window.speechSynthesis.cancel();
-  speakingIndicator.classList.remove('show');
-});
+if(window.speechSynthesis){window.speechSynthesis.getVoices();window.speechSynthesis.onvoiceschanged=()=>window.speechSynthesis.getVoices()}
+stopSpeakBtn.addEventListener('click',()=>{window.speechSynthesis&&window.speechSynthesis.cancel();speakingIndicator.classList.remove('show')});
 
-function setupVoice() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) { voiceBtn.title = 'Voice not supported in this browser'; return; }
-  recognition = new SR();
-  recognition.continuous = false;
-  recognition.interimResults = true;
-  recognition.lang = 'hi-IN';
-  let finalTranscript = '';
-  recognition.onstart  = () => { voiceBtn.classList.add('active', 'listening'); finalTranscript = ''; };
-  recognition.onresult = (e) => {
-    finalTranscript = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      if (e.results[i].isFinal) finalTranscript += e.results[i][0].transcript;
-      else input.value = e.results[i][0].transcript;
-    }
-    if (finalTranscript) input.value = finalTranscript;
-  };
-  recognition.onend = () => {
-    voiceBtn.classList.remove('active', 'listening');
-    if (input.value.trim()) form.requestSubmit();
-  };
-  recognition.onerror = () => voiceBtn.classList.remove('active', 'listening');
+function setupVoice(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return;
+  recognition=new SR();recognition.continuous=false;recognition.interimResults=true;recognition.lang='hi-IN';
+  let finalTranscript='';
+  recognition.onstart=()=>{voiceBtn.classList.add('active','listening');finalTranscript=''};
+  recognition.onresult=(e)=>{finalTranscript='';for(let i=e.resultIndex;i<e.results.length;i++){if(e.results[i].isFinal)finalTranscript+=e.results[i][0].transcript;else input.value=e.results[i][0].transcript}if(finalTranscript)input.value=finalTranscript};
+  recognition.onend=()=>{voiceBtn.classList.remove('active','listening');if(input.value.trim())form.requestSubmit()};
+  recognition.onerror=()=>voiceBtn.classList.remove('active','listening');
 }
 setupVoice();
-voiceBtn.addEventListener('click', () => {
-  if (!recognition) { alert('Voice input is not supported in this browser. Try Chrome.'); return; }
-  if (voiceBtn.classList.contains('listening')) { recognition.stop(); return; }
-  recognition.start();
-});
+voiceBtn.addEventListener('click',()=>{if(!recognition){alert('Voice not supported in this browser.');return}if(voiceBtn.classList.contains('listening')){recognition.stop();return}recognition.start()});
 
-/* ============================================================
-   Attachments
-   ============================================================ */
-function handleFileSelect(file) {
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const dataUrl = e.target.result;
-    pendingFile = { name: file.name, mimeType: file.type || 'application/octet-stream', dataBase64: dataUrl.split(',')[1] };
-    pendingName.textContent = file.name;
-    pendingAttach.classList.add('show');
-  };
+function handleFileSelect(file){
+  if(!file)return;const reader=new FileReader();
+  reader.onload=(e)=>{const dataUrl=e.target.result;pendingFile={name:file.name,mimeType:file.type||'application/octet-stream',dataBase64:dataUrl.split(',')[1]};pendingName.textContent=file.name;pendingAttach.classList.add('show')};
   reader.readAsDataURL(file);
 }
-attachBtn.addEventListener('click', () => fileInput.click());
-cameraBtn.addEventListener('click', () => cameraInput.click());
-selfieBtn.addEventListener('click', () => selfieInput.click());
-fileInput.addEventListener('change', () => handleFileSelect(fileInput.files[0]));
-cameraInput.addEventListener('change', () => handleFileSelect(cameraInput.files[0]));
-selfieInput.addEventListener('change', () => handleFileSelect(selfieInput.files[0]));
-pendingRemove.addEventListener('click', () => {
-  pendingFile = null; fileInput.value = ''; cameraInput.value = ''; pendingAttach.classList.remove('show');
-});
+attachBtn.addEventListener('click',()=>fileInput.click());
+cameraBtn.addEventListener('click',()=>cameraInput.click());
+selfieBtn.addEventListener('click',()=>selfieInput.click());
+fileInput.addEventListener('change',()=>handleFileSelect(fileInput.files[0]));
+cameraInput.addEventListener('change',()=>handleFileSelect(cameraInput.files[0]));
+selfieInput.addEventListener('change',()=>handleFileSelect(selfieInput.files[0]));
+pendingRemove.addEventListener('click',()=>{pendingFile=null;fileInput.value='';cameraInput.value='';pendingAttach.classList.remove('show')});
 
-/* ============================================================
-   Conversation list + history
-   ============================================================ */
-async function loadConversationList() {
-  try {
-    const r = await fetch('/api/conversations');
-    const d = await r.json();
-    const convs = d.conversations || [];
-    convListEl.innerHTML = '';
-    convs.forEach(c => {
-      const item = document.createElement('div');
-      item.className = 'conv-item' + (c.id === activeConvId ? ' active' : '');
-      item.innerHTML = '<span class="title"></span>'
-        + '<button class="rename-btn" title="Rename">✎</button>'
-        + '<button class="del-btn" title="Delete">✕</button>';
-      item.querySelector('.title').textContent = c.title;
-      item.addEventListener('click', (e) => {
-        if (!e.target.classList.contains('del-btn') && !e.target.classList.contains('rename-btn')) openConversation(c.id);
-      });
-      item.querySelector('.rename-btn').addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const newTitle = prompt('Rename chat:', c.title);
-        if (!newTitle || !newTitle.trim() || newTitle.trim() === c.title) return;
-        await fetch('/api/conversations/' + c.id, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: newTitle.trim() })
-        });
-        loadConversationList();
-      });
-      item.querySelector('.del-btn').addEventListener('click', async (e) => {
-        e.stopPropagation();
-        await fetch('/api/conversations/' + c.id, { method: 'DELETE' });
-        if (c.id === activeConvId) startNewChat();
-        else loadConversationList();
-      });
+async function loadConversationList(){
+  try{
+    const r=await fetch('/api/conversations');const d=await r.json();const convs=d.conversations||[];
+    convListEl.innerHTML='';
+    convs.forEach(c=>{
+      const item=document.createElement('div');item.className='conv-item'+(c.id===activeConvId?' active':'');
+      item.innerHTML='<span class="title"></span><button class="rename-btn">✎</button><button class="del-btn">✕</button>';
+      item.querySelector('.title').textContent=c.title;
+      item.addEventListener('click',(e)=>{if(!e.target.classList.contains('del-btn')&&!e.target.classList.contains('rename-btn'))openConversation(c.id)});
+      item.querySelector('.rename-btn').addEventListener('click',async(e)=>{e.stopPropagation();const nt=prompt('Rename chat:',c.title);if(!nt||!nt.trim()||nt.trim()===c.title)return;await fetch('/api/conversations/'+c.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:nt.trim()})});loadConversationList()});
+      item.querySelector('.del-btn').addEventListener('click',async(e)=>{e.stopPropagation();await fetch('/api/conversations/'+c.id,{method:'DELETE'});if(c.id===activeConvId)startNewChat();else loadConversationList()});
       convListEl.appendChild(item);
     });
     return convs;
-  } catch { return []; }
+  }catch{return[]}
+}
+async function openConversation(convId){
+  activeConvId=convId;
+  try{const r=await fetch('/api/conversations/'+convId);if(!r.ok)return;const d=await r.json();messagesEl.innerHTML='';(d.messages||[]).forEach(m=>addMessage(m.role,m.text,m.attachment));loadConversationList()}catch{}
+  if(isMobile())closeSidebar();
+}
+function startNewChat(){activeConvId=null;messagesEl.innerHTML='';showEmptyState();loadConversationList();if(isMobile())closeSidebar()}
+
+function setGenerating(state){
+  isGenerating=state;sendBtn.classList.toggle('generating',state);
+  sendBtn.title=state?'Stop':'Send';
+  sendBtn.innerHTML=state?'<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>':'<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>';
 }
 
-async function openConversation(convId) {
-  activeConvId = convId;
-  try {
-    const r = await fetch('/api/conversations/' + convId);
-    if (!r.ok) return;
-    const d = await r.json();
-    messagesEl.innerHTML = '';
-    (d.messages || []).forEach(m => addMessage(m.role, m.text, m.attachment));
-    loadConversationList();
-  } catch {}
-  if (isMobile()) closeSidebar();
+const IMAGE_KEYWORDS=/\b(generate|create|draw|make|paint|render|show me|ghibli|anime|realistic|cartoon|portrait|landscape|art|artwork|image of|picture of|photo of|illustration)\b/i;
+async function tryGenerateImage(prompt){
+  try{const r=await fetch('/api/generate-image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});
+    const d=await r.json();
+    if(d.image){const div=document.createElement('div');div.className='msg ai';const img=document.createElement('img');img.className='gen-img';img.src='data:image/png;base64,'+d.image;div.appendChild(img);messagesEl.appendChild(div);scrollToBottom();return true}
+  }catch{}return false;
 }
 
-function startNewChat() {
-  activeConvId = null;
-  messagesEl.innerHTML = '';
-  showEmptyState();
-  loadConversationList();
-  if (isMobile()) closeSidebar();
+const NEWS_RE=/\b(news|khabar|khabren|headline|aaj ki|today.*news|latest.*news|cricket|ipl|score|match|winner|won|result|election|stock|price|rate|breaking|current events?|live)\b/i;
+const WEATHER_RE=/\b(weather|mausam|temperature|rain|barish|forecast|humid)\b/i;
+const SEARCH_RE=/^(search:|search for|google|find|look up|what is|who is|tell me about|how to|kya hai|kaun hai|batao|dhundho|when|where|which)/i;
+const GENERIC_FACT_RE=/\b(today|now|currently|latest|this year|2025|2026|recent|update|happening)\b/i;
+
+function getLastKnownLocation(){return new Promise(r=>{if(!navigator.geolocation){r(null);return}navigator.geolocation.getCurrentPosition(p=>r({lat:p.coords.latitude,lon:p.coords.longitude}),()=>r(null),{timeout:5000})})}
+
+async function fetchWeatherContextForChat(message){
+  const m=message.match(/(?:weather|mausam|temperature|forecast)\s*(?:in|of|at)?\s*([a-zA-Z\u0900-\u097F ]{2,40})/i);
+  const city=m?m[1].trim():null;
+  let body=city&&city.length>1?{location:city}:null;
+  if(!body){const loc=await getLastKnownLocation();if(loc)body={lat:loc.lat,lon:loc.lon}}
+  if(!body)return null;
+  try{
+    const r=await fetch('/api/weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();if(!d.weather)return null;
+    const w=d.weather;
+    return `[Live data] Current weather in ${w.location}: ${w.temp}°C (feels like ${w.feels_like}°C), ${w.condition}, humidity ${w.humidity}%, wind ${w.wind_speed} km/h.`;
+  }catch{return null}
 }
 
-/* ============================================================
-   Send / stop
-   ============================================================ */
-function setGenerating(state) {
-  isGenerating = state;
-  sendBtn.classList.toggle('generating', state);
-  sendBtn.title = state ? 'Stop generating' : 'Send';
-  sendBtn.innerHTML = state
-    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>'
-    : '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>';
-}
-
-const IMAGE_KEYWORDS = /\b(generate|create|draw|make|paint|render|show me|ghibli|anime|realistic|cartoon|portrait|landscape|art|artwork|image of|picture of|photo of|illustration)\b/i;
-async function tryGenerateImage(prompt) {
-  try {
-    const r = await fetch('/api/generate-image', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt })
-    });
-    const d = await r.json();
-    if (d.image) { addImageMessage('ai', d.image, ''); return true; }
-  } catch {}
-  return false;
-}
-
-const NEWS_RE     = /\b(news|khabar|khabren|headline|aaj ki|today.*news|latest.*news|cricket|ipl|score|match|winner|won|result|election|stock|price|rate|breaking|current events?|live)\b/i;
-const WEATHER_RE  = /\b(weather|mausam|temperature|rain|barish|forecast|humid)\b/i;
-const SEARCH_RE   = /^(search:|search for|google|find|look up|what is|who is|tell me about|how to|kya hai|kaun hai|batao|dhundho|when|where|which)/i;
-const GENERIC_FACT_RE = /\b(today|now|currently|latest|this year|2025|2026|recent|update|happening)\b/i;
-
-function getLastKnownLocation() {
-  return new Promise((resolve) => {
-    if (!navigator.geolocation) { resolve(null); return; }
-    navigator.geolocation.getCurrentPosition(
-      pos => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
-      () => resolve(null),
-      { timeout: 5000 }
-    );
-  });
-}
-
-async function fetchWeatherContextForChat(message) {
-  const cityMatch = message.match(/(?:weather|mausam|temperature|forecast)\s*(?:in|of|at)?\s*([a-zA-Z\u0900-\u097F ]{2,40})/i);
-  const city = cityMatch ? cityMatch[1].trim() : null;
-  let body = city && city.length > 1 ? { location: city } : null;
-  if (!body) {
-    const loc = await getLastKnownLocation();
-    if (loc) body = { lat: loc.lat, lon: loc.lon };
+async function streamReply({message=null,attachment=null,regenerate=false}={}){
+  showTyping();setGenerating(true);currentAbortController=new AbortController();
+  if(!regenerate){const wantsImage=IMAGE_KEYWORDS.test(message||'')&&!attachment;if(wantsImage){hideTyping();const generated=await tryGenerateImage(message);if(generated){setGenerating(false);loadConversationList();return}showTyping()}}
+  let newsContext=null;
+  if(!regenerate&&message&&WEATHER_RE.test(message)){const w=await fetchWeatherContextForChat(message);if(w)newsContext=w}
+  if(!regenerate&&message&&NEWS_RE.test(message)){try{const nr=await fetch('/api/news',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:message.length<80?message:null})});const nd=await nr.json();if(nd.articles&&nd.articles.length>0)newsContext="[Live data] Live news headlines:\n"+nd.articles.map((a,i)=>`${i+1}. ${a.title} (${a.source})`).join('\n')}catch{}}
+  if(!regenerate&&message&&(SEARCH_RE.test(message)||GENERIC_FACT_RE.test(message)||(!newsContext&&NEWS_RE.test(message)))){
+    const sq=message.replace(/^(search:|search for)\s*/i,'').trim();
+    try{const sr=await fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:sq})});
+      const sd=await sr.json();
+      if(sd.results&&sd.results.length>0){const sb=`[Live data] Web search results for "${sq}":\n`+sd.results.map((r,i)=>`${i+1}. ${r.title}: ${r.snippet}`).join('\n');newsContext=newsContext?(newsContext+"\n\n"+sb):sb}
+    }catch{}
   }
-  if (!body) return null;
-  try {
-    const r = await fetch('/api/weather', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    const d = await r.json();
-    if (!d.weather) return null;
-    const w = d.weather;
-    let text = `[Live data] Current weather in ${w.location}: ${w.temp}°C (feels like ${w.feels_like}°C), ${w.condition}, humidity ${w.humidity}%, wind ${w.wind_speed} km/h.`;
-    if (w.hourly_forecast && w.hourly_forecast.length) {
-      text += " Hour-by-hour forecast: " + w.hourly_forecast.map(h => {
-        const t = h.time ? h.time.split('T')[1] : '';
-        return `${t} → ${h.temp}°C, ${h.condition}${h.rain_chance != null ? `, ${h.rain_chance}% rain chance` : ''}`;
-      }).join('; ') + ".";
-    }
-    return text;
-  } catch { return null; }
+  let aiTextNode=null;
+  try{
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},signal:currentAbortController.signal,body:JSON.stringify({message:message||'',conversation_id:activeConvId,attachment,user_name:getUserName(),regenerate:!!regenerate,news_context:newsContext,model:selectedModel})});
+    if(!r.ok||!r.body){hideTyping();if(r.status===403){const e=await r.json().catch(()=>({}));if(e.error==='vip_required'){showVipModal();return}}addMessage('error','Something went wrong. Try again.');return}
+    hideTyping();aiTextNode=addMessage('ai','');
+    const convId=r.headers.get('X-Conversation-Id');if(convId)activeConvId=convId;
+    const reader=r.body.getReader();const decoder=new TextDecoder();let buf='';
+    while(true){const{done,value}=await reader.read();if(done)break;buf+=decoder.decode(value,{stream:true});aiTextNode.innerHTML=renderMarkdown(buf);scrollToBottom()}
+    speak(buf);loadConversationList();
+  }catch(err){hideTyping();if(err.name==='AbortError'){if(aiTextNode&&!aiTextNode.textContent.trim())aiTextNode.textContent='[Stopped]'}else{addMessage('error','Network error: '+err.message)}}
+  finally{setGenerating(false);currentAbortController=null}
 }
 
-async function streamReply({ message = null, attachment = null, regenerate = false } = {}) {
-  showTyping();
-  setGenerating(true);
-  currentAbortController = new AbortController();
+function regenerateLast(row){if(isGenerating)return;row.remove();streamReply({regenerate:true})}
 
-  if (!regenerate) {
-    const wantsImage = IMAGE_KEYWORDS.test(message || '') && !attachment;
-    if (wantsImage) {
-      hideTyping();
-      const generated = await tryGenerateImage(message);
-      if (generated) { setGenerating(false); loadConversationList(); return; }
-      showTyping();
-    }
-  }
+form.addEventListener('submit',(e)=>{
+  e.preventDefault();if(isGenerating)return;
+  const text=input.value.trim();if(!text&&!pendingFile)return;
+  const attachment=pendingFile;pendingFile=null;fileInput.value='';cameraInput.value='';pendingAttach.classList.remove('show');
+  addMessage('user',text,attachment);input.value='';input.style.height='auto';
+  streamReply({message:text,attachment});
+});
+sendBtn.addEventListener('click',(e)=>{if(isGenerating){e.preventDefault();if(currentAbortController)currentAbortController.abort()}});
+input.addEventListener('keydown',(e)=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});
+input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,140)+'px'});
 
-  let newsContext = null;
-  if (!regenerate && message && WEATHER_RE.test(message)) {
-    const w = await fetchWeatherContextForChat(message);
-    if (w) newsContext = w;
-  }
-  if (!regenerate && message && NEWS_RE.test(message)) {
-    try {
-      const nr = await fetch('/api/news', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: message.length < 80 ? message : null })
-      });
-      const nd = await nr.json();
-      if (nd.articles && nd.articles.length > 0) {
-        newsContext = "[Live data] Live news headlines:\n" + nd.articles.map((a, i) => `${i+1}. ${a.title} (${a.source})`).join('\n');
-      }
-    } catch {}
-  }
-  if (!regenerate && message && (SEARCH_RE.test(message) || GENERIC_FACT_RE.test(message) || (!newsContext && NEWS_RE.test(message)))) {
-    const searchQuery = message.replace(/^(search:|search for)\s*/i, '').trim();
-    try {
-      const sr = await fetch('/api/search', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: searchQuery })
-      });
-      const sd = await sr.json();
-      if (sd.results && sd.results.length > 0) {
-        const searchBlock = `[Live data] Web search results for "${searchQuery}":\n` +
-          sd.results.map((r, i) => `${i+1}. ${r.title}: ${r.snippet}`).join('\n');
-        newsContext = newsContext ? (newsContext + "\n\n" + searchBlock) : searchBlock;
-      }
-    } catch {}
-  }
+function isMobile(){return window.innerWidth<=768}
+function openSidebar(){sidebar.classList.remove('hidden');if(isMobile())sidebarOverlay.style.display='block'}
+function closeSidebar(){sidebar.classList.add('hidden');sidebarOverlay.style.display='none'}
+sidebarToggle.addEventListener('click',()=>sidebar.classList.contains('hidden')?openSidebar():closeSidebar());
+sidebarOverlay.addEventListener('click',closeSidebar);
 
-  let aiTextNode = null;
-  try {
-    const r = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: currentAbortController.signal,
-      body: JSON.stringify({
-        message: message || '',
-        conversation_id: activeConvId,
-        attachment,
-        user_name: getUserName(),
-        regenerate: !!regenerate,
-        news_context: newsContext,
-        model: selectedModel,
-      })
-    });
-    if (!r.ok || !r.body) {
-      hideTyping();
-      if (r.status === 403) {
-        const e = await r.json().catch(() => ({}));
-        if (e.error === 'vip_required') { showVipModal(); return; }
-      }
-      addMessage('error', 'Something went wrong. Try again.');
-      return;
-    }
-    hideTyping();
-    aiTextNode = addMessage('ai', '');
+const fullscreenIcon=fullscreenBtn.querySelector('span');
+function isFullscreen(){return !!(document.fullscreenElement||document.webkitFullscreenElement)}
+function updateFullscreenBtn(){if(isFullscreen()){fullscreenIcon.textContent='⤢';fullscreenBtn.title='Exit fullscreen';fullscreenBtn.classList.add('active')}else{fullscreenIcon.textContent='⛶';fullscreenBtn.title='Fullscreen';fullscreenBtn.classList.remove('active')}}
+async function toggleFullscreen(){const el=document.documentElement;try{if(!document.fullscreenElement&&!document.webkitFullscreenElement){if(el.requestFullscreen)await el.requestFullscreen();else if(el.webkitRequestFullscreen)el.webkitRequestFullscreen()}else{if(document.exitFullscreen)await document.exitFullscreen();else if(document.webkitExitFullscreen)document.webkitExitFullscreen()}}catch{}}
+fullscreenBtn.addEventListener('click',toggleFullscreen);
+document.addEventListener('fullscreenchange',updateFullscreenBtn);
+document.addEventListener('webkitfullscreenchange',updateFullscreenBtn);
 
-    const convId = r.headers.get('X-Conversation-Id');
-    if (convId) activeConvId = convId;
+function getUserName(){return localStorage.getItem('aarav_user_name')||''}
+function setUserName(name){if(name)localStorage.setItem('aarav_user_name',name);else localStorage.removeItem('aarav_user_name')}
+function openNameModal(){nameInput.value=getUserName();nameModalOverlay.classList.add('show');setTimeout(()=>nameInput.focus(),50)}
+function closeNameModal(){nameModalOverlay.classList.remove('show')}
+nameBtn.addEventListener('click',openNameModal);
+nameCancelBtn.addEventListener('click',closeNameModal);
+nameModalOverlay.addEventListener('click',(e)=>{if(e.target===nameModalOverlay)closeNameModal()});
+nameSaveBtn.addEventListener('click',()=>{setUserName(nameInput.value.trim());closeNameModal()});
+nameInput.addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();nameSaveBtn.click()}else if(e.key==='Escape')closeNameModal()});
+if(!localStorage.getItem('aarav_name_prompted')){localStorage.setItem('aarav_name_prompted','1');setTimeout(openNameModal,600)}
 
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let rawBuf = '';
-    let fullText = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      rawBuf += decoder.decode(value, { stream: true });
-      fullText = rawBuf;
-      aiTextNode.innerHTML = renderMarkdown(fullText);
-      scrollToBottom();
-    }
-    speak(fullText);
-    loadConversationList();
-  } catch (err) {
-    hideTyping();
-    if (err.name === 'AbortError') {
-      if (aiTextNode && !aiTextNode.textContent.trim()) aiTextNode.textContent = '[Stopped]';
-    } else {
-      addMessage('error', 'Network error: ' + err.message);
-    }
-  } finally {
-    setGenerating(false);
-    currentAbortController = null;
-  }
+if(isMobile())sidebar.classList.add('hidden');
+newChatBtn.addEventListener('click',startNewChat);
+clearBtn.addEventListener('click',async()=>{if(!activeConvId)return;await fetch('/api/conversations/'+activeConvId,{method:'DELETE'});startNewChat()});
+
+exportBtn.addEventListener('click',async()=>{if(!activeConvId){alert('Start or open a chat first.');return}try{const r=await fetch('/api/conversations/'+activeConvId);if(!r.ok)return;const d=await r.json();const lines=[`# ${d.title||'Mythic AI chat'}`,''];(d.messages||[]).forEach(m=>{lines.push(m.role==='user'?'You:':'Mythic AI:');lines.push(m.text||(m.attachment?`[attachment: ${m.attachment.name}]`:''));lines.push('')});const blob=new Blob([lines.join('\n')],{type:'text/plain;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=(d.title||'chat').replace(/[^a-z0-9_ -]/gi,'').trim().slice(0,60)+'.txt';document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url)}catch(err){alert('Export failed: '+err.message)}});
+
+const imgModalOverlay=document.getElementById('img-modal-overlay');
+const imgPrompt=document.getElementById('img-prompt');
+const imgResult=document.getElementById('img-result');
+const imgOutput=document.getElementById('img-output');
+const imgLoading=document.getElementById('img-loading');
+const imgError=document.getElementById('img-error');
+const imgGenerateBtn=document.getElementById('img-generate-btn');
+const imgCloseBtn=document.getElementById('img-close-btn');
+const imgGenBtn=document.getElementById('img-gen-btn');
+const imgStyle=document.getElementById('img-style');
+
+imgGenBtn.addEventListener('click',()=>{imgModalOverlay.style.display='flex';imgPrompt.focus();imgResult.style.display='none';imgError.style.display='none';imgLoading.style.display='none'});
+imgCloseBtn.addEventListener('click',()=>{imgModalOverlay.style.display='none'});
+imgModalOverlay.addEventListener('click',e=>{if(e.target===imgModalOverlay)imgModalOverlay.style.display='none'});
+imgGenerateBtn.addEventListener('click',async()=>{
+  const prompt=imgPrompt.value.trim();const style=imgStyle?imgStyle.value:'';
+  if(!prompt)return;imgResult.style.display='none';imgError.style.display='none';imgLoading.style.display='block';imgGenerateBtn.disabled=true;
+  try{
+    const r=await fetch('/api/generate-image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,style})});
+    const d=await r.json();imgLoading.style.display='none';
+    if(d.image){imgOutput.src='data:image/png;base64,'+d.image;imgResult.style.display='block';clearEmptyState();const div=document.createElement('div');div.className='msg-row ai';const bubble=document.createElement('div');bubble.className='msg ai';const caption=document.createElement('div');caption.textContent='🎨 '+prompt;caption.style.cssText='font-size:12px;opacity:.7;margin-bottom:8px;';const img=document.createElement('img');img.src='data:image/png;base64,'+d.image;img.style.cssText='max-width:100%;border-radius:10px;display:block;';bubble.appendChild(caption);bubble.appendChild(img);div.appendChild(bubble);messagesEl.appendChild(div);scrollToBottom()}
+    else{imgError.textContent=d.error||'Generation failed.';imgError.style.display='block'}
+  }catch(e){imgLoading.style.display='none';imgError.textContent='Network error: '+e.message;imgError.style.display='block'}
+  finally{imgGenerateBtn.disabled=false}
+});
+imgPrompt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();imgGenerateBtn.click()}});
+
+const weatherOverlay=document.getElementById('weather-modal-overlay');
+const weatherCity=document.getElementById('weather-city');
+const weatherResult=document.getElementById('weather-result');
+const weatherContent=document.getElementById('weather-content');
+const weatherLoading=document.getElementById('weather-loading');
+const weatherError=document.getElementById('weather-error');
+const weatherSearchBtn=document.getElementById('weather-search-btn');
+const weatherCloseBtn=document.getElementById('weather-close-btn');
+const weatherLocationBtn=document.getElementById('weather-location-btn');
+const weatherBtn=document.getElementById('weather-btn');
+
+weatherBtn.addEventListener('click',()=>{weatherOverlay.style.display='flex';weatherCity.focus();weatherResult.style.display='none';weatherError.style.display='none'});
+weatherCloseBtn.addEventListener('click',()=>{weatherOverlay.style.display='none'});
+weatherOverlay.addEventListener('click',e=>{if(e.target===weatherOverlay)weatherOverlay.style.display='none'});
+
+function renderWeather(w){
+  weatherContent.innerHTML=`<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;"><div style="font-size:48px;line-height:1;">${w.icon}</div><div><div style="font-size:18px;font-weight:700;">${w.location}</div><div style="font-size:13px;color:var(--muted);">${w.condition}</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;"><div style="background:var(--bg);border-radius:8px;padding:10px;"><div style="font-size:11px;color:var(--muted);">TEMPERATURE</div><div style="font-size:22px;font-weight:700;">${w.temp}°C</div><div style="font-size:11px;color:var(--muted);">Feels like ${w.feels_like}°C</div></div><div style="background:var(--bg);border-radius:8px;padding:10px;"><div style="font-size:11px;color:var(--muted);">HUMIDITY</div><div style="font-size:22px;font-weight:700;">${w.humidity}%</div><div style="font-size:11px;color:var(--muted);">Wind ${w.wind_speed} km/h</div></div></div>`;
+  weatherResult.style.display='block';
+  input.value=`${w.icon} Weather in ${w.location}: ${w.temp}°C, ${w.condition}. Humidity: ${w.humidity}%, Wind: ${w.wind_speed} km/h, Feels like: ${w.feels_like}°C.`;autoResize();
 }
-
-function regenerateLast(row) {
-  if (isGenerating) return;
-  row.remove();
-  streamReply({ regenerate: true });
+async function fetchWeather(location){
+  weatherResult.style.display='none';weatherError.style.display='none';weatherLoading.style.display='block';weatherSearchBtn.disabled=true;
+  try{const r=await fetch('/api/weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location})});const d=await r.json();weatherLoading.style.display='none';if(d.weather)renderWeather(d.weather);else{weatherError.textContent=d.error||'Could not fetch weather.';weatherError.style.display='block'}}catch(e){weatherLoading.style.display='none';weatherError.textContent='Error: '+e.message;weatherError.style.display='block'}finally{weatherSearchBtn.disabled=false}
 }
+weatherSearchBtn.addEventListener('click',()=>{const loc=weatherCity.value.trim();if(loc)fetchWeather(loc)});
+weatherCity.addEventListener('keydown',e=>{if(e.key==='Enter')weatherSearchBtn.click()});
+weatherLocationBtn.addEventListener('click',()=>{if(!navigator.geolocation){alert('Geolocation not supported');return}weatherLoading.style.display='block';weatherLocationBtn.disabled=true;navigator.geolocation.getCurrentPosition(async pos=>{const{latitude:lat,longitude:lon}=pos.coords;weatherLocationBtn.disabled=false;weatherResult.style.display='none';weatherError.style.display='none';weatherLoading.style.display='block';weatherSearchBtn.disabled=true;try{const r=await fetch('/api/weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon})});const d=await r.json();weatherLoading.style.display='none';if(d.weather)renderWeather(d.weather);else{weatherError.textContent=d.error||'Could not fetch weather.';weatherError.style.display='block'}}catch(e){weatherLoading.style.display='none';weatherError.textContent='Error: '+e.message;weatherError.style.display='block'}finally{weatherSearchBtn.disabled=false}},err=>{weatherLocationBtn.disabled=false;weatherLoading.style.display='none';alert('Could not get your location: '+err.message)})});
 
-form.addEventListener('submit', (e) => {
-  e.preventDefault();
-  if (isGenerating) return;
-  const text = input.value.trim();
-  if (!text && !pendingFile) return;
-  const attachment = pendingFile;
-  pendingFile = null; fileInput.value = ''; cameraInput.value = '';
-  pendingAttach.classList.remove('show');
-  addMessage('user', text, attachment);
-  input.value = ''; input.style.height = 'auto';
-  streamReply({ message: text, attachment });
-});
+const homeworkBtn=document.getElementById('homework-btn');
+homeworkBtn.addEventListener('click',()=>{input.value='Help me with my homework: ';input.focus();autoResize();input.setSelectionRange(input.value.length,input.value.length)});
+const searchBtn=document.getElementById('search-btn');
+searchBtn.addEventListener('click',()=>{const q=prompt('What do you want to search for?');if(!q||!q.trim())return;input.value='Search: '+q.trim();input.focus();autoResize();form.requestSubmit()});
 
-sendBtn.addEventListener('click', (e) => {
-  if (isGenerating) {
-    e.preventDefault();
-    if (currentAbortController) currentAbortController.abort();
-  }
-});
-
-input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
-});
-input.addEventListener('input', () => {
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 140) + 'px';
-});
-
-/* ============================================================
-   Sidebar + fullscreen
-   ============================================================ */
-function isMobile() { return window.innerWidth <= 768; }
-function openSidebar() {
-  sidebar.classList.remove('hidden');
-  if (isMobile()) sidebarOverlay.style.display = 'block';
-}
-function closeSidebar() {
-  sidebar.classList.add('hidden');
-  sidebarOverlay.style.display = 'none';
-}
-sidebarToggle.addEventListener('click', () => {
-  sidebar.classList.contains('hidden') ? openSidebar() : closeSidebar();
-});
-sidebarOverlay.addEventListener('click', closeSidebar);
-
-const fullscreenIconEl = fullscreenBtn.querySelector('span');
-const fsSupported = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
-function isFullscreen() {
-  return !!(document.fullscreenElement || document.webkitFullscreenElement) ||
-    document.body.classList.contains('pseudo-fullscreen');
-}
-function updateFullscreenBtn() {
-  if (isFullscreen()) {
-    fullscreenIconEl.textContent = '⤢';
-    fullscreenBtn.title = 'Exit fullscreen';
-    fullscreenBtn.classList.add('active');
-  } else {
-    fullscreenIconEl.textContent = '⛶';
-    fullscreenBtn.title = 'Fullscreen';
-    fullscreenBtn.classList.remove('active');
-  }
-}
-async function toggleFullscreen() {
-  const el = document.documentElement;
-  try {
-    if (fsSupported) {
-      if (!document.fullscreenElement && !document.webkitFullscreenElement) {
-        if (el.requestFullscreen) await el.requestFullscreen();
-        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-      } else {
-        if (document.exitFullscreen) await document.exitFullscreen();
-        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-      }
-    } else {
-      document.body.classList.toggle('pseudo-fullscreen');
-      updateFullscreenBtn();
-    }
-  } catch (err) {
-    console.warn('Fullscreen request failed:', err);
-    document.body.classList.toggle('pseudo-fullscreen');
-    updateFullscreenBtn();
-  }
-}
-fullscreenBtn.addEventListener('click', toggleFullscreen);
-document.addEventListener('fullscreenchange', updateFullscreenBtn);
-document.addEventListener('webkitfullscreenchange', updateFullscreenBtn);
-
-/* ============================================================
-   Name modal
-   ============================================================ */
-function getUserName() { return localStorage.getItem('aarav_user_name') || ''; }
-function setUserName(name) {
-  if (name) localStorage.setItem('aarav_user_name', name);
-  else localStorage.removeItem('aarav_user_name');
-}
-function openNameModal() {
-  nameInput.value = getUserName();
-  nameModalOverlay.classList.add('show');
-  setTimeout(() => nameInput.focus(), 50);
-}
-function closeNameModal() { nameModalOverlay.classList.remove('show'); }
-nameBtn.addEventListener('click', openNameModal);
-nameCancelBtn.addEventListener('click', closeNameModal);
-nameModalOverlay.addEventListener('click', (e) => { if (e.target === nameModalOverlay) closeNameModal(); });
-nameSaveBtn.addEventListener('click', () => { setUserName(nameInput.value.trim()); closeNameModal(); });
-nameInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); nameSaveBtn.click(); }
-  else if (e.key === 'Escape') closeNameModal();
-});
-if (!localStorage.getItem('aarav_name_prompted')) {
-  localStorage.setItem('aarav_name_prompted', '1');
-  setTimeout(openNameModal, 600);
-}
-
-/* ============================================================
-   Clear + export
-   ============================================================ */
-if (isMobile()) sidebar.classList.add('hidden');
-newChatBtn.addEventListener('click', startNewChat);
-clearBtn.addEventListener('click', async () => {
-  if (!activeConvId) return;
-  await fetch('/api/conversations/' + activeConvId, { method: 'DELETE' });
-  startNewChat();
-});
-
-exportBtn.addEventListener('click', async () => {
-  if (!activeConvId) { alert('Start or open a chat first.'); return; }
-  try {
-    const r = await fetch('/api/conversations/' + activeConvId);
-    if (!r.ok) return;
-    const d = await r.json();
-    const lines = [`# ${d.title || 'Mythic AI chat'}`, ''];
-    (d.messages || []).forEach(m => {
-      lines.push(m.role === 'user' ? 'You:' : 'Mythic AI:');
-      lines.push(m.text || (m.attachment ? `[attachment: ${m.attachment.name}]` : ''));
-      lines.push('');
-    });
-    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = (d.title || 'chat').replace(/[^a-z0-9_ -]/gi, '').trim().slice(0, 60) + '.txt';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  } catch (err) { alert('Export failed: ' + err.message); }
-});
-
-/* ============================================================
-   Image-gen modal
-   ============================================================ */
-const imgModalOverlay = document.getElementById('img-modal-overlay');
-const imgPrompt       = document.getElementById('img-prompt');
-const imgResult       = document.getElementById('img-result');
-const imgOutput       = document.getElementById('img-output');
-const imgLoading      = document.getElementById('img-loading');
-const imgError        = document.getElementById('img-error');
-const imgGenerateBtn  = document.getElementById('img-generate-btn');
-const imgCloseBtn     = document.getElementById('img-close-btn');
-const imgGenBtn       = document.getElementById('img-gen-btn');
-const imgStyle        = document.getElementById('img-style');
-
-imgGenBtn.addEventListener('click', () => {
-  imgModalOverlay.style.display = 'flex';
-  imgPrompt.focus();
-  imgResult.style.display = 'none';
-  imgError.style.display = 'none';
-  imgLoading.style.display = 'none';
-});
-imgCloseBtn.addEventListener('click', () => { imgModalOverlay.style.display = 'none'; });
-imgModalOverlay.addEventListener('click', e => { if (e.target === imgModalOverlay) imgModalOverlay.style.display = 'none'; });
-
-imgGenerateBtn.addEventListener('click', async () => {
-  const prompt = imgPrompt.value.trim();
-  const style = imgStyle ? imgStyle.value : '';
-  if (!prompt) return;
-  imgResult.style.display = 'none';
-  imgError.style.display = 'none';
-  imgLoading.style.display = 'block';
-  imgGenerateBtn.disabled = true;
-  try {
-    const r = await fetch('/api/generate-image', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, style })
-    });
-    const d = await r.json();
-    imgLoading.style.display = 'none';
-    if (d.image) {
-      imgOutput.src = 'data:image/png;base64,' + d.image;
-      imgResult.style.display = 'block';
-      clearEmptyState();
-      const div = document.createElement('div');
-      div.className = 'msg-row ai';
-      const bubble = document.createElement('div');
-      bubble.className = 'msg ai';
-      const caption = document.createElement('div');
-      caption.textContent = '🎨 ' + prompt;
-      caption.style.cssText = 'font-size:12px;opacity:.7;margin-bottom:8px;';
-      const img = document.createElement('img');
-      img.src = 'data:image/png;base64,' + d.image;
-      img.style.cssText = 'max-width:100%;border-radius:10px;display:block;';
-      bubble.appendChild(caption);
-      bubble.appendChild(img);
-      div.appendChild(bubble);
-      messagesEl.appendChild(div);
-      scrollToBottom();
-    } else {
-      imgError.textContent = d.error || 'Generation failed. Try a different prompt.';
-      imgError.style.display = 'block';
-    }
-  } catch (e) {
-    imgLoading.style.display = 'none';
-    imgError.textContent = 'Network error: ' + e.message;
-    imgError.style.display = 'block';
-  } finally { imgGenerateBtn.disabled = false; }
-});
-imgPrompt.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); imgGenerateBtn.click(); }
-});
-
-/* ============================================================
-   Weather modal
-   ============================================================ */
-const weatherOverlay     = document.getElementById('weather-modal-overlay');
-const weatherCity        = document.getElementById('weather-city');
-const weatherResult      = document.getElementById('weather-result');
-const weatherContent     = document.getElementById('weather-content');
-const weatherLoading     = document.getElementById('weather-loading');
-const weatherError       = document.getElementById('weather-error');
-const weatherSearchBtn   = document.getElementById('weather-search-btn');
-const weatherCloseBtn    = document.getElementById('weather-close-btn');
-const weatherLocationBtn = document.getElementById('weather-location-btn');
-const weatherBtn         = document.getElementById('weather-btn');
-
-weatherBtn.addEventListener('click', () => {
-  weatherOverlay.style.display = 'flex';
-  weatherCity.focus();
-  weatherResult.style.display = 'none';
-  weatherError.style.display = 'none';
-});
-weatherCloseBtn.addEventListener('click', () => { weatherOverlay.style.display = 'none'; });
-weatherOverlay.addEventListener('click', e => { if (e.target === weatherOverlay) weatherOverlay.style.display = 'none'; });
-
-function renderWeather(w) {
-  weatherContent.innerHTML = `
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
-      <div style="font-size:48px;line-height:1;">${w.icon}</div>
-      <div>
-        <div style="font-size:18px;font-weight:700;">${w.location}</div>
-        <div style="font-size:13px;color:var(--muted);">${w.condition}</div>
-      </div>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-      <div style="background:var(--bg);border-radius:8px;padding:10px;">
-        <div style="font-size:11px;color:var(--muted);">TEMPERATURE</div>
-        <div style="font-size:22px;font-weight:700;">${w.temp}°C</div>
-        <div style="font-size:11px;color:var(--muted);">Feels like ${w.feels_like}°C</div>
-      </div>
-      <div style="background:var(--bg);border-radius:8px;padding:10px;">
-        <div style="font-size:11px;color:var(--muted);">HUMIDITY</div>
-        <div style="font-size:22px;font-weight:700;">${w.humidity}%</div>
-        <div style="font-size:11px;color:var(--muted);">Wind ${w.wind_speed} km/h</div>
-      </div>
-    </div>`;
-  weatherResult.style.display = 'block';
-  const summary = `${w.icon} Weather in ${w.location}: ${w.temp}°C, ${w.condition}. Humidity: ${w.humidity}%, Wind: ${w.wind_speed} km/h, Feels like: ${w.feels_like}°C.`;
-  input.value = summary;
-  autoResize();
-}
-
-async function fetchWeather(location) {
-  weatherResult.style.display = 'none';
-  weatherError.style.display = 'none';
-  weatherLoading.style.display = 'block';
-  weatherSearchBtn.disabled = true;
-  try {
-    const r = await fetch('/api/weather', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ location })
-    });
-    const d = await r.json();
-    weatherLoading.style.display = 'none';
-    if (d.weather) { renderWeather(d.weather); }
-    else { weatherError.textContent = d.error || 'Could not fetch weather.'; weatherError.style.display = 'block'; }
-  } catch(e) {
-    weatherLoading.style.display = 'none';
-    weatherError.textContent = 'Error: ' + e.message; weatherError.style.display = 'block';
-  } finally { weatherSearchBtn.disabled = false; }
-}
-
-weatherSearchBtn.addEventListener('click', () => {
-  const loc = weatherCity.value.trim();
-  if (loc) fetchWeather(loc);
-});
-weatherCity.addEventListener('keydown', e => { if (e.key === 'Enter') weatherSearchBtn.click(); });
-weatherLocationBtn.addEventListener('click', () => {
-  if (!navigator.geolocation) { alert('Geolocation not supported'); return; }
-  weatherLoading.style.display = 'block';
-  weatherLocationBtn.disabled = true;
-  navigator.geolocation.getCurrentPosition(
-    async pos => {
-      const { latitude: lat, longitude: lon } = pos.coords;
-      weatherLocationBtn.disabled = false;
-      weatherResult.style.display = 'none';
-      weatherError.style.display = 'none';
-      weatherLoading.style.display = 'block';
-      weatherSearchBtn.disabled = true;
-      try {
-        const r = await fetch('/api/weather', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ lat, lon })
-        });
-        const d = await r.json();
-        weatherLoading.style.display = 'none';
-        if (d.weather) { renderWeather(d.weather); }
-        else { weatherError.textContent = d.error || 'Could not fetch weather.'; weatherError.style.display = 'block'; }
-      } catch(e) {
-        weatherLoading.style.display = 'none';
-        weatherError.textContent = 'Error: ' + e.message; weatherError.style.display = 'block';
-      } finally { weatherSearchBtn.disabled = false; }
-    },
-    err => {
-      weatherLocationBtn.disabled = false;
-      weatherLoading.style.display = 'none';
-      alert('Could not get your location: ' + err.message);
-    }
-  );
-});
-
-/* ============================================================
-   Quick action buttons
-   ============================================================ */
-const homeworkBtn = document.getElementById('homework-btn');
-homeworkBtn.addEventListener('click', () => {
-  input.value = 'Help me with my homework: ';
-  input.focus();
-  autoResize();
-  input.setSelectionRange(input.value.length, input.value.length);
-});
-
-const searchBtn = document.getElementById('search-btn');
-searchBtn.addEventListener('click', () => {
-  const q = prompt('What do you want to search for?');
-  if (!q || !q.trim()) return;
-  input.value = 'Search: ' + q.trim();
-  input.focus();
-  autoResize();
-  form.requestSubmit();
-});
-
-/* ============================================================
-   Boot
-   ============================================================ */
-(async () => {
-  const convs = await loadConversationList();
-  if (convs.length > 0) openConversation(convs[0].id);
-  else showEmptyState();
-})();
+(async()=>{const convs=await loadConversationList();if(convs.length>0)openConversation(convs[0].id);else showEmptyState()})();
 </script>
 </body>
-</html>
-"""
+</html>"""
 
-# ============================================================
-# Entrypoint
 # ============================================================
 if __name__ == "__main__":
     active = []
-    if PROVIDER in ("auto", "gemini") and GEMINI_API_KEY:   active.append(f"Gemini({GEMINI_MODEL})")
-    if PROVIDER in ("auto", "groq") and GROQ_API_KEY:       active.append(f"Groq({GROQ_MODEL})")
+    if PROVIDER in ("auto", "groq") and GROQ_API_KEY:     active.append(f"Groq({GROQ_MODEL})")
     if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY: active.append(f"Cerebras({CEREBRAS_MODEL})")
-    if PROVIDER in ("auto", "openrouter") and OPENROUTER_API_KEY: active.append(f"OpenRouter({OPENROUTER_MODEL})")
-    if PROVIDER in ("auto", "huggingface") and HF_API_KEY:  active.append(f"HuggingFace({HF_MODEL})")
-    if PROVIDER == "ollama":                                 active.append(f"Ollama({OLLAMA_MODEL}@{OLLAMA_URL})")
     if not LIMITER_ENABLED:
         print("⚠️  flask-limiter not installed — chat is unrate-limited. Run: pip install flask-limiter")
     print(f"Mythic AI → http://localhost:5000")
-    print(f"Providers (fallback order): {' → '.join(active) if active else 'NONE CONFIGURED — add keys to .env'}")
+    print(f"Providers (fallback order): {' → '.join(active) if active else 'NONE — add GROQ_API_KEY / CEREBRAS_API_KEY to .env'}")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)
