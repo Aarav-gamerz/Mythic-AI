@@ -934,19 +934,27 @@ PAGE = r"""<!DOCTYPE html>
     <div style="margin-bottom:14px;">
       <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Style (optional):</label>
       <select id="img-style" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;outline:none;font-family:inherit;">
-        <option value="">Default</option>
-        <option value="photorealistic, highly detailed, 8k">Photorealistic</option>
-        <option value="anime style, vibrant colors">Anime</option>
-        <option value="digital painting, fantasy art">Fantasy Art</option>
-        <option value="watercolor painting, soft pastel colors">Watercolor</option>
-        <option value="3d render, octane render, cinematic lighting">3D Render</option>
-        <option value="minimalist flat vector illustration">Minimalist</option>
+        <option value="">✨ Auto (recommended)</option>
+        <option value="photorealistic, hyperrealistic DSLR photography, 8K resolution, cinematic">📸 Photorealistic</option>
+        <option value="professional book cover design, award-winning layout, elegant typography">📚 Book Cover</option>
+        <option value="Studio Ghibli anime style, soft watercolor, vibrant colors, beautiful">🌿 Anime / Ghibli</option>
+        <option value="digital painting, fantasy concept art, epic lighting, deviantart">🎭 Fantasy Art</option>
+        <option value="watercolor painting, soft pastel, dreamy, artistic brushstrokes">🖌 Watercolor</option>
+        <option value="3D render, Octane render, ultra realistic, physically based rendering">🧊 3D Render</option>
+        <option value="flat vector illustration, minimalist, clean lines, modern design">📐 Minimalist / Vector</option>
+        <option value="oil painting, impressionist, rich textures, museum quality">🖼 Oil Painting</option>
+        <option value="cinematic film still, dramatic lighting, movie poster quality, 35mm">🎬 Cinematic</option>
+        <option value="pixel art, retro 8-bit style, vibrant palette, game art">🕹 Pixel Art</option>
+        <option value="pencil sketch, detailed graphite drawing, fine art, black and white">✏️ Pencil Sketch</option>
+        <option value="logo design, professional brand identity, clean, scalable vector">🏷 Logo / Brand</option>
       </select>
     </div>
 
     <div id="img-loading" style="display:none;text-align:center;padding:20px;">
       <div style="font-size:32px;margin-bottom:8px;">🎨</div>
-      <div style="color:var(--muted);font-size:13px;">Generating your image...<br><span style="font-size:11px;">This can take a moment</span></div>
+      <div style="color:var(--muted);font-size:13px;">Generating your image...<br>
+        <span style="font-size:11px;opacity:.7;">Auto-enhancing your prompt for best quality</span>
+      </div>
     </div>
     <div id="img-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px;background:#fef2f2;border-radius:6px;"></div>
 
@@ -2834,6 +2842,62 @@ def generate_image():
 
     full_prompt = f"{prompt}, {style}" if style else prompt
 
+    # ── Auto-enhance prompt for better output quality ────────────────────────
+    # Detect context and append quality boosters the user doesn't need to type.
+    # Book covers get portrait orientation; people get photorealism helpers; etc.
+    prompt_lower = full_prompt.lower()
+    is_book     = any(w in prompt_lower for w in ["book cover", "book", "novel cover", "textbook"])
+    is_portrait = any(w in prompt_lower for w in ["portrait", "person", "face", "selfie", "photo of"])
+    is_logo     = any(w in prompt_lower for w in ["logo", "icon", "emblem", "badge"])
+    is_anime    = any(w in prompt_lower for w in ["anime", "ghibli", "manga", "cartoon", "illustration"])
+    is_landscape= any(w in prompt_lower for w in ["landscape", "scenery", "nature", "city", "skyline", "aerial"])
+
+    # Quality tail appended to every prompt
+    quality_tail = ", masterpiece, best quality, highly detailed, sharp focus, professional"
+
+    if is_book:
+        enhanced = (
+            f"{full_prompt}, professional book cover design, elegant typography layout, "
+            f"dramatic lighting, rich colors, visually striking, award-winning cover art, "
+            f"publishing industry standard{quality_tail}"
+        )
+        width, height = 512, 768   # portrait — standard book ratio
+    elif is_portrait:
+        enhanced = (
+            f"{full_prompt}, cinematic portrait photography, soft studio lighting, "
+            f"8K ultra-detailed, DSLR quality, photorealistic{quality_tail}"
+        )
+        width, height = 512, 768
+    elif is_logo:
+        enhanced = (
+            f"{full_prompt}, clean vector style, minimalist, professional brand design, "
+            f"flat design, scalable, high contrast{quality_tail}"
+        )
+        width, height = 768, 768
+    elif is_anime:
+        enhanced = (
+            f"{full_prompt}, vibrant anime art, clean linework, beautiful coloring, "
+            f"Studio Ghibli quality, cel shading{quality_tail}"
+        )
+        width, height = 768, 768
+    elif is_landscape:
+        enhanced = (
+            f"{full_prompt}, epic wide shot, golden hour lighting, ultra-wide, "
+            f"breathtaking scenery, National Geographic quality{quality_tail}"
+        )
+        width, height = 896, 512   # landscape ratio
+    else:
+        enhanced = f"{full_prompt}{quality_tail}"
+        width, height = 768, 768
+
+    # Negative prompt — things we never want in any image
+    negative = (
+        "blurry, low quality, pixelated, distorted, deformed, ugly, bad anatomy, "
+        "watermark, signature, text errors, garbled text, poorly drawn, disfigured, "
+        "oversaturated, washed out, extra limbs, duplicate, clone, artifact, noise"
+    )
+
+
     # ── 1. NanoBanana (best: real image-to-image for Ghibli Me) ─────────────
     if NANO_BANANA_API_KEY:
         image_urls = None
@@ -2845,9 +2909,10 @@ def generate_image():
             if len(raw) > MAX_UPLOAD_BYTES:
                 return jsonify({"error": "image too large (max 8MB)"}), 400
             img_id = _store_temp_image(raw, mime_type)
-            image_urls = [f"{request.host_url.rstrip('/')}/api/temp-image/{img_id}"]
+            base_url = request.host_url.rstrip('/')
+            image_urls = [f"{base_url}/api/temp-image/{img_id}"]
 
-        task_id, err = nano_banana_submit(full_prompt, image_urls=image_urls)
+        task_id, err = nano_banana_submit(enhanced, image_urls=image_urls)
         if not err:
             result_url, err = nano_banana_poll(task_id)
             if not err:
@@ -2864,7 +2929,7 @@ def generate_image():
             resp = requests.post(
                 "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
                 headers={"Authorization": f"Bearer {HF_API_KEY}"},
-                json={"inputs": full_prompt},
+                json={"inputs": enhanced},
                 timeout=90,
             )
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
@@ -2873,16 +2938,20 @@ def generate_image():
             pass  # fall through
 
     # ── 3. Pollinations.AI — FREE, no API key, works on any server ──────────
-    # Encodes the prompt into a URL and fetches a PNG back directly.
-    # This is the guaranteed fallback so image generation always works even
-    # when no API keys are configured at all.
+    # Uses the enhanced prompt, smart dimensions, negative prompt, and the
+    # flux model with enhancement enabled for much better output quality.
     try:
         import urllib.parse
-        encoded = urllib.parse.quote(full_prompt)
-        # Add a random seed so repeated identical prompts get fresh results
-        seed = int(time.time()) % 10000
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&seed={seed}&nologo=true&model=flux"
-        img_resp = requests.get(url, timeout=90)
+        seed = int(time.time()) % 99999
+        encoded_prompt   = urllib.parse.quote(enhanced)
+        encoded_negative = urllib.parse.quote(negative)
+        url = (
+            f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+            f"?width={width}&height={height}&seed={seed}"
+            f"&negative={encoded_negative}"
+            f"&model=flux&enhance=true&nologo=true"
+        )
+        img_resp = requests.get(url, timeout=120)
         if img_resp.status_code == 200 and img_resp.headers.get("content-type", "").startswith("image/"):
             return jsonify({"image": base64.b64encode(img_resp.content).decode("utf-8")})
         return jsonify({"error": f"Image generation failed ({img_resp.status_code}). Try a different prompt."}), 502
