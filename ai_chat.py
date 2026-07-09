@@ -182,9 +182,10 @@ def delete_conversation(username, conv_id):
         pass
 
 
+import tempfile
 import os as _os
-_BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
-_DATA_DIR = _os.path.join(_BASE_DIR, "chat_data")
+
+_DATA_DIR = _os.path.join(tempfile.gettempdir(), "chat_data")
 _os.makedirs(_DATA_DIR, exist_ok=True)
 
 def _user_conv_dir(username):
