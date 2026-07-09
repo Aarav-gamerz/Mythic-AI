@@ -1,5 +1,43 @@
 """
-Mythic AI — single file, powered by Google's Gemini API or a local Ollama model.
+Ꮇʏᴛʜɪᴄ ᴀɪ — single file, powered by Google's Gemini API or a local Ollama model.
+
+Usage (Gemini — default, needs a free API key):
+    1. pip install flask requests
+    2. Set your API key:
+         Mac/Linux:   export GEMINI_API_KEY="your-key-here"
+         Windows:     set GEMINI_API_KEY=your-key-here
+    3. python ai_chat.py
+    4. Open http://localhost:5000 in your browser
+
+Get a FREE API key (no credit card needed) at https://aistudio.google.com/apikey
+
+Usage (Ollama — fully local, no API key or internet needed):
+    1. Install Ollama from https://ollama.com and make sure it's running
+       (`ollama serve`, or it may already be running as a background service)
+    2. Pull a model, e.g.:  ollama pull llama3.1
+    3. Set the provider:
+         Mac/Linux:   export AI_PROVIDER=ollama
+         Windows:     set AI_PROVIDER=ollama
+       Optional overrides:
+         OLLAMA_URL   (default: http://localhost:11434)
+         OLLAMA_MODEL (default: llama3.1)
+    4. python ai_chat.py
+    5. Open http://localhost:5000 in your browser
+
+Supabase (optional — for accounts/conversation storage across restarts & devices):
+    Set these as environment variables (never hardcode secrets in this file):
+         SUPABASE_URL   e.g. https://xxxxx.supabase.co
+         SUPABASE_KEY   your Supabase *secret* key (server-side only, keeps full DB access)
+    If unset, the app falls back to storing conversations as local JSON files in chat_data/.
+
+Features:
+- Login/register (real accounts, hashed passwords, stored in chat_data/users.json)
+- Multi-conversation chat with sidebar, saved per-account, survives restarts
+- File/image upload (attach an image or text file to a message)
+- Web search grounding (Gemini can search Google for current info — Gemini only)
+- Streaming responses (text appears word-by-word)
+- Switchable AI backend: Google Gemini (cloud) or Ollama (local, private, free)
+- No rate limiting — unlimited messages
 """
 
 import os
@@ -14,16 +52,29 @@ from flask import (
 )
 
 PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
+# "auto"        = round-robin: Groq → OpenRouter → HuggingFace (all work on servers)
+# "gemini"      = Google Gemini only (free tier only works locally, not on Render)
+# "groq"        = Groq only
+# "openrouter"  = OpenRouter only
+# "huggingface" = Hugging Face only
+# "ollama"      = local Ollama only
 
+# --- API Keys (hardcoded fallbacks — override via environment variables) ------
+# WARNING: don't commit a file with real keys to a public GitHub repo.
+# Set these as environment variables on Render instead.
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY",    "")
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "")
 CEREBRAS_API_KEY  = os.environ.get("CEREBRAS_API_KEY",  "")
 OPENROUTER_API_KEY= os.environ.get("OPENROUTER_API_KEY","")
 HF_API_KEY        = os.environ.get("HF_API_KEY",        "")
-# Nano Banana (Gemini image generation model) API key — set this in Render's
-# Environment tab. No default is hardcoded here for security.
+# NanoBanana API (nanobananaapi.ai) — powers "Ghibli Me" image editing so it can
+# actually transform the user's uploaded photo (image-to-image), not just
+# generate a generic image from text. Get a key at https://nanobananaapi.ai/api-key
+# and set it as an environment variable — never hardcode it here.
 NANO_BANANA_API_KEY = os.environ.get("NANO_BANANA_API_KEY", "")
+NANO_BANANA_BASE     = "https://api.nanobananaapi.ai/api/v1/nanobanana"
 
+# --- Model names -------------------------------------------------------------
 GEMINI_MODEL      = "gemini-2.5-flash"
 GROQ_MODEL        = os.environ.get("GROQ_MODEL",        "llama-3.1-8b-instant")
 OPENROUTER_MODEL  = os.environ.get("OPENROUTER_MODEL",  "google/gemma-3-4b-it:free")
@@ -31,21 +82,17 @@ HF_MODEL          = os.environ.get("HF_MODEL",          "mistralai/Mistral-7B-In
 CEREBRAS_MODEL    = os.environ.get("CEREBRAS_MODEL",    "gpt-oss-120b")
 OLLAMA_MODEL      = os.environ.get("OLLAMA_MODEL",       "llama3.1")
 OLLAMA_URL        = os.environ.get("OLLAMA_URL",         "http://localhost:11434").rstrip("/")
-# Nano Banana model id (Gemini's image-generation model, nicknamed "nano banana")
-NANO_BANANA_MODEL = os.environ.get("NANO_BANANA_MODEL", "gemini-2.5-flash-image")
 
 GEMINI_STREAM_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:streamGenerateContent"
 )
-NANO_BANANA_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{NANO_BANANA_MODEL}:generateContent"
-)
 
+# keep old name for compatibility with existing references below
 API_KEY = GEMINI_API_KEY
 MODEL   = GEMINI_MODEL
 SYSTEM_PROMPT = (
-    "You are Mythic AI, a smart and friendly AI assistant made by Aarav Singh. "
-    "If asked who made you, say you are Mythic AI made by Aarav Singh — say it once naturally, never repeat it unprompted. "
+    "You are Ꮇʏᴛʜɪᴄ ᴀɪ, a smart and friendly AI assistant made by Aarav Singh. "
+    "If asked who made you, say you are Ꮇʏᴛʜɪᴄ ᴀɪ made by Aarav Singh — say it once naturally, never repeat it unprompted. "
     "Never mention Google, Groq, OpenRouter, HuggingFace, Meta, Mistral, Anthropic, or any AI company as your creator or backend. "
     "You can help with anything: questions, writing, coding, math, ideas, or just chatting. "
     "When writing code, always wrap it in markdown code blocks with the language name. "
@@ -67,6 +114,10 @@ SYSTEM_PROMPT = (
     "5. Keep answers concise unless the user asks for detail."
 )
 
+# Extra instruction appended ONLY for Gemini, which actually has a real google_search tool wired up.
+# Other providers (Groq/Cerebras/OpenRouter/HF/Ollama) have no real search access, so telling them
+# "you have search" makes them hallucinate fake tool-call JSON into the visible reply — hence this
+# is kept separate from the base SYSTEM_PROMPT above.
 GEMINI_SEARCH_ADDENDUM = (
     " WEB SEARCH: You have access to Google Search. When the user asks about current events, "
     "live prices, news, sports scores, weather, or anything that needs up-to-date information, "
@@ -75,10 +126,125 @@ GEMINI_SEARCH_ADDENDUM = (
 )
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-me-" + str(uuid.uuid4()))
 
-MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 
+def _persistent_secret_key():
+    """A stable Flask secret key across restarts/workers so each visitor's
+    session cookie (which stores their anonymous user_id) doesn't get
+    invalidated every time the server restarts. Without this, a random key
+    was generated per-process, which silently "lost" every conversation
+    tied to the old session on every restart/redeploy/worker respawn —
+    the classic cause of "it only ever shows 1 chat".
+
+    Priority: FLASK_SECRET_KEY env var > a key file persisted next to this
+    script. Setting FLASK_SECRET_KEY explicitly is STRONGLY recommended for
+    any real deployment (Render, etc.), since some hosts wipe local disk
+    between deploys, which would defeat the file fallback too.
+    """
+    env_key = os.environ.get("FLASK_SECRET_KEY")
+    if env_key:
+        return env_key
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(base_dir, "chat_data")
+    os.makedirs(data_dir, exist_ok=True)
+    key_path = os.path.join(data_dir, "flask_secret.key")
+    if os.path.exists(key_path):
+        with open(key_path, "r") as f:
+            existing = f.read().strip()
+        if existing:
+            return existing
+    new_key = str(uuid.uuid4())
+    with open(key_path, "w") as f:
+        f.write(new_key)
+    return new_key
+
+
+app.secret_key = _persistent_secret_key()
+
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 8 MB
+
+# --- Temporary public image hosting (for NanoBanana image-to-image editing) --
+# NanoBanana's /generate endpoint needs a publicly reachable image URL for
+# edit-mode requests — it can't accept a raw base64 upload directly. So when a
+# user uploads a selfie for "Ghibli Me", we stash the bytes here in memory
+# under a random id and serve them back at /api/temp-image/<id>, giving
+# NanoBanana's servers a URL they can fetch. Entries expire on their own after
+# a short TTL so memory doesn't grow unbounded.
+_TEMP_IMAGES = {}
+_TEMP_IMAGE_TTL_SECONDS = 30 * 60  # 30 minutes
+
+
+def _store_temp_image(raw_bytes, mime_type):
+    # Opportunistic cleanup of anything past its TTL
+    cutoff = time.time() - _TEMP_IMAGE_TTL_SECONDS
+    for k in [k for k, v in _TEMP_IMAGES.items() if v["created"] < cutoff]:
+        _TEMP_IMAGES.pop(k, None)
+    img_id = uuid.uuid4().hex
+    _TEMP_IMAGES[img_id] = {"data": raw_bytes, "mime_type": mime_type or "image/png", "created": time.time()}
+    return img_id
+
+
+def nano_banana_submit(prompt, image_urls=None, num_images=1):
+    """Submits a NanoBanana generation/edit task. Returns (task_id, error)."""
+    if not NANO_BANANA_API_KEY:
+        return None, "NanoBanana API key not configured"
+    payload = {
+        "prompt": prompt,
+        "type": "IMAGETOIAMGE" if image_urls else "TEXTTOIAMGE",
+        "numImages": num_images,
+    }
+    if image_urls:
+        payload["imageUrls"] = image_urls
+    try:
+        resp = requests.post(
+            f"{NANO_BANANA_BASE}/generate",
+            headers={"Authorization": f"Bearer {NANO_BANANA_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        data = resp.json()
+        if resp.status_code == 200 and data.get("code") == 200:
+            return data["data"]["taskId"], None
+        return None, data.get("msg") or f"NanoBanana error ({resp.status_code})"
+    except (requests.RequestException, ValueError) as e:
+        return None, str(e)
+
+
+def nano_banana_poll(task_id, max_wait=180, interval=3):
+    """Polls a NanoBanana task until it succeeds/fails/times out.
+    Returns (result_image_url, error)."""
+    headers = {"Authorization": f"Bearer {NANO_BANANA_API_KEY}"}
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        try:
+            resp = requests.get(
+                f"{NANO_BANANA_BASE}/record-info",
+                params={"taskId": task_id}, headers=headers, timeout=15,
+            )
+            data = resp.json()
+        except (requests.RequestException, ValueError) as e:
+            return None, str(e)
+        flag = data.get("successFlag")
+        if flag == 1:
+            result = data.get("response") or {}
+            url = result.get("resultImageUrl")
+            if not url and isinstance(result.get("resultImageUrls"), list) and result["resultImageUrls"]:
+                url = result["resultImageUrls"][0]
+            if not url:
+                return None, "NanoBanana returned no result image"
+            return url, None
+        if flag in (2, 3):
+            return None, data.get("errorMessage") or "NanoBanana generation failed"
+        time.sleep(interval)
+    return None, "NanoBanana generation timed out"
+
+# --- Supabase config ---------------------------------------------------------
+# Never hardcode real keys here — always set these as environment variables:
+#   SUPABASE_URL  -> your project URL, e.g. https://xxxxx.supabase.co
+#   SUPABASE_KEY  -> your Supabase *secret* (service-role-style) key
+# The secret key grants full database access, so it must only ever live in
+# server-side environment variables/secret storage, never in source code,
+# client-side JS, or anything committed to a public repo.
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
@@ -94,7 +260,11 @@ def sb(path):
     return f"{SUPABASE_URL}/rest/v1/{path}"
 
 
+# --- User accounts (Supabase: users table) -----------------------------------
+
 def current_username():
+    """Each visitor gets a unique anonymous ID stored in their browser cookie.
+    No login required — conversations are private per browser session."""
     if "user_id" not in session:
         session["user_id"] = str(uuid.uuid4())
         session.permanent = True
@@ -102,12 +272,15 @@ def current_username():
 
 
 def login_required(view):
+    """No-op decorator kept so all @login_required routes still work unchanged."""
     def wrapped(*args, **kwargs):
-        current_username()
+        current_username()  # ensure session id is set
         return view(*args, **kwargs)
     wrapped.__name__ = view.__name__
     return wrapped
 
+
+# --- Supabase / file storage helpers ----------------------------------------
 
 def list_conversations(username):
     if not SUPABASE_URL:
@@ -182,6 +355,7 @@ def delete_conversation(username, conv_id):
         pass
 
 
+# --- Local file fallbacks for when Supabase is not configured ----------------
 import os as _os
 _BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
 _DATA_DIR = _os.path.join(_BASE_DIR, "chat_data")
@@ -236,23 +410,34 @@ def make_title(first_message):
     return title[:40] + ("…" if len(title) > 40 else "")
 
 
+# --- HTML pages ----------------------------------------------------------
+
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Mythic AI</title>
+<title>Ꮇʏᴛʜɪᴄ ᴀɪ</title>
 <style>
   :root {
     --bg:#1a1a1a; --panel:#2a2a2a; --border:#3a3a3a;
     --text:#ececec; --muted:#8e8ea0; --accent:#10a37f;
     --accent-dim:#1a3a30; --user-bubble:#2a2a2a; --user-text:#ececec;
-    --ai-bubble:#1a1a1a; --sidebar-w:260px;
+    --ai-bubble:#1a1a1a; --sidebar-w:260px; --msg-font-size:14.5px;
   }
   * { box-sizing:border-box; margin:0; padding:0; }
   html,body { height:100%; background:var(--bg); color:var(--text);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif; overflow:hidden; }
   .layout { display:flex; height:100vh; }
+
+  /* Light theme override */
+  body.theme-light {
+    --bg:#f7f7f8; --panel:#ffffff; --border:#e3e3e6;
+    --text:#1f1f1f; --muted:#6b6b76; --accent-dim:#e3f5ef;
+    --user-bubble:#eef0f2; --user-text:#1f1f1f; --ai-bubble:#ffffff;
+  }
+
+  /* Sidebar */
   #sidebar { width:var(--sidebar-w); flex-shrink:0; background:var(--panel);
     border-right:1px solid var(--border); display:flex; flex-direction:column;
     transition:margin-left .2s ease; }
@@ -275,6 +460,8 @@ PAGE = r"""<!DOCTYPE html>
   .conv-item .rename-btn:hover { color:var(--accent); }
   .conv-item .del-btn:hover { color:#ef4444; }
   #sidebar-footer { padding:12px; font-size:11px; color:var(--muted); border-top:1px solid var(--border); }
+
+  /* Main */
   .app { display:flex; flex-direction:column; height:100vh; flex:1; min-width:0; }
   header { padding:calc(14px + env(safe-area-inset-top)) 20px 14px; border-bottom:1px solid var(--border);
     display:flex; align-items:center; justify-content:space-between; gap:10px;
@@ -290,10 +477,17 @@ PAGE = r"""<!DOCTYPE html>
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
     display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
   #name-btn:hover { background:var(--panel); }
+  #settings-btn { background:none; border:1px solid var(--border); color:var(--muted);
+    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
+  #settings-btn:hover { background:var(--panel); }
   #export-btn { background:none; border:1px solid var(--border); color:var(--muted);
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
     display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
   #export-btn:hover { background:var(--panel); }
+
+  /* Fullscreen bar — sits above the input row so it's always reachable on mobile,
+     away from any notch/status-bar area that can swallow top-corner taps. */
   #fullscreen-btn { display:flex; align-items:center; justify-content:center; gap:6px;
     width:100%; max-width:760px; margin:0 auto 8px; padding:9px 12px;
     background:var(--panel); border:1px solid var(--border); border-radius:10px;
@@ -302,9 +496,14 @@ PAGE = r"""<!DOCTYPE html>
   #fullscreen-btn:hover { color:var(--text); border-color:var(--accent); }
   #fullscreen-btn.active { color:var(--accent); border-color:var(--accent); }
   #fullscreen-icon { font-size:15px; }
+
+  /* Fallback for browsers without a real Fullscreen API (iOS Safari, some in-app webviews):
+     hide the sidebar toggle/header chrome so the chat fills the screen. */
   body.pseudo-fullscreen #sidebar-toggle,
   body.pseudo-fullscreen header .left h1 { display:none; }
   body.pseudo-fullscreen header { padding-top:calc(6px + env(safe-area-inset-top)); padding-bottom:6px; }
+
+  /* Name modal */
   #name-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
     z-index:200; align-items:center; justify-content:center; }
   #name-modal-overlay.show { display:flex; }
@@ -325,11 +524,50 @@ PAGE = r"""<!DOCTYPE html>
   #clear-btn { background:none; border:1px solid var(--border); color:var(--muted);
     font-size:12px; padding:6px 12px; border-radius:6px; cursor:pointer; flex-shrink:0; }
   #clear-btn:hover { background:var(--panel); }
+
+  /* Settings modal */
+  #settings-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
+    z-index:200; align-items:center; justify-content:center; }
+  #settings-modal { background:var(--bg); border:1px solid var(--border); border-radius:14px;
+    padding:22px; width:92%; max-width:420px; max-height:86vh; overflow-y:auto;
+    box-shadow:0 10px 40px rgba(0,0,0,.3); }
+  #settings-modal h3 { margin:0 0 4px; font-size:17px; color:var(--text); }
+  #settings-modal p.sub { margin:0 0 16px; font-size:12.5px; color:var(--muted); }
+  .settings-section { margin-bottom:16px; }
+  .settings-section label { display:block; font-size:12px; color:var(--muted); margin-bottom:6px; font-weight:600; }
+  .settings-row { display:flex; gap:8px; flex-wrap:wrap; }
+  .settings-choice { flex:1; min-width:80px; padding:8px 10px; border-radius:8px; border:1.5px solid var(--border);
+    background:var(--panel); color:var(--muted); cursor:pointer; font-size:12.5px; font-family:inherit; text-align:center; }
+  .settings-choice:hover { border-color:var(--accent); }
+  #accent-color-input { width:44px; height:34px; border:1.5px solid var(--border); border-radius:8px;
+    background:var(--panel); cursor:pointer; padding:2px; }
+  #font-size-slider { width:100%; accent-color:var(--accent); }
+  #font-size-label { font-size:12px; color:var(--muted); }
+  .settings-select { width:100%; padding:9px 10px; border-radius:8px; border:1.5px solid var(--border);
+    background:var(--panel); color:var(--text); font-size:13px; font-family:inherit; outline:none; }
+  .settings-select:focus { border-color:var(--accent); }
+  #custom-instructions-input { width:100%; box-sizing:border-box; padding:9px 12px; border-radius:8px;
+    border:1.5px solid var(--border); background:var(--panel); color:var(--text);
+    font-size:13px; font-family:inherit; outline:none; resize:vertical; min-height:60px; }
+  #custom-instructions-input:focus { border-color:var(--accent); }
+  #settings-close-btn { width:100%; margin-top:6px; background:var(--accent); color:#fff; border:none;
+    border-radius:10px; padding:11px; font-size:14px; font-weight:700; cursor:pointer; font-family:inherit; }
+  #settings-close-btn:hover { opacity:.9; }
+
+  /* Message bubble density controlled by settings */
+  body.bubble-compact .msg { padding:7px 11px; border-radius:12px; }
+  body.bubble-compact #messages { gap:8px; }
+  body.bubble-comfortable .msg { padding:11px 15px; border-radius:18px; }
+  body.bubble-comfortable #messages { gap:16px; }
+  body.bubble-spacious .msg { padding:16px 20px; border-radius:22px; }
+  body.bubble-spacious #messages { gap:24px; }
+
+  /* Messages */
   #messages-wrap { flex:1; overflow-y:auto; position:relative; }
   #messages { padding:24px 20px; display:flex; flex-direction:column; gap:16px;
     max-width:760px; margin:0 auto; width:100%; min-height:100%; }
   .msg { max-width:80%; padding:11px 15px; border-radius:18px; line-height:1.6;
-    font-size:14.5px; white-space:pre-wrap; word-wrap:break-word; }
+    font-size:var(--msg-font-size); white-space:pre-wrap; word-wrap:break-word; }
   .msg.user { align-self:flex-end; background:var(--user-bubble); color:var(--user-text);
     border-bottom-right-radius:4px; }
   .msg.ai { align-self:flex-start; background:var(--ai-bubble); color:var(--text);
@@ -338,6 +576,8 @@ PAGE = r"""<!DOCTYPE html>
     color:#dc2626; font-size:13px; border-radius:10px; }
   .msg img { max-width:100%; border-radius:10px; display:block; margin-top:8px; }
   .attach-chip { font-size:11.5px; opacity:.75; margin-bottom:4px; }
+
+  /* Message row wraps the bubble + its action buttons (copy / regenerate) */
   .msg-row { display:flex; flex-direction:column; max-width:80%; }
   .msg-row.user { align-self:flex-end; align-items:flex-end; }
   .msg-row.ai { align-self:flex-start; align-items:flex-start; }
@@ -350,6 +590,7 @@ PAGE = r"""<!DOCTYPE html>
     font-size:12px; padding:2px 7px; border-radius:5px; touch-action:manipulation;
     -webkit-tap-highlight-color:transparent; }
   .msg-actions button:hover { background:var(--panel); color:var(--text); }
+  .msg-timestamp { font-size:10.5px; color:var(--muted); margin-top:2px; }
   .empty-state { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
     text-align:center; color:var(--muted); }
   .empty-state h2 { font-size:22px; font-weight:700; color:var(--accent); margin-bottom:8px; }
@@ -361,12 +602,18 @@ PAGE = r"""<!DOCTYPE html>
   .typing span:nth-child(2) { animation-delay:.2s; }
   .typing span:nth-child(3) { animation-delay:.4s; }
   @keyframes blink { 0%,80%,100%{opacity:.2} 40%{opacity:1} }
+
+  /* Scroll to bottom */
   #scroll-btn { position:fixed; bottom:130px; right:24px; width:36px; height:36px;
     border-radius:50%; background:var(--accent); color:#fff; border:none; cursor:pointer;
     font-size:18px; display:none; align-items:center; justify-content:center;
     box-shadow:0 2px 8px rgba(0,0,0,.15); z-index:10; }
   #scroll-btn.show { display:flex; }
+
+  /* Image preview */
   .gen-img { max-width:320px; border-radius:12px; display:block; margin-top:8px; }
+
+  /* Input area */
   #pending-attach { max-width:760px; margin:0 auto; width:100%; padding:6px 20px 0;
     display:none; align-items:center; gap:8px; font-size:12.5px; color:var(--muted); }
   #pending-attach.show { display:flex; }
@@ -395,6 +642,8 @@ PAGE = r"""<!DOCTYPE html>
   #send-btn.generating:hover { opacity:.9; }
   #voice-btn.listening { color:#ef4444; animation:pulse 1s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  /* Speaking indicator */
   #speaking-indicator { display:none; align-items:center; gap:6px; font-size:12px;
     color:var(--accent); padding:4px 0; }
   #speaking-indicator.show { display:flex; }
@@ -404,48 +653,63 @@ PAGE = r"""<!DOCTYPE html>
     font-size:12.5px; padding:6px 14px; border-radius:20px; cursor:pointer;
     transition:all .15s ease; white-space:nowrap; font-family:inherit; touch-action:manipulation; }
   .quick-btn:hover { background:var(--accent-dim); border-color:var(--accent); color:var(--accent); }
+
   #messages-wrap::-webkit-scrollbar, #conv-list::-webkit-scrollbar { width:6px; }
   #messages-wrap::-webkit-scrollbar-thumb, #conv-list::-webkit-scrollbar-thumb
     { background:var(--border); border-radius:4px; }
   #sidebar-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
     z-index:99; -webkit-tap-highlight-color:transparent; }
+
   @media(max-width:768px) {
     :root { --sidebar-w: 78vw; }
+
+    /* Sidebar slides in as overlay — never pushes content */
     #sidebar { position:fixed; top:0; left:0; z-index:100; height:100%;
       height:-webkit-fill-available; width:var(--sidebar-w) !important;
       transform:translateX(0); transition:transform .25s ease;
       box-shadow:4px 0 24px rgba(0,0,0,.5); }
     #sidebar.hidden { transform:translateX(-105%); margin-left:0 !important; }
+
+    /* Show overlay when sidebar open */
     #sidebar-overlay { display:block; }
+
+    /* Main app always takes full width */
     .app { width:100% !important; flex:1; }
+
     header { padding:calc(10px + env(safe-area-inset-top)) 12px 10px; }
     header h1 { font-size:14px; }
     #sidebar-toggle { width:38px; height:38px; font-size:14px; }
     #name-btn { width:38px; height:38px; font-size:14px; }
+    #settings-btn { width:38px; height:38px; font-size:14px; }
     #export-btn { width:38px; height:38px; font-size:14px; }
     #clear-btn { font-size:11px; padding:8px 10px; min-height:38px; }
     #speak-toggle { font-size:11px; padding:5px 8px; }
     #fullscreen-btn { font-size:12.5px; padding:10px 12px; }
+
     #messages-wrap { overflow-y:auto; -webkit-overflow-scrolling:touch; }
     #messages { padding:14px 10px; gap:12px; max-width:100%; }
     .msg { max-width:90%; font-size:14px; padding:10px 12px; }
     .msg-row { max-width:90%; }
-    .msg-actions { opacity:1; height:26px; }
+    .msg-actions { opacity:1; height:26px; } /* no hover on touch — keep always visible */
     .msg-actions button { font-size:13px; padding:4px 9px; min-width:30px; min-height:26px; }
+
     .input-area { padding:8px 10px max(10px,env(safe-area-inset-bottom)); }
     .input-row { padding:6px 8px; }
-    textarea { font-size:16px; }
+    textarea { font-size:16px; } /* 16px prevents iOS zoom */
     .tool-btn { width:34px; height:34px; font-size:17px; }
     #send-btn { width:34px; height:34px; font-size:16px; }
+
     .empty-state h2 { font-size:19px; }
     .empty-state p { font-size:13px; }
     #scroll-btn { bottom:80px; right:12px; width:34px; height:34px; }
+
     #new-chat-btn { margin:10px; padding:10px 12px; font-size:13.5px; }
     .conv-item { padding:10px 8px; font-size:13px; min-height:44px; }
     .conv-item .rename-btn { opacity:1; }
     .conv-item .del-btn { opacity:1; }
     #sidebar-footer { font-size:11px; padding:10px 12px; }
   }
+
   @media(max-width:380px) {
     :root { --sidebar-w: 88vw; }
     .msg { font-size:13.5px; }
@@ -460,16 +724,23 @@ PAGE = r"""<!DOCTYPE html>
   <div id="sidebar">
     <button id="new-chat-btn">+ New chat</button>
     <div id="conv-list"></div>
-    <div id="sidebar-footer">Mythic AI &middot; by Aarav Singh</div>
+    <div id="sidebar-footer">Ꮇʏᴛʜɪᴄ ᴀɪ &middot; by Aarav Singh</div>
   </div>
   <div class="app">
     <header>
       <div class="left">
         <button id="sidebar-toggle" title="Toggle sidebar">☰</button>
-        <h1>Mythic AI</h1>
+        <h1>Ꮇʏᴛʜɪᴄ ᴀɪ</h1>
+        <select id="model-select" title="Select model" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;cursor:pointer;outline:none;max-width:130px;font-family:inherit;">
+          <option value="mythic-1" data-vip="0">Mythic 1</option>
+          <option value="mythic-2" data-vip="0" selected>Mythic 2</option>
+          <option value="mythic-3" data-vip="0">Mythic 3</option>
+          <option value="mythic-vip" data-vip="1">Mythic VIP 🔒</option>
+        </select>
       </div>
       <div class="right">
-        <button id="name-btn" title="What should Mythic AI call you?">🙂</button>
+        <button id="name-btn" title="What should Ꮇʏᴛʜɪᴄ ᴀɪ call you?">🙂</button>
+        <button id="settings-btn" title="Settings">⚙</button>
         <button id="export-btn" title="Export this chat">⬇</button>
         <button id="clear-btn">Delete chat</button>
       </div>
@@ -478,7 +749,7 @@ PAGE = r"""<!DOCTYPE html>
     <div id="messages-wrap">
       <div id="messages">
         <div class="empty-state" id="empty-state">
-          <h2>Mythic AI</h2>
+          <h2>Ꮇʏᴛʜɪᴄ ᴀɪ</h2>
           <p>Ask me anything, generate images, or just chat 👋</p>
         </div>
       </div>
@@ -496,6 +767,7 @@ PAGE = r"""<!DOCTYPE html>
       <button id="stop-speak-btn">Stop</button>
     </div>
 
+    <!-- Quick action buttons -->
     <div id="quick-actions" style="display:flex;gap:8px;padding:6px 20px 0;max-width:760px;margin:0 auto;width:100%;flex-wrap:wrap;">
       <button class="quick-btn" id="img-gen-btn">🎨 Image</button>
       <button class="quick-btn" id="ghibli-btn">🌿 Ghibli Me</button>
@@ -508,12 +780,14 @@ PAGE = r"""<!DOCTYPE html>
       </button>
       <form id="chat-form">
         <div class="input-row">
+          <!-- Attach file -->
           <input type="file" id="file-input" accept="image/*,.txt,.md,.csv,.json,.pdf" style="display:none">
           <button class="tool-btn" id="attach-btn" type="button" title="Attach file">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
             </svg>
           </button>
+          <!-- Camera -->
           <input type="file" id="camera-input" accept="image/*" capture="environment" style="display:none">
           <button class="tool-btn" id="camera-btn" type="button" title="Take photo">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -521,7 +795,8 @@ PAGE = r"""<!DOCTYPE html>
               <circle cx="12" cy="13" r="4"/>
             </svg>
           </button>
-          <textarea id="input" rows="1" placeholder="Message Mythic AI..."></textarea>
+          <textarea id="input" rows="1" placeholder="Message Ꮇʏᴛʜɪᴄ ᴀɪ..."></textarea>
+          <!-- Voice input -->
           <button class="tool-btn" id="voice-btn" type="button" title="Voice input">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
@@ -543,8 +818,8 @@ PAGE = r"""<!DOCTYPE html>
 
 <div id="name-modal-overlay">
   <div id="name-modal">
-    <h3>What should Mythic AI call you?</h3>
-    <p>Enter your preferred name — Mythic AI will use it when it talks to you.</p>
+    <h3>What should Ꮇʏᴛʜɪᴄ ᴀɪ call you?</h3>
+    <p>Enter your preferred name — Ꮇʏᴛʜɪᴄ ᴀɪ will use it when it talks to you.</p>
     <input type="text" id="name-input" maxlength="60" placeholder="e.g. Aarav" autocomplete="off">
     <div id="name-modal-actions">
       <button id="name-cancel-btn" type="button">Cancel</button>
@@ -553,19 +828,90 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Settings Modal -->
+<div id="settings-modal-overlay">
+  <div id="settings-modal">
+    <h3>Settings</h3>
+    <p class="sub">Customize how Ꮇʏᴛʜɪᴄ ᴀɪ looks and replies. Saved on this device.</p>
+
+    <div class="settings-section">
+      <label>Theme</label>
+      <div class="settings-row">
+        <button class="settings-choice" data-group="theme" data-value="dark">🌙 Dark</button>
+        <button class="settings-choice" data-group="theme" data-value="light">☀️ Light</button>
+        <button class="settings-choice" data-group="theme" data-value="system">🖥 System</button>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <label>Accent color</label>
+      <input type="color" id="accent-color-input" value="#10a37f">
+    </div>
+
+    <div class="settings-section">
+      <label>Font size — <span id="font-size-label">14.5px</span></label>
+      <input type="range" id="font-size-slider" min="12" max="20" step="0.5" value="14.5">
+    </div>
+
+    <div class="settings-section">
+      <label>Bubble spacing</label>
+      <div class="settings-row">
+        <button class="settings-choice" data-group="bubble" data-value="compact">Compact</button>
+        <button class="settings-choice" data-group="bubble" data-value="comfortable">Comfortable</button>
+        <button class="settings-choice" data-group="bubble" data-value="spacious">Spacious</button>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <label>Reply tone</label>
+      <select id="tone-select" class="settings-select">
+        <option value="default">Default</option>
+        <option value="formal">Formal</option>
+        <option value="casual">Casual</option>
+        <option value="funny">Funny</option>
+        <option value="professional">Professional</option>
+      </select>
+    </div>
+
+    <div class="settings-section">
+      <label>Reply length</label>
+      <select id="length-select" class="settings-select">
+        <option value="default">Default</option>
+        <option value="short">Short</option>
+        <option value="medium">Medium</option>
+        <option value="long">Long</option>
+      </select>
+    </div>
+
+    <div class="settings-section">
+      <label>Custom instructions</label>
+      <textarea id="custom-instructions-input" placeholder="e.g. Always answer in bullet points"></textarea>
+    </div>
+
+    <button id="settings-close-btn" type="button">Done</button>
+  </div>
+</div>
+
+<!-- Ghibli Selfie Modal -->
 <div id="ghibli-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:300;align-items:center;justify-content:center;">
   <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:440px;max-height:90vh;overflow-y:auto;">
     <h3 style="margin:0 0 4px;font-size:18px;">🌿 Ghibli Me</h3>
     <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Upload your photo and get a Studio Ghibli-style version of yourself</p>
+
+    <!-- Upload area -->
     <div id="ghibli-upload-area" style="border:2px dashed var(--border);border-radius:12px;padding:24px;text-align:center;cursor:pointer;margin-bottom:12px;transition:border-color .2s;">
       <div style="font-size:36px;margin-bottom:8px;">📸</div>
       <div style="font-size:13px;color:var(--muted);">Click to upload your photo<br><span style="font-size:11px;">or drag & drop</span></div>
       <input type="file" id="ghibli-file-input" accept="image/*" style="display:none">
     </div>
+
+    <!-- Preview -->
     <div id="ghibli-preview-wrap" style="display:none;margin-bottom:12px;text-align:center;">
       <img id="ghibli-preview" style="max-width:100%;max-height:180px;border-radius:10px;border:2px solid var(--accent);">
       <div style="font-size:11px;color:var(--muted);margin-top:4px;">Your photo ✓</div>
     </div>
+
+    <!-- Style options -->
     <div style="margin-bottom:12px;">
       <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Ghibli Style:</label>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
@@ -575,69 +921,25 @@ PAGE = r"""<!DOCTYPE html>
         <button class="ghibli-style-btn" data-style="Studio Ghibli portrait, Princess Mononoke style, nature anime art" style="padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--muted);cursor:pointer;font-size:12px;font-family:inherit;">🐺 Mononoke</button>
       </div>
     </div>
+
+    <!-- Extra prompt -->
     <input id="ghibli-extra" type="text" placeholder="Add details (optional): e.g. forest background, sunset..."
       style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:12px;font-family:inherit;">
+
+    <!-- Result -->
     <div id="ghibli-result-wrap" style="display:none;margin-bottom:12px;text-align:center;">
       <img id="ghibli-result" style="max-width:100%;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.4);">
       <button id="ghibli-download-btn" style="margin-top:8px;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:8px 18px;font-size:13px;cursor:pointer;font-family:inherit;">⬇ Download</button>
     </div>
     <div id="ghibli-loading" style="display:none;text-align:center;padding:20px;">
       <div style="font-size:32px;margin-bottom:8px;">🎨</div>
-      <div style="color:var(--muted);font-size:13px;">Creating your Ghibli portrait...<br><span style="font-size:11px;">This takes 15-30 seconds</span></div>
+      <div style="color:var(--muted);font-size:13px;">Creating your Ghibli portrait...<br><span style="font-size:11px;">This can take up to a minute or two</span></div>
     </div>
     <div id="ghibli-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px;background:#fef2f2;border-radius:6px;"></div>
+
     <div style="display:flex;gap:8px;">
       <button id="ghibli-generate-btn" style="flex:1;background:linear-gradient(135deg,#10a37f,#0d7a5f);color:#fff;border:none;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">✨ Create Ghibli Art</button>
       <button id="ghibli-close-btn" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:12px 16px;font-size:14px;cursor:pointer;">✕</button>
-    </div>
-  </div>
-</div>
-
-<div id="img-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:300;align-items:center;justify-content:center;">
-  <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:420px;">
-    <h3 style="margin:0 0 6px;font-size:17px;">🎨 Generate Image</h3>
-    <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Describe the image you want to create (powered by Nano Banana)</p>
-    <select id="img-style" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:10px;padding:10px 12px;font-size:14px;margin-bottom:10px;outline:none;cursor:pointer;">
-      <option value="">✨ No Style (auto)</option>
-      <option value="anime">🎌 Anime</option>
-      <option value="realistic">📷 Realistic / Photographic</option>
-      <option value="oil painting">🖼 Oil Painting</option>
-      <option value="watercolor">🎨 Watercolor</option>
-      <option value="3d render">🧊 3D Render</option>
-      <option value="cartoon">🐱 Cartoon</option>
-    </select>
-    <textarea id="img-prompt" rows="3" placeholder="e.g. A girl walking through a forest..."
-      style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;resize:none;outline:none;"></textarea>
-    <div id="img-result" style="display:none;margin-top:12px;text-align:center;">
-      <img id="img-output" style="max-width:100%;border-radius:10px;display:block;margin:0 auto;" alt="Generated image">
-    </div>
-    <div id="img-loading" style="display:none;text-align:center;padding:20px;color:var(--muted);font-size:13px;">⏳ Generating...</div>
-    <div id="img-error" style="display:none;color:#ef4444;font-size:12px;margin-top:8px;"></div>
-    <div style="display:flex;gap:8px;margin-top:14px;">
-      <button id="img-generate-btn" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Generate</button>
-      <button id="img-close-btn" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px;font-size:14px;cursor:pointer;">Close</button>
-    </div>
-  </div>
-</div>
-
-<div id="weather-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:300;align-items:center;justify-content:center;">
-  <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:380px;">
-    <h3 style="margin:0 0 6px;font-size:17px;">🌤 Weather Forecast</h3>
-    <p style="color:var(--muted);font-size:13px;margin:0 0 14px;">Enter city name or allow location access</p>
-    <div style="display:flex;gap:8px;margin-bottom:10px;">
-      <input id="weather-city" type="text" placeholder="e.g. Delhi, Mumbai, London..."
-        style="flex:1;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;">
-      <button id="weather-location-btn" title="Use my location"
-        style="background:var(--panel);border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:8px 12px;font-size:18px;cursor:pointer;">📍</button>
-    </div>
-    <div id="weather-result" style="display:none;background:var(--bg);border-radius:12px;padding:16px;margin-bottom:12px;">
-      <div id="weather-content"></div>
-    </div>
-    <div id="weather-loading" style="display:none;text-align:center;padding:16px;color:var(--muted);font-size:13px;">⏳ Fetching weather...</div>
-    <div id="weather-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;"></div>
-    <div style="display:flex;gap:8px;">
-      <button id="weather-search-btn" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Get Weather</button>
-      <button id="weather-close-btn" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px;font-size:14px;cursor:pointer;">Close</button>
     </div>
   </div>
 </div>
@@ -654,6 +956,92 @@ const newChatBtn   = document.getElementById('new-chat-btn');
 const sidebarToggle= document.getElementById('sidebar-toggle');
 const fullscreenBtn= document.getElementById('fullscreen-btn');
 const nameBtn       = document.getElementById('name-btn');
+const modelSelect   = document.getElementById('model-select');
+
+let selectedModel = 'mythic-2';
+let vipUnlocked   = false;
+
+function showVipModal() {
+  const existing = document.getElementById('vip-modal-overlay');
+  if (existing) { existing.style.display = 'flex'; return; }
+  const overlay = document.createElement('div');
+  overlay.id = 'vip-modal-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;display:flex;align-items:center;justify-content:center;';
+  overlay.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:340px;">
+    <div style="font-size:22px;margin-bottom:6px;">🔒 VIP Access</div>
+    <div style="color:var(--muted);font-size:13px;margin-bottom:16px;">Mythic VIP is for VIP users only.</div>
+    <input id="vip-pw-in" type="password" placeholder="VIP password" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;margin-bottom:8px;font-family:inherit;">
+    <div id="vip-pw-err" style="color:#ef4444;font-size:12px;display:none;margin-bottom:8px;">Wrong password.</div>
+    <div style="display:flex;gap:8px;">
+      <button id="vip-pw-ok" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Unlock</button>
+      <button id="vip-pw-cancel" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px;font-size:14px;cursor:pointer;">Cancel</button>
+    </div></div>`;
+  document.body.appendChild(overlay);
+  const pwIn = overlay.querySelector('#vip-pw-in'), pwErr = overlay.querySelector('#vip-pw-err');
+  pwIn.focus();
+  overlay.querySelector('#vip-pw-cancel').addEventListener('click', () => {
+    overlay.style.display = 'none';
+    modelSelect.value = selectedModel;
+  });
+  overlay.querySelector('#vip-pw-ok').addEventListener('click', async () => {
+    try {
+      const r = await fetch('/api/vip-unlock', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pwIn.value.trim() })
+      });
+      const d = await r.json();
+      if (d.success) {
+        vipUnlocked = true;
+        overlay.style.display = 'none';
+        selectedModel = 'mythic-vip';
+        modelSelect.value = 'mythic-vip';
+        const opt = modelSelect.querySelector('option[value="mythic-vip"]');
+        if (opt) opt.textContent = 'Mythic VIP ✨';
+      } else {
+        pwErr.style.display = 'block'; pwIn.value = ''; pwIn.focus();
+      }
+    } catch {
+      pwErr.textContent = 'Network error — try again.';
+      pwErr.style.display = 'block';
+    }
+  });
+  pwIn.addEventListener('keydown', e => { if (e.key === 'Enter') overlay.querySelector('#vip-pw-ok').click(); });
+}
+
+// Populate model list from the backend (falls back to the static HTML options if it fails)
+(async () => {
+  try {
+    const [mr, vr] = await Promise.all([
+      fetch('/api/models').then(r => r.json()),
+      fetch('/api/vip-status').then(r => r.json()),
+    ]);
+    vipUnlocked = !!vr.vip;
+    if (mr && Array.isArray(mr.models) && mr.models.length) {
+      modelSelect.innerHTML = '';
+      mr.models.forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.vip ? (vipUnlocked ? m.name.replace('🔒', '✨') : m.name) : m.name;
+        opt.dataset.vip = m.vip ? '1' : '0';
+        if (m.id === mr.default) opt.selected = true;
+        modelSelect.appendChild(opt);
+      });
+      selectedModel = mr.default || selectedModel;
+    }
+  } catch {
+    // Backend didn't respond — the static <option> list already in the HTML still works fine.
+  }
+})();
+
+modelSelect.addEventListener('change', () => {
+  const opt = modelSelect.options[modelSelect.selectedIndex];
+  if (opt && opt.dataset.vip === '1' && !vipUnlocked) {
+    showVipModal();
+  } else {
+    selectedModel = modelSelect.value;
+  }
+});
+
 const nameModalOverlay = document.getElementById('name-modal-overlay');
 const nameInput     = document.getElementById('name-input');
 const nameCancelBtn = document.getElementById('name-cancel-btn');
@@ -677,11 +1065,7 @@ let pendingFile  = null;
 let recognition  = null;
 let currentUtterance = null;
 
-function autoResize() {
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 140) + 'px';
-}
-
+// --- Scroll button ---
 messagesWrap.addEventListener('scroll', () => {
   const nearBottom = messagesWrap.scrollHeight - messagesWrap.scrollTop - messagesWrap.clientHeight < 120;
   scrollBtn.classList.toggle('show', !nearBottom);
@@ -700,7 +1084,7 @@ function clearEmptyState() {
   if (es) es.remove();
 }
 function showEmptyState() {
-  messagesEl.innerHTML = '<div class="empty-state" id="empty-state"><h2>Mythic AI</h2><p>Ask me anything, generate images, or just chat 👋</p></div>';
+  messagesEl.innerHTML = '<div class="empty-state" id="empty-state"><h2>Ꮇʏᴛʜɪᴄ ᴀɪ</h2><p>Ask me anything, generate images, or just chat 👋</p></div>';
 }
 
 function addMessage(role, text, attachment) {
@@ -804,6 +1188,7 @@ function hideTyping() {
   if (el) el.remove();
 }
 
+// --- Text-to-speech ---
 function speak(text) {
   if (!window.speechSynthesis) return;
   window.speechSynthesis.cancel();
@@ -821,6 +1206,7 @@ stopSpeakBtn.addEventListener('click', () => {
   speakingIndicator.classList.remove('show');
 });
 
+// --- Voice input ---
 function setupVoice() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { voiceBtn.title = 'Voice not supported in this browser'; return; }
@@ -851,6 +1237,7 @@ voiceBtn.addEventListener('click', () => {
   recognition.start();
 });
 
+// --- File / camera attach ---
 function handleFileSelect(file) {
   if (!file) return;
   const reader = new FileReader();
@@ -874,6 +1261,7 @@ pendingRemove.addEventListener('click', () => {
   pendingAttach.classList.remove('show');
 });
 
+// --- Image generation detection ---
 const IMAGE_KEYWORDS = /\b(generate|create|draw|make|paint|render|show me|ghibli|anime|realistic|cartoon|portrait|landscape|art|artwork|image of|picture of|photo of|illustration)\b/i;
 async function tryGenerateImage(prompt) {
   try {
@@ -891,6 +1279,7 @@ async function tryGenerateImage(prompt) {
   return false;
 }
 
+// --- Conversations ---
 async function loadConversationList() {
   try {
     const r = await fetch('/api/conversations');
@@ -950,6 +1339,7 @@ function startNewChat() {
   loadConversationList();
 }
 
+// --- Send / regenerate / stop ---
 let isGenerating = false;
 let currentAbortController = null;
 
@@ -967,6 +1357,7 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
   setGenerating(true);
   currentAbortController = new AbortController();
 
+  // Check if user wants an image (only on fresh sends, not regenerate)
   if (!regenerate) {
     const wantsImage = IMAGE_KEYWORDS.test(message || '') && !attachment;
     if (wantsImage) {
@@ -989,6 +1380,7 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
         attachment,
         user_name: getUserName(),
         regenerate: !!regenerate,
+        model: selectedModel,
       })
     });
     if (!r.ok || !r.body) {
@@ -1018,6 +1410,7 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
   } catch (err) {
     hideTyping();
     if (err.name === 'AbortError') {
+      // User hit stop — keep whatever text streamed in so far, just mark it as stopped.
       if (aiTextNode && !aiTextNode.textContent.trim()) aiTextNode.textContent = '[Stopped]';
     } else {
       addMessage('error', 'Network error: ' + err.message);
@@ -1046,7 +1439,8 @@ form.addEventListener('submit', (e) => {
   addMessage('user', text, attachment);
   input.value = '';
   input.style.height = 'auto';
-  streamReply({ message: text, attachment });
+  const tonePrefix = getTonePrefix();
+  streamReply({ message: tonePrefix + text, attachment });
 });
 
 sendBtn.addEventListener('click', (e) => {
@@ -1059,6 +1453,10 @@ sendBtn.addEventListener('click', (e) => {
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
 });
+function autoResize() {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 140) + 'px';
+}
 input.addEventListener('input', autoResize);
 
 const sidebarOverlay = document.getElementById('sidebar-overlay');
@@ -1078,6 +1476,8 @@ sidebarToggle.addEventListener('click', () => {
 });
 sidebarOverlay.addEventListener('click', closeSidebar);
 
+// Fullscreen toggle (works on Android/desktop; iOS Safari has no real Fullscreen API,
+// so it falls back to a "pseudo-fullscreen" mode that maximizes the app view instead)
 const fullscreenIcon  = document.getElementById('fullscreen-icon');
 const fullscreenLabel = document.getElementById('fullscreen-label');
 const fsSupported = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
@@ -1109,11 +1509,14 @@ async function toggleFullscreen() {
         else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
       }
     } else {
+      // iOS Safari / in-app browsers: real Fullscreen API isn't available,
+      // so just maximize the app view (hides scroll bounce, fills the screen).
       document.body.classList.toggle('pseudo-fullscreen');
       updateFullscreenBtn();
     }
   } catch (err) {
     console.warn('Fullscreen request failed:', err);
+    // Even on failure, fall back to pseudo-fullscreen so the button still does something
     document.body.classList.toggle('pseudo-fullscreen');
     updateFullscreenBtn();
   }
@@ -1122,6 +1525,7 @@ fullscreenBtn.addEventListener('click', toggleFullscreen);
 document.addEventListener('fullscreenchange', updateFullscreenBtn);
 document.addEventListener('webkitfullscreenchange', updateFullscreenBtn);
 
+// "What should Ꮇʏᴛʜɪᴄ ᴀɪ call you?" — stored locally, sent with every chat request
 function getUserName() { return localStorage.getItem('mythic_user_name') || ''; }
 function setUserName(name) {
   if (name) localStorage.setItem('mythic_user_name', name);
@@ -1144,11 +1548,13 @@ nameInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); nameSaveBtn.click(); }
   else if (e.key === 'Escape') closeNameModal();
 });
+// First-time visitors get a gentle one-time prompt
 if (!localStorage.getItem('mythic_name_prompted')) {
   localStorage.setItem('mythic_name_prompted', '1');
   setTimeout(openNameModal, 600);
 }
 
+// Hide sidebar by default on mobile
 if (isMobile()) sidebar.classList.add('hidden');
 newChatBtn.addEventListener('click', startNewChat);
 clearBtn.addEventListener('click', async () => {
@@ -1163,9 +1569,9 @@ exportBtn.addEventListener('click', async () => {
     const r = await fetch('/api/conversations/' + activeConvId);
     if (!r.ok) return;
     const d = await r.json();
-    const lines = [`# ${d.title || 'Mythic AI chat'}`, ''];
+    const lines = [`# ${d.title || 'Ꮇʏᴛʜɪᴄ ᴀɪ chat'}`, ''];
     (d.messages || []).forEach(m => {
-      lines.push(m.role === 'user' ? 'You:' : 'Mythic AI:');
+      lines.push(m.role === 'user' ? 'You:' : 'Ꮇʏᴛʜɪᴄ ᴀɪ:');
       lines.push(m.text || (m.attachment ? `[attachment: ${m.attachment.name}]` : ''));
       lines.push('');
     });
@@ -1183,6 +1589,357 @@ exportBtn.addEventListener('click', async () => {
   }
 });
 
+// Initial load
+// ─── SETTINGS ────────────────────────────────────────────────────────────────
+const settingsBtn        = document.getElementById('settings-btn');
+const settingsModalOverlay=document.getElementById('settings-modal-overlay');
+const settingsCloseBtn   = document.getElementById('settings-close-btn');
+const accentColorInput   = document.getElementById('accent-color-input');
+const fontSizeSlider     = document.getElementById('font-size-slider');
+const fontSizeLabel      = document.getElementById('font-size-label');
+const toneSelect         = document.getElementById('tone-select');
+const lengthSelect       = document.getElementById('length-select');
+const customInstructions = document.getElementById('custom-instructions-input');
+
+// Load saved settings
+function loadSettings() {
+  const s = JSON.parse(localStorage.getItem('mythic_settings') || '{}');
+  // Theme
+  const theme = s.theme || 'dark';
+  applyTheme(theme);
+  document.querySelectorAll('[data-group="theme"]').forEach(b => {
+    b.style.borderColor = b.dataset.value === theme ? 'var(--accent)' : 'var(--border)';
+    b.style.color = b.dataset.value === theme ? 'var(--accent)' : '';
+  });
+  // Accent
+  const accent = s.accent || '#10a37f';
+  accentColorInput.value = accent;
+  document.documentElement.style.setProperty('--accent', accent);
+  // Font size
+  const fs = s.fontSize || '14.5';
+  fontSizeSlider.value = fs;
+  fontSizeLabel.textContent = fs + 'px';
+  document.documentElement.style.setProperty('--msg-font-size', fs + 'px');
+  // Bubble style
+  const bubble = s.bubble || 'comfortable';
+  document.body.classList.remove('bubble-compact','bubble-comfortable','bubble-spacious');
+  document.body.classList.add('bubble-' + bubble);
+  document.querySelectorAll('[data-group="bubble"]').forEach(b => {
+    b.style.borderColor = b.dataset.value === bubble ? 'var(--accent)' : 'var(--border)';
+    b.style.color = b.dataset.value === bubble ? 'var(--accent)' : '';
+  });
+  // Tone & Length
+  if (toneSelect) toneSelect.value = s.tone || 'default';
+  if (lengthSelect) lengthSelect.value = s.length || 'default';
+  // Custom instructions
+  if (customInstructions) customInstructions.value = s.customInstructions || '';
+}
+
+function saveSettings() {
+  const s = JSON.parse(localStorage.getItem('mythic_settings') || '{}');
+  s.theme = document.body.classList.contains('theme-light') ? 'light' : 'dark';
+  s.accent = accentColorInput.value;
+  s.fontSize = fontSizeSlider.value;
+  const bubs = ['compact','comfortable','spacious'].find(b => document.body.classList.contains('bubble-'+b)) || 'comfortable';
+  s.bubble = bubs;
+  s.tone = toneSelect ? toneSelect.value : 'default';
+  s.length = lengthSelect ? lengthSelect.value : 'default';
+  s.customInstructions = customInstructions ? customInstructions.value : '';
+  localStorage.setItem('mythic_settings', JSON.stringify(s));
+}
+
+function applyTheme(t) {
+  if (t === 'system') {
+    const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.body.classList.toggle('theme-light', !dark);
+  } else {
+    document.body.classList.toggle('theme-light', t === 'light');
+  }
+}
+
+settingsBtn.addEventListener('click', () => { settingsModalOverlay.style.display = 'flex'; });
+settingsCloseBtn.addEventListener('click', () => { saveSettings(); settingsModalOverlay.style.display = 'none'; });
+settingsModalOverlay.addEventListener('click', e => { if (e.target === settingsModalOverlay) { saveSettings(); settingsModalOverlay.style.display = 'none'; } });
+
+document.querySelectorAll('.settings-choice').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const group = btn.dataset.group;
+    document.querySelectorAll(`[data-group="${group}"]`).forEach(b => {
+      b.style.borderColor = 'var(--border)'; b.style.color = '';
+    });
+    btn.style.borderColor = 'var(--accent)'; btn.style.color = 'var(--accent)';
+    if (group === 'theme') applyTheme(btn.dataset.value);
+    if (group === 'bubble') {
+      document.body.classList.remove('bubble-compact','bubble-comfortable','bubble-spacious');
+      document.body.classList.add('bubble-' + btn.dataset.value);
+    }
+    saveSettings();
+  });
+});
+
+accentColorInput.addEventListener('input', () => {
+  document.documentElement.style.setProperty('--accent', accentColorInput.value);
+});
+fontSizeSlider.addEventListener('input', () => {
+  fontSizeLabel.textContent = fontSizeSlider.value + 'px';
+  document.documentElement.style.setProperty('--msg-font-size', fontSizeSlider.value + 'px');
+});
+
+loadSettings();
+
+// ─── MARKDOWN RENDERING ──────────────────────────────────────────────────────
+function renderMarkdown(text) {
+  const div = document.createElement('div');
+  div.className = 'msg-text md-rendered';
+  // Escape HTML first
+  let html = text
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // Code blocks (must come before inline code)
+  html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
+    `<pre><code class="lang-${lang}">${code.trim()}</code></pre>`);
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Bold
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // Italic
+  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  // Headers
+  html = html.replace(/^### (.+)$/gm, '<h3 style="font-size:14px;margin:6px 0 3px;font-weight:700;">$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2 style="font-size:15px;margin:8px 0 4px;font-weight:700;">$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1 style="font-size:17px;margin:10px 0 5px;font-weight:700;">$1</h1>');
+  // Unordered lists
+  html = html.replace(/(^|\n)([\-\*] .+(\n[\-\*] .+)*)/g, (_, pre, block) =>
+    pre + '<ul>' + block.replace(/[\-\*] (.+)/g, '<li>$1</li>') + '</ul>');
+  // Ordered lists
+  html = html.replace(/(^|\n)(\d+\. .+(\n\d+\. .+)*)/g, (_, pre, block) =>
+    pre + '<ol>' + block.replace(/\d+\. (.+)/g, '<li>$1</li>') + '</ol>');
+  // Line breaks
+  html = html.replace(/\n/g, '<br>');
+  div.innerHTML = html;
+  return div;
+}
+
+// Override addMessage to use markdown for AI
+const _origAddMessage = addMessage;
+function addMessage(role, text, attachment) {
+  const textNode = _origAddMessage(role, text, attachment);
+  if (role === 'ai' && text) {
+    try {
+      const md = renderMarkdown(text);
+      textNode.parentNode.replaceChild(md, textNode);
+      return md;
+    } catch { return textNode; }
+  }
+  return textNode;
+}
+
+// ─── MESSAGE TIMESTAMPS ───────────────────────────────────────────────────────
+const _origAddMsg2 = addMessage;
+function addMessageWithTimestamp(role, text, attachment) {
+  const node = _origAddMsg2(role, text, attachment);
+  const row = node.closest ? node.closest('.msg-row') : null;
+  if (row) {
+    const ts = document.createElement('div');
+    ts.className = 'msg-timestamp';
+    ts.textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    row.appendChild(ts);
+  }
+  return node;
+}
+// Monkey-patch addMessage to include timestamp
+const _rawAdd = addMessage;
+window._addMsgFinal = function(role, text, attachment) {
+  const node = _rawAdd(role, text, attachment);
+  const row = node && node.closest ? node.closest('.msg-row') : null;
+  if (row && !row.querySelector('.msg-timestamp')) {
+    const ts = document.createElement('div');
+    ts.className = 'msg-timestamp';
+    ts.textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    row.appendChild(ts);
+  }
+  return node;
+};
+
+// ─── FOLLOW-UP SUGGESTIONS ───────────────────────────────────────────────────
+async function addFollowupSuggestions(aiText) {
+  if (!aiText || aiText.length < 50) return;
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        message: `Based on this AI reply, suggest 3 short follow-up questions the user might ask. Reply ONLY with 3 questions, one per line, no numbering, no extra text:\n\n${aiText.slice(0,400)}`,
+        conversation_id: null, model: 'mythic-1.0', user_name: ''
+      })
+    });
+    if (!r.ok) return;
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let full = '';
+    while (true) { const {done,value} = await reader.read(); if(done) break; full += dec.decode(value,{stream:true}); }
+    const qs = full.trim().split('\n').filter(q => q.trim().length > 5).slice(0,3);
+    if (!qs.length) return;
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;max-width:100%;';
+    qs.forEach(q => {
+      const btn = document.createElement('button');
+      btn.textContent = q.trim().replace(/^["']|["']$/g,'');
+      btn.style.cssText = 'background:var(--panel);border:1px solid var(--border);color:var(--muted);font-size:11.5px;padding:5px 10px;border-radius:16px;cursor:pointer;font-family:inherit;text-align:left;';
+      btn.addEventListener('click', () => {
+        input.value = btn.textContent; input.focus(); autoResize();
+        form.requestSubmit(); wrap.remove();
+      });
+      wrap.appendChild(btn);
+    });
+    messagesEl.appendChild(wrap);
+    scrollToBottom();
+  } catch {}
+}
+
+// ─── MESSAGE REACTIONS ────────────────────────────────────────────────────────
+function addReactionBar(row) {
+  if (row.querySelector('.reaction-bar')) return;
+  const bar = document.createElement('div');
+  bar.className = 'reaction-bar';
+  bar.style.cssText = 'display:flex;gap:4px;margin-top:3px;';
+  ['👍','👎','❤️','😂','🔖'].forEach(emoji => {
+    const btn = document.createElement('button');
+    btn.textContent = emoji;
+    btn.style.cssText = 'background:none;border:1px solid var(--border);border-radius:12px;padding:2px 7px;font-size:13px;cursor:pointer;touch-action:manipulation;';
+    btn.addEventListener('click', () => {
+      btn.style.borderColor = btn.style.borderColor === 'var(--accent)' ? 'var(--border)' : 'var(--accent)';
+      btn.style.background  = btn.style.background === 'var(--accent-dim)' ? '' : 'var(--accent-dim)';
+    });
+    bar.appendChild(btn);
+  });
+  row.appendChild(bar);
+}
+
+// ─── MESSAGE SEARCH ───────────────────────────────────────────────────────────
+function addSearchUI() {
+  const searchWrap = document.createElement('div');
+  searchWrap.id = 'msg-search-wrap';
+  searchWrap.style.cssText = 'display:none;position:fixed;top:70px;left:50%;transform:translateX(-50%);z-index:150;background:var(--panel);border:1.5px solid var(--accent);border-radius:10px;padding:8px 12px;display:flex;gap:8px;align-items:center;min-width:280px;box-shadow:0 4px 20px rgba(0,0,0,.3);';
+  searchWrap.innerHTML = '<input id="msg-search-input" placeholder="Search messages..." style="background:transparent;border:none;color:var(--text);font-size:14px;outline:none;flex:1;font-family:inherit;"><span id="msg-search-count" style="color:var(--muted);font-size:12px;"></span><button id="msg-search-close" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;">✕</button>';
+  searchWrap.style.display = 'none';
+  document.body.appendChild(searchWrap);
+
+  let highlights = [];
+  document.getElementById('msg-search-input').addEventListener('input', e => {
+    highlights.forEach(el => { el.style.background = ''; el.style.outline = ''; });
+    highlights = [];
+    const q = e.target.value.trim().toLowerCase();
+    if (!q) { document.getElementById('msg-search-count').textContent = ''; return; }
+    document.querySelectorAll('.msg-text,.md-rendered').forEach(el => {
+      if (el.textContent.toLowerCase().includes(q)) {
+        el.style.background = 'rgba(255,200,0,.15)';
+        el.style.outline = '2px solid rgba(255,200,0,.4)';
+        highlights.push(el);
+      }
+    });
+    document.getElementById('msg-search-count').textContent = highlights.length ? `${highlights.length} found` : 'no results';
+    if (highlights.length) highlights[0].scrollIntoView({behavior:'smooth',block:'center'});
+  });
+  document.getElementById('msg-search-close').addEventListener('click', () => {
+    searchWrap.style.display = 'none';
+    highlights.forEach(el => { el.style.background = ''; el.style.outline = ''; });
+  });
+  return searchWrap;
+}
+const msgSearchWrap = addSearchUI();
+
+// Keyboard shortcut Ctrl+F to search messages
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'f' && !settingsModalOverlay.style.display.includes('flex')) {
+    e.preventDefault();
+    msgSearchWrap.style.display = 'flex';
+    setTimeout(() => document.getElementById('msg-search-input').focus(), 50);
+  }
+  if (e.key === 'Escape') msgSearchWrap.style.display = 'none';
+});
+
+// ─── PWA SUPPORT ─────────────────────────────────────────────────────────────
+if ('serviceWorker' in navigator && navigator.serviceWorker) {
+  // Inline service worker for offline caching
+  const swCode = `
+const CACHE = 'mythic-ai-v1';
+const OFFLINE = ['/', '/static/app.js'];
+self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(['/']))));
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
+  e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+});`;
+  const blob = new Blob([swCode], {type:'application/javascript'});
+  navigator.serviceWorker.register(URL.createObjectURL(blob)).catch(()=>{});
+}
+
+// ─── WIRE REACTIONS INTO MSG ACTIONS ─────────────────────────────────────────
+// Patch buildMsgActions to add reaction button
+const _origBuildActions = buildMsgActions;
+function buildMsgActions(row, textNode, role) {
+  const actions = _origBuildActions(row, textNode, role);
+  if (role === 'ai') {
+    const reactBtn = document.createElement('button');
+    reactBtn.type = 'button'; reactBtn.title = 'React'; reactBtn.textContent = '😊';
+    reactBtn.addEventListener('click', () => addReactionBar(row));
+    actions.appendChild(reactBtn);
+    // 🔊 speak button
+    const sp = document.createElement('button');
+    sp.type='button'; sp.title='Read aloud'; sp.textContent='🔊';
+    sp.addEventListener('click', () => {
+      if (sp.textContent === '⏹') { stopSpeaking(); sp.textContent='🔊'; return; }
+      sp.textContent='⏹'; speak(textNode.textContent || (textNode.innerText || ''));
+      if (currentUtterance) {
+        currentUtterance.onend = () => sp.textContent='🔊';
+        currentUtterance.onerror = () => sp.textContent='🔊';
+      }
+    });
+    actions.appendChild(sp);
+  }
+  return actions;
+}
+
+function stopSpeaking() { if(window.speechSynthesis) window.speechSynthesis.cancel(); }
+
+// ─── TONE/LENGTH INJECTION ────────────────────────────────────────────────────
+function getTonePrefix() {
+  const s = JSON.parse(localStorage.getItem('mythic_settings') || '{}');
+  const tone = s.tone || 'default';
+  const length = s.length || 'default';
+  let parts = [];
+  if (tone === 'formal') parts.push('Reply in a formal, professional tone.');
+  if (tone === 'casual') parts.push('Reply in a casual, friendly tone.');
+  if (tone === 'funny') parts.push('Be funny and use wit and humor in your reply.');
+  if (tone === 'professional') parts.push('Use a professional, business-appropriate tone.');
+  if (length === 'short') parts.push('Keep your reply very short — 1-3 sentences max.');
+  if (length === 'medium') parts.push('Keep your reply medium length — a few paragraphs.');
+  if (length === 'long') parts.push('Give a thorough, detailed, long reply.');
+  const ci = customInstructions ? customInstructions.value.trim() : '';
+  if (ci) parts.push(ci);
+  return parts.length ? '[Instructions: ' + parts.join(' ') + '] ' : '';
+}
+
+// ─── AUTO FOLLOW-UPS AFTER AI REPLY ──────────────────────────────────────────
+// Hook into streamReply completion by patching the form submit
+const _origFormSubmit = form.onsubmit;
+form.addEventListener('submit', async () => {
+  // Wait for generation to finish then add follow-ups
+  const checkDone = setInterval(() => {
+    if (!isGenerating) {
+      clearInterval(checkDone);
+      const allRows = messagesEl.querySelectorAll('.msg-row.ai');
+      if (allRows.length) {
+        const lastRow = allRows[allRows.length - 1];
+        const textEl = lastRow.querySelector('.msg-text,.md-rendered');
+        if (textEl && !lastRow.querySelector('.reaction-bar')) {
+          addReactionBar(lastRow);
+          setTimeout(() => addFollowupSuggestions(textEl.textContent || textEl.innerText || ''), 300);
+        }
+      }
+    }
+  }, 500);
+});
+
+// ─── INITIAL LOAD ─────────────────────────────────────────────────────────────
 (async () => {
   const convs = await loadConversationList();
   if (convs.length > 0) openConversation(convs[0].id);
@@ -1213,6 +1970,7 @@ if (searchBtn) searchBtn.addEventListener('click', () => {
   input.value = 'Search: ' + q.trim(); autoResize(); form.requestSubmit();
 });
 
+// ─── GHIBLI SELFIE MODAL ─────────────────────────────────────────────────────
 const ghibliModal     = document.getElementById('ghibli-modal-overlay');
 const ghibliUploadArea= document.getElementById('ghibli-upload-area');
 const ghibliFileInput = document.getElementById('ghibli-file-input');
@@ -1228,8 +1986,10 @@ const ghibliDownloadBtn=document.getElementById('ghibli-download-btn');
 const ghibliExtraInput= document.getElementById('ghibli-extra');
 
 let ghibliBase64 = null;
+let ghibliMimeType = 'image/jpeg';
 let ghibliSelectedStyle = 'Studio Ghibli portrait, Spirited Away style, soft watercolor anime art';
 
+// Open/close
 if (ghibliBtn) ghibliBtn.addEventListener('click', () => {
   ghibliModal.style.display = 'flex';
   ghibliBase64 = null;
@@ -1241,6 +2001,7 @@ if (ghibliBtn) ghibliBtn.addEventListener('click', () => {
 if (ghibliCloseBtn) ghibliCloseBtn.addEventListener('click', () => ghibliModal.style.display = 'none');
 ghibliModal.addEventListener('click', e => { if (e.target === ghibliModal) ghibliModal.style.display = 'none'; });
 
+// Style selector
 document.querySelectorAll('.ghibli-style-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.ghibli-style-btn').forEach(b => {
@@ -1251,6 +2012,7 @@ document.querySelectorAll('.ghibli-style-btn').forEach(btn => {
   });
 });
 
+// Upload area
 ghibliUploadArea.addEventListener('click', () => ghibliFileInput.click());
 ghibliUploadArea.addEventListener('dragover', e => { e.preventDefault(); ghibliUploadArea.style.borderColor = 'var(--accent)'; });
 ghibliUploadArea.addEventListener('dragleave', () => { ghibliUploadArea.style.borderColor = 'var(--border)'; });
@@ -1267,6 +2029,7 @@ function loadGhibliPhoto(file) {
   const reader = new FileReader();
   reader.onload = e => {
     ghibliBase64 = e.target.result.split(',')[1];
+    ghibliMimeType = file.type || 'image/jpeg';
     ghibliPreview.src = e.target.result;
     ghibliPreviewWrap.style.display = 'block';
     ghibliResultWrap.style.display = 'none';
@@ -1276,6 +2039,7 @@ function loadGhibliPhoto(file) {
   reader.readAsDataURL(file);
 }
 
+// Generate Ghibli image
 ghibliGenerateBtn.addEventListener('click', async () => {
   if (!ghibliBase64) {
     ghibliError.textContent = 'Please upload your photo first!';
@@ -1292,13 +2056,14 @@ ghibliGenerateBtn.addEventListener('click', async () => {
   try {
     const r = await fetch('/api/generate-image', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ prompt, style: '', image: ghibliBase64 })
+      body: JSON.stringify({ prompt, imageBase64: ghibliBase64, mimeType: ghibliMimeType })
     });
     const d = await r.json();
     ghibliLoading.style.display = 'none';
     if (d.image) {
       ghibliResult.src = 'data:image/png;base64,' + d.image;
       ghibliResultWrap.style.display = 'block';
+      // Also show in chat
       clearEmptyState();
       const row = document.createElement('div'); row.className = 'msg-row ai';
       const bubble = document.createElement('div'); bubble.className = 'msg ai';
@@ -1334,6 +2099,7 @@ if (ghibliDownloadBtn) ghibliDownloadBtn.addEventListener('click', () => {
   if (ghibliResult.src) downloadGhibliImage(ghibliResult.src.split(',')[1]);
 });
 
+// ─── IMAGE GENERATION MODAL JS ───────────────────────────────────────────────
 const imgModalOverlay = document.getElementById('img-modal-overlay');
 const imgPromptEl     = document.getElementById('img-prompt');
 const imgStyleEl      = document.getElementById('img-style');
@@ -1375,6 +2141,7 @@ if (imgCloseBtn2) imgCloseBtn2.addEventListener('click', () => imgModalOverlay.s
 if (imgModalOverlay) imgModalOverlay.addEventListener('click', e => { if(e.target===imgModalOverlay) imgModalOverlay.style.display='none'; });
 if (imgPromptEl) imgPromptEl.addEventListener('keydown', e => { if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();imgGenerateBtn2.click();} });
 
+// ─── WEATHER MODAL JS ────────────────────────────────────────────────────────
 const weatherModal2    = document.getElementById('weather-modal-overlay');
 const weatherCityEl2   = document.getElementById('weather-city');
 const weatherResultEl2 = document.getElementById('weather-result');
@@ -1489,6 +2256,8 @@ def api_rename_conversation(conv_id):
 
 
 def to_ollama_messages(gemini_messages, system_prompt):
+    """Convert our stored Gemini-style messages ({role, parts:[...]}) into
+    Ollama's chat format ({role, content, images?})."""
     msgs = [{"role": "system", "content": system_prompt}]
     for m in gemini_messages:
         role = "user" if m["role"] == "user" else "assistant"
@@ -1506,6 +2275,7 @@ def to_ollama_messages(gemini_messages, system_prompt):
 
 
 def ollama_stream_chunks(messages):
+    """Yields plain text increments from a local Ollama server."""
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/chat",
@@ -1543,6 +2313,8 @@ def ollama_stream_chunks(messages):
 
 
 def to_openai_messages(gemini_messages, system_prompt):
+    """Convert stored Gemini-format messages to OpenAI-compatible chat format.
+    Used by Groq, OpenRouter, and HuggingFace (all use the same OpenAI-style API)."""
     msgs = [{"role": "system", "content": system_prompt}]
     for m in gemini_messages:
         role = "user" if m["role"] == "user" else "assistant"
@@ -1552,6 +2324,7 @@ def to_openai_messages(gemini_messages, system_prompt):
 
 
 def groq_stream_chunks(messages):
+    """Stream from Groq API (OpenAI-compatible, very fast, generous free tier)."""
     if not GROQ_API_KEY:
         return
     try:
@@ -1575,19 +2348,21 @@ def groq_stream_chunks(messages):
                         yield content
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
-            return
+            return  # success — stop here
+        # rate limited or error — fall through (return without yielding)
     except requests.RequestException:
         pass
 
 
 def openrouter_stream_chunks(messages):
+    """Stream from OpenRouter (aggregates many free models)."""
     if not OPENROUTER_API_KEY:
         return
     try:
         resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json",
-                     "HTTP-Referer": "http://localhost:5000", "X-Title": "Mythic AI"},
+                     "HTTP-Referer": "http://localhost:5000", "X-Title": "Ꮇʏᴛʜɪᴄ ᴀɪ"},
             json={"model": OPENROUTER_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
             stream=True, timeout=60,
         )
@@ -1615,8 +2390,10 @@ def openrouter_stream_chunks(messages):
 
 
 def huggingface_stream_chunks(messages):
+    """Stream from Hugging Face Inference API (free tier available)."""
     if not HF_API_KEY:
         return
+    # HF uses the same OpenAI-compatible endpoint format
     try:
         resp = requests.post(
             f"https://api-inference.huggingface.co/models/{HF_MODEL}/v1/chat/completions",
@@ -1640,14 +2417,16 @@ def huggingface_stream_chunks(messages):
                     continue
             return
         else:
-            yield f"[HuggingFace error {resp.status_code}: {resp.text[:200]}]"
+            yield f"[OpenRouter error {resp.status_code}: {resp.text[:200]}]"
             return
     except requests.RequestException as e:
-        yield f"[HuggingFace connection error: {e}]"
+        yield f"[OpenRouter connection error: {e}]"
         return
 
 
+
 def cerebras_stream_chunks(messages):
+    """Stream from Cerebras AI (very fast, generous free tier, works on servers)."""
     if not CEREBRAS_API_KEY:
         return
     try:
@@ -1680,14 +2459,22 @@ def cerebras_stream_chunks(messages):
         return
 
 
+# --- Round-robin provider rotation ------------------------------------------
+# Tracks which provider index to try FIRST next time (persists for the life
+# of the process; resets on server restart, which is fine).
 _provider_index = [0]
 
 
 def auto_stream_chunks(gemini_payload, gemini_messages, system_prompt=None):
+    """True round-robin rotation across all configured providers.
+    No provider is primary — starts from wherever the last successful call left off.
+    If the current provider fails/is rate-limited, moves to the next one and
+    remembers that position for the next request too."""
     sp = system_prompt or SYSTEM_PROMPT
     openai_msgs = to_openai_messages(gemini_messages, sp)
     ollama_msgs = to_ollama_messages(gemini_messages, sp)
 
+    # Build the full list of available providers (only those with keys)
     all_providers = []
     if PROVIDER in ("auto", "gemini") and GEMINI_API_KEY:
         all_providers.append(("Gemini", lambda: gemini_stream_chunks(gemini_payload)))
@@ -1698,6 +2485,7 @@ def auto_stream_chunks(gemini_payload, gemini_messages, system_prompt=None):
     if PROVIDER == "openrouter" and OPENROUTER_API_KEY:
         all_providers.append(("OpenRouter", lambda: openrouter_stream_chunks(openai_msgs)))
     if PROVIDER == "huggingface" and HF_API_KEY:
+        # HuggingFace free tier blocks server IPs (Render etc) — only use if explicitly set
         all_providers.append(("HuggingFace", lambda: huggingface_stream_chunks(openai_msgs)))
     if PROVIDER == "ollama":
         all_providers.append(("Ollama", lambda: ollama_stream_chunks(ollama_msgs)))
@@ -1709,6 +2497,7 @@ def auto_stream_chunks(gemini_payload, gemini_messages, system_prompt=None):
     n = len(all_providers)
     start = _provider_index[0] % n
 
+    # Try each provider starting from the current rotation position
     for i in range(n):
         idx = (start + i) % n
         name, fn = all_providers[idx]
@@ -1718,15 +2507,22 @@ def auto_stream_chunks(gemini_payload, gemini_messages, system_prompt=None):
                 collected.append(chunk)
                 yield chunk
             if collected:
+                # Success — next request starts from the NEXT provider (true rotation)
                 _provider_index[0] = (idx + 1) % n
                 return
         except Exception:
             pass
+        # This provider failed — silently try the next one
 
     yield "[All AI providers failed or are rate-limited. Try again in a moment.]"
 
 
+
+
 def gemini_stream_chunks(payload):
+    """Yields plain text increments from Gemini's SSE stream.
+    Returns nothing (silently) on auth/quota/rate-limit errors so the
+    round-robin rotation automatically falls through to the next provider."""
     try:
         resp = requests.post(
             GEMINI_STREAM_URL,
@@ -1736,9 +2532,11 @@ def gemini_stream_chunks(payload):
             timeout=60,
         )
     except requests.RequestException:
-        return
+        return  # network error — silently fall through
 
     if resp.status_code != 200:
+        # Auth errors (401/403), quota errors (429), and server errors (5xx)
+        # all mean "try the next provider" — don't yield anything.
         return
 
     for raw_line in resp.iter_lines(decode_unicode=True):
@@ -1759,14 +2557,54 @@ def gemini_stream_chunks(payload):
             continue
 
 
+# --- Model selector (cosmetic tiers over the same underlying providers) -----
+# "VIP" is gated by a password so it isn't just a free option in the dropdown.
+# Set VIP_PASSWORD as an environment variable — if it's never set, the VIP
+# tier simply can't be unlocked (safe default, no hardcoded password).
+VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "")
+
+MODEL_CATALOG = [
+    {"id": "mythic-1", "name": "Mythic 1", "vip": False},
+    {"id": "mythic-2", "name": "Mythic 2", "vip": False},
+    {"id": "mythic-3", "name": "Mythic 3", "vip": False},
+    {"id": "mythic-vip", "name": "Mythic VIP 🔒", "vip": True},
+]
+DEFAULT_MODEL_ID = "mythic-2"
+
+
+@app.route("/api/models", methods=["GET"])
+@login_required
+def api_models():
+    return jsonify({"models": MODEL_CATALOG, "default": DEFAULT_MODEL_ID})
+
+
+@app.route("/api/vip-status", methods=["GET"])
+@login_required
+def api_vip_status():
+    return jsonify({"vip": bool(session.get("vip_unlocked"))})
+
+
+@app.route("/api/vip-unlock", methods=["POST"])
+@login_required
+def api_vip_unlock():
+    data = request.get_json(force=True) or {}
+    password = data.get("password") or ""
+    if VIP_PASSWORD and password == VIP_PASSWORD:
+        session["vip_unlocked"] = True
+        session.permanent = True
+        return jsonify({"success": True})
+    return jsonify({"success": False})
+
+
 @app.route("/api/chat", methods=["POST"])
 @login_required
 def chat():
     data = request.get_json(force=True) or {}
     user_message = (data.get("message") or "").strip()
     conv_id = data.get("conversation_id")
-    attachment = data.get("attachment")
-    user_name = (data.get("user_name") or "").strip()[:60]
+    attachment = data.get("attachment")  # {name, mimeType, dataBase64} or None
+    user_name = (data.get("user_name") or "").strip()[:60]  # what Ꮇʏᴛʜɪᴄ ᴀɪ should call the user
+    requested_model = (data.get("model") or DEFAULT_MODEL_ID).strip()
     regenerate = bool(data.get("regenerate"))
 
     if regenerate:
@@ -1794,6 +2632,8 @@ def chat():
     messages = conv.setdefault("messages", [])
 
     if regenerate:
+        # Drop the most recent assistant reply (if any) so a fresh one replaces it.
+        # Leaves the preceding user message in place to regenerate against.
         if messages and messages[-1]["role"] == "model":
             messages.pop()
         if not messages or messages[-1]["role"] != "user":
@@ -1815,6 +2655,7 @@ def chat():
             user_entry["attachment_meta"] = attachment_meta
         messages.append(user_entry)
 
+    # Strip attachment_meta (frontend-only field) before sending to the model
     gemini_contents = [
         {"role": m["role"], "parts": m["parts"]} for m in messages
     ]
@@ -1826,6 +2667,14 @@ def chat():
             f"Address them as {user_name} naturally where it fits (e.g. greetings, "
             f"acknowledgements) — don't force it into every single reply."
         )
+    if requested_model == "mythic-vip" and session.get("vip_unlocked"):
+        effective_system_prompt += (
+            " The user is on the VIP tier — feel free to go deeper and be more "
+            "thorough than usual when it's helpful, without padding for its own sake."
+        )
+    # Only the real Gemini call gets the "you have search" instruction — fallback
+    # providers don't have real search, so giving them that instruction makes them
+    # hallucinate fake tool-call JSON into the visible reply.
     gemini_system_prompt = effective_system_prompt + GEMINI_SEARCH_ADDENDUM
 
     payload = {
@@ -1852,140 +2701,73 @@ def chat():
     return resp
 
 
-@app.route("/api/weather", methods=["POST"])
-@login_required
-def get_weather():
-    """Free weather via Open-Meteo — no API key needed."""
-    d = request.get_json(force=True) or {}
-    location = (d.get("location") or "").strip()
-    lat = d.get("lat")
-    lon = d.get("lon")
-    if not location and (lat is None or lon is None):
-        return jsonify({"error": "location or coordinates required"}), 400
-    try:
-        if lat is not None and lon is not None:
-            geo_r = requests.get(
-                "https://nominatim.openstreetmap.org/reverse",
-                params={"lat": lat, "lon": lon, "format": "json"},
-                headers={"User-Agent": "MythicAI/1.0"}, timeout=8,
-            )
-            addr = geo_r.json().get("address", {}) if geo_r.status_code == 200 else {}
-            location_name = addr.get("city") or addr.get("town") or addr.get("village") or "Your Location"
-        else:
-            geo_r = requests.get(
-                "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": location, "count": 1, "language": "en", "format": "json"}, timeout=8,
-            )
-            if geo_r.status_code != 200 or not geo_r.json().get("results"):
-                return jsonify({"error": f"City '{location}' not found. Try a different spelling."}), 404
-            result = geo_r.json()["results"][0]
-            lat, lon = result["latitude"], result["longitude"]
-            location_name = result["name"] + ", " + result.get("country", "")
-
-        weather_r = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={"latitude": lat, "longitude": lon,
-                    "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
-                    "wind_speed_unit": "kmh", "timezone": "auto"}, timeout=8,
-        )
-        if weather_r.status_code != 200:
-            return jsonify({"error": "Weather service unavailable"}), 502
-        current = weather_r.json()["current"]
-        wmo = {0:"Clear sky",1:"Mainly clear",2:"Partly cloudy",3:"Overcast",45:"Foggy",48:"Icy fog",
-               51:"Light drizzle",53:"Drizzle",55:"Heavy drizzle",61:"Light rain",63:"Rain",65:"Heavy rain",
-               71:"Light snow",73:"Snow",75:"Heavy snow",80:"Rain showers",81:"Heavy showers",82:"Violent showers",
-               95:"Thunderstorm",96:"Thunderstorm with hail",99:"Heavy thunderstorm"}
-        code = current.get("weather_code", 0)
-        icons = {0:"☀️",1:"🌤",2:"⛅",3:"☁️",45:"🌫",48:"🌫",51:"🌦",53:"🌧",55:"🌧",61:"🌦",63:"🌧",65:"🌧",
-                 71:"🌨",73:"❄️",75:"❄️",80:"🌧",81:"🌧",82:"⛈",95:"⛈",96:"⛈",99:"⛈"}
-        return jsonify({"weather": {
-            "location": location_name, "temp": round(current["temperature_2m"]),
-            "feels_like": round(current["apparent_temperature"]), "condition": wmo.get(code, "Unknown"),
-            "humidity": current["relative_humidity_2m"], "wind_speed": round(current["wind_speed_10m"]),
-            "icon": icons.get(code, "🌡"),
-        }})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
-
-
-def pollinations_generate_image(prompt, style=""):
-    """Fallback image generator that works reliably on hosted servers (Render, etc.)
-    where Google's free-tier Gemini API often blocks or rate-limits server IPs.
-    No API key needed, no image-to-image support, but always available."""
-    import urllib.parse, random
-    quality_tokens = "masterpiece, best quality, ultra detailed, sharp focus, highly detailed"
-    full_prompt = f"{prompt}, {style} style, {quality_tokens}" if style else f"{prompt}, {quality_tokens}"
-    encoded = urllib.parse.quote(full_prompt)
-    seed = random.randint(1, 999999)
-    image_url = (
-        f"https://image.pollinations.ai/prompt/{encoded}"
-        f"?width=1024&height=1024&model=flux&nologo=true&enhance=true&seed={seed}"
-    )
-    try:
-        resp = requests.get(image_url, timeout=45, headers={"User-Agent": "MythicAI/1.0"})
-        if resp.status_code == 200:
-            ct = resp.headers.get("content-type", "")
-            if ct.startswith("image/") and len(resp.content) > 20_000:
-                return base64.b64encode(resp.content).decode()
-    except Exception:
-        pass
-    return None
+@app.route("/api/temp-image/<img_id>", methods=["GET"])
+def serve_temp_image(img_id):
+    """Serves a temporarily-stashed upload so NanoBanana's servers can fetch it
+    by URL for image-to-image editing. See _store_temp_image() above."""
+    entry = _TEMP_IMAGES.get(img_id)
+    if not entry:
+        return jsonify({"error": "not found or expired"}), 404
+    return Response(entry["data"], mimetype=entry["mime_type"])
 
 
 @app.route("/api/generate-image", methods=["POST"])
 @login_required
 def generate_image():
-    """Image generation: tries Nano Banana (Gemini) first for best quality and
-    image-to-image support, then automatically falls back to Pollinations.ai —
-    which has no key and works reliably on hosted servers like Render — if
-    Nano Banana is blocked, rate-limited, or errors out for any reason.
-    This means image generation keeps working even when Google blocks the
-    server's IP, on Render or any other cloud host."""
     data = request.get_json(force=True) or {}
-    prompt = (data.get("prompt") or "").strip()
-    style = (data.get("style") or "").strip()
-    input_image_b64 = data.get("image")  # optional base64 photo for image-to-image (e.g. Ghibli Me)
+    prompt = data.get("prompt", "").strip()
+    image_b64 = data.get("imageBase64")  # optional — source photo for Ghibli Me / edits
+    mime_type = data.get("mimeType", "image/jpeg")
     if not prompt:
         return jsonify({"error": "prompt required"}), 400
 
-    nano_error = None
+    # Preferred path: NanoBanana. Supports real image-to-image editing, so
+    # "Ghibli Me" can actually transform the uploaded photo instead of just
+    # generating a generic image from text.
     if NANO_BANANA_API_KEY:
-        full_prompt = f"{prompt}, {style} style" if style else prompt
-        parts = [{"text": full_prompt}]
-        if input_image_b64:
-            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": input_image_b64}})
-        payload = {
-            "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {"responseModalities": ["IMAGE"]},
-        }
+        image_urls = None
+        if image_b64:
+            try:
+                raw = base64.b64decode(image_b64, validate=True)
+            except Exception:
+                return jsonify({"error": "invalid image data"}), 400
+            if len(raw) > MAX_UPLOAD_BYTES:
+                return jsonify({"error": "image too large (max 8MB)"}), 400
+            img_id = _store_temp_image(raw, mime_type)
+            image_urls = [f"{request.host_url.rstrip('/')}/api/temp-image/{img_id}"]
+
+        task_id, err = nano_banana_submit(prompt, image_urls=image_urls)
+        if err:
+            return jsonify({"error": err}), 502
+        result_url, err = nano_banana_poll(task_id)
+        if err:
+            return jsonify({"error": err}), 502
         try:
-            resp = requests.post(NANO_BANANA_URL, params={"key": NANO_BANANA_API_KEY}, json=payload, timeout=45)
-            if resp.status_code == 200:
-                rj = resp.json()
-                try:
-                    for part in rj["candidates"][0]["content"]["parts"]:
-                        inline = part.get("inline_data") or part.get("inlineData")
-                        if inline and inline.get("data"):
-                            return jsonify({"image": inline["data"], "provider": "nano-banana"})
-                except (KeyError, IndexError):
-                    nano_error = "Nano Banana returned no image data"
-            else:
-                nano_error = f"Nano Banana error {resp.status_code}"
+            img_resp = requests.get(result_url, timeout=30)
+            img_resp.raise_for_status()
+            return jsonify({"image": base64.b64encode(img_resp.content).decode("utf-8")})
         except requests.RequestException as e:
-            nano_error = f"Nano Banana connection error: {e}"
-    else:
-        nano_error = "Nano Banana API key not configured"
+            return jsonify({"error": f"Could not download result image: {e}"}), 502
 
-    # Fall back to Pollinations — note: this loses image-to-image (uploaded photo
-    # is ignored), so tell the user their photo wasn't used if that happened.
-    img = pollinations_generate_image(prompt, style)
-    if img:
-        result = {"image": img, "provider": "pollinations"}
-        if input_image_b64:
-            result["note"] = "Your uploaded photo could not be used with the fallback generator — this is a fresh text-to-image result instead."
-        return jsonify(result)
-
-    return jsonify({"error": f"Image generation failed on all providers (Nano Banana: {nano_error})"}), 502
+    # Fallback: HuggingFace FLUX.1-schnell — text-to-image only, ignores any
+    # uploaded photo (it has no image-to-image mode here).
+    if not HF_API_KEY:
+        return jsonify({"error": "No image generation provider configured"}), 503
+    model = "black-forest-labs/FLUX.1-schnell"
+    try:
+        resp = requests.post(
+            f"https://api-inference.huggingface.co/models/{model}",
+            headers={"Authorization": f"Bearer {HF_API_KEY}"},
+            json={"inputs": prompt},
+            timeout=60,
+        )
+        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
+            img_b64 = base64.b64encode(resp.content).decode("utf-8")
+            return jsonify({"image": img_b64})
+        else:
+            return jsonify({"error": f"Image generation failed ({resp.status_code})"}), 502
+    except requests.RequestException as e:
+        return jsonify({"error": str(e)}), 502
 
 
 if __name__ == "__main__":
@@ -2003,7 +2785,10 @@ if __name__ == "__main__":
     if PROVIDER == "ollama":
         active.append(f"Ollama({OLLAMA_MODEL}@{OLLAMA_URL})")
     providers_str = " → ".join(active) if active else "none configured!"
-    print(f"Starting Mythic AI at http://localhost:5000")
-    print(f"Image generation: Nano Banana ({NANO_BANANA_MODEL})")
+    image_provider = "NanoBanana (image-to-image supported)" if NANO_BANANA_API_KEY else (
+        "HuggingFace FLUX (text-to-image only)" if HF_API_KEY else "none configured!"
+    )
+    print(f"Starting Ꮇʏᴛʜɪᴄ ᴀɪ at http://localhost:5000")
     print(f"Providers (fallback order): {providers_str}")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print(f"Image generation: {image_provider}")
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
