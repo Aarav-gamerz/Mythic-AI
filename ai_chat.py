@@ -1087,7 +1087,7 @@ function showEmptyState() {
   messagesEl.innerHTML = '<div class="empty-state" id="empty-state"><h2>Ꮇʏᴛʜɪᴄ ᴀɪ</h2><p>Ask me anything, generate images, or just chat 👋</p></div>';
 }
 
-function addMessage(role, text, attachment) {
+let addMessage = function(role, text, attachment) {
   clearEmptyState();
   const row = document.createElement('div');
   row.className = 'msg-row ' + role;
@@ -1118,9 +1118,9 @@ function addMessage(role, text, attachment) {
   messagesEl.appendChild(row);
   scrollToBottom();
   return textNode;
-}
+};
 
-function buildMsgActions(row, textNode, role) {
+let buildMsgActions = function(row, textNode, role) {
   const actions = document.createElement('div');
   actions.className = 'msg-actions';
 
@@ -1156,7 +1156,7 @@ function buildMsgActions(row, textNode, role) {
     actions.appendChild(regenBtn);
   }
   return actions;
-}
+};
 
 function addImageMessage(role, base64, caption) {
   clearEmptyState();
@@ -1721,7 +1721,7 @@ function renderMarkdown(text) {
 
 // Override addMessage to use markdown for AI
 const _origAddMessage = addMessage;
-function addMessage(role, text, attachment) {
+addMessage = function(role, text, attachment) {
   const textNode = _origAddMessage(role, text, attachment);
   if (role === 'ai' && text) {
     try {
@@ -1731,7 +1731,7 @@ function addMessage(role, text, attachment) {
     } catch { return textNode; }
   }
   return textNode;
-}
+};
 
 // ─── MESSAGE TIMESTAMPS ───────────────────────────────────────────────────────
 const _origAddMsg2 = addMessage;
@@ -1875,7 +1875,7 @@ self.addEventListener('fetch', e => {
 // ─── WIRE REACTIONS INTO MSG ACTIONS ─────────────────────────────────────────
 // Patch buildMsgActions to add reaction button
 const _origBuildActions = buildMsgActions;
-function buildMsgActions(row, textNode, role) {
+buildMsgActions = function(row, textNode, role) {
   const actions = _origBuildActions(row, textNode, role);
   if (role === 'ai') {
     const reactBtn = document.createElement('button');
@@ -1896,7 +1896,7 @@ function buildMsgActions(row, textNode, role) {
     actions.appendChild(sp);
   }
   return actions;
-}
+};
 
 function stopSpeaking() { if(window.speechSynthesis) window.speechSynthesis.cancel(); }
 
