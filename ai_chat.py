@@ -1,40 +1,5 @@
 """
-Ꮇʏᴛʜɪᴄ ᴀɪ — single file, powered by Groq (primary) with Cerebras as a silent
-automatic fallback. No provider selection is exposed to the user — if Groq is
-rate-limited, times out, or errors, the app transparently retries on Cerebras.
-
-Usage:
-    1. pip install flask requests
-    2. Set your API keys:
-         Mac/Linux:   export GROQ_API_KEY="your-groq-key"
-                      export CEREBRAS_API_KEY="your-cerebras-key"
-         Windows:     set GROQ_API_KEY=your-groq-key
-                      set CEREBRAS_API_KEY=your-cerebras-key
-    3. python ai_chat.py
-    4. Open http://localhost:5000 in your browser
-
-Get a FREE Groq API key at https://console.groq.com/keys
-Get a FREE Cerebras API key at https://cloud.cerebras.ai
-
-Optional — NanoBanana (nanobananaapi.ai) powers real image-to-image editing for
-"Ghibli Me"; without it, image generation falls back to HuggingFace FLUX
-(text-to-image only). Weather uses Open-Meteo, which needs no API key at all.
-
-Supabase (optional — for accounts/conversation storage across restarts & devices):
-    Set these as environment variables (never hardcode secrets in this file):
-         SUPABASE_URL   e.g. https://xxxxx.supabase.co
-         SUPABASE_KEY   your Supabase *secret* key (server-side only, keeps full DB access)
-    If unset, the app falls back to storing conversations as local JSON files in chat_data/.
-
-Features:
-- Login/register (real accounts, hashed passwords, stored in chat_data/users.json)
-- Multi-conversation chat with sidebar, saved per-account, survives restarts
-- File/image upload (attach an image or text file to a message)
-- Streaming responses (text appears word-by-word)
-- Groq primary / Cerebras automatic silent fallback — no provider picker, ever
-- Image generation, Ghibli Me (image-to-image), and full weather (current +
-  hourly + 7-day + air quality) built in
-- No rate limiting — unlimited messages
+Mythic AI — single file, powered by Google's Gemini API or a local Ollama model.
 """
 
 import os
@@ -42,7 +7,6 @@ import json
 import uuid
 import time
 import base64
-import urllib.parse
 import requests
 from flask import (
     Flask, request, jsonify, Response, session,
@@ -50,744 +14,378 @@ from flask import (
 )
 
 PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
-# "auto"  = Groq first, silently falls back to Cerebras on any failure (rate limit,
-#           timeout, invalid model, network error, 429/500/503, etc.)
-# "groq"     = Groq only
-# "cerebras" = Cerebras only
 
-# --- API Keys (hardcoded fallbacks — override via environment variables) ------
-# WARNING: don't commit a file with real keys to a public GitHub repo.
-# Set these as environment variables on Render instead.
-GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "")
-CEREBRAS_API_KEY  = os.environ.get("CEREBRAS_API_KEY",  "")
-# HF is kept ONLY as a text-to-image fallback for /api/generate-image when
-# NanoBanana isn't configured — it is NOT used as a chat/text provider.
-HF_API_KEY        = os.environ.get("HF_API_KEY",        "")
-# NanoBanana API (nanobananaapi.ai) — powers "Ghibli Me" image editing so it can
-# actually transform the user's uploaded photo (image-to-image), not just
-# generate a generic image from text. Get a key at https://nanobananaapi.ai/api-key
-# and set it as an environment variable — never hardcode it here.
-NANO_BANANA_API_KEY = os.environ.get("NANO_BANANA_API_KEY", "")
-NANO_BANANA_BASE     = "https://api.nanobananaapi.ai/api/v1/nanobanana"
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY",    "")
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "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")
+CEREBRAS_API_KEY  = os.environ.get("CEREBRAS_API_KEY",  "csk-2ph5f5nxt3jrtwj5edcehpr5xh96628268fvjh4e658m4t6h")
+OPENROUTER_API_KEY= os.environ.get("OPENROUTER_API_KEY","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")
+HF_API_KEY        = os.environ.get("HF_API_KEY",        "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")
+NEWS_API_KEY      = os.environ.get("NEWS_API_KEY",      "344a953f2d08489a865239c2f9f030e4")
+NANO_BANANA_API_KEY = os.environ.get("NANO_BANANA_API_KEY", "52b727c25b537301bd162fe540c5267e")
 
-# --- Model names -------------------------------------------------------------
-GROQ_MODEL        = os.environ.get("GROQ_MODEL",        "llama-3.1-8b-instant")
-HF_MODEL          = os.environ.get("HF_MODEL",          "mistralai/Mistral-7B-Instruct-v0.3")
-CEREBRAS_MODEL    = os.environ.get("CEREBRAS_MODEL",    "gpt-oss-120b")
+VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "1254")
+VIP_MODELS   = {"mythic-vip"}
+
+MYTHIC_MODELS = {
+    "mythic-1":   ("groq",      "llama-3.1-8b-instant",      "Fast",     False),
+    "mythic-2":   ("groq",      "llama-3.3-70b-versatile",   "Smart",    False),
+    "mythic-pro": ("cerebras",  "llama-3.3-70b",             "Advanced", False),
+    "mythic-vip": ("openrouter","meta-llama/llama-3.3-70b-instruct:free","Most Powerful 🔒",True),
+}
+DEFAULT_MODEL_ID = "mythic-2"
+
+GEMINI_MODEL    = "gemini-2.5-flash"
+GROQ_MODEL      = os.environ.get("GROQ_MODEL",     "llama-3.3-70b-versatile")
+CEREBRAS_MODEL  = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
+OPENROUTER_MODEL= os.environ.get("OPENROUTER_MODEL","meta-llama/llama-3.3-70b-instruct:free")
+HF_MODEL        = os.environ.get("HF_MODEL",        "mistralai/Mistral-7B-Instruct-v0.3")
+OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL",     "llama3.1")
+OLLAMA_URL      = os.environ.get("OLLAMA_URL",       "http://localhost:11434").rstrip("/")
+
+NANO_BANANA_MODEL = "gemini-2.0-flash-preview-image-generation"
+NANO_BANANA_URL   = "https://api.nanobanana.ai/v1beta/models/" + NANO_BANANA_MODEL + ":generateContent"
+
+GEMINI_STREAM_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:streamGenerateContent"
+API_KEY = GEMINI_API_KEY
+MODEL   = GEMINI_MODEL
 
 SYSTEM_PROMPT = (
-    "You are Ꮇʏᴛʜɪᴄ ᴀɪ, a smart and friendly AI assistant made by Aarav Singh. "
-    "If asked who made you, say you are Ꮇʏᴛʜɪᴄ ᴀɪ made by Aarav Singh — say it once naturally, never repeat it unprompted. "
-    "Never mention Google, Groq, OpenRouter, HuggingFace, Cerebras, Meta, Mistral, Anthropic, or any AI company as your creator or backend. "
+    "You are Mythic AI, a smart and friendly AI assistant made by Aarav Singh. "
+    "If asked who made you, say you are Mythic AI made by Aarav Singh — say it once naturally, never repeat it unprompted. "
+    "Never mention Google, Groq, Cerebras, OpenRouter, HuggingFace, Meta, Mistral, Anthropic, or any AI company as your creator or backend. "
     "You can help with anything: questions, writing, coding, math, ideas, or just chatting. "
     "When writing code, always wrap it in markdown code blocks with the language name. "
-    "LANGUAGE: Always reply ENTIRELY in the same language the user's message is written in — "
-    "never mix two languages in a single reply, and never produce garbled or mis-encoded text. "
-    "If they write in Hindi, reply fully in Hindi (in proper Devanagari script, never romanized or "
-    "mis-encoded). If they write in Tamil, reply fully in Tamil (Tamil script). The same rule applies "
-    "to Gujarati, Marathi, Bengali, Telugu, Malayalam, or any other language — always reply in that "
-    "language's own native script, fully and consistently, from the first word to the last. "
-    "If they write in English, reply fully in English (do not slip into any other language partway "
-    "through, even if source information you know is in a different language — translate it into the "
-    "reply language first). If they mix languages themselves, match their mix. Never force English "
-    "on the user. "
-    "TOOL USE: Never write out fake tool calls, function names, or JSON like {\"query\": ...} in your reply — "
-    "those are internal mechanisms the user must never see. You do not have live web search access — "
-    "answer from what you know and say your information may not be fully up to date if asked about "
-    "very recent events, instead of pretending to search. "
-    "ANTI-REPETITION RULES — follow strictly every reply: "
-    "1. NEVER restate or echo back what the user just said. Jump straight to the answer. "
-    "2. NEVER start replies with filler like Great question, Sure, Of course, Absolutely, Certainly. "
-    "3. NEVER repeat information already given earlier in the conversation. Build on it. "
-    "4. Be direct and natural — like a knowledgeable friend, not a customer service bot. "
-    "5. Keep answers concise unless the user asks for detail."
+    "LANGUAGE: Always reply ENTIRELY in the same language the user writes in. "
+    "English → English only. Hindi (Devanagari) → Hindi only. Hinglish → Hinglish only. NEVER mix. "
+    "ANTI-REPETITION: Never restate what the user said. No filler like 'Great question' or 'Sure'. "
+    "Be direct and natural — like a knowledgeable friend. Keep answers concise unless asked for detail."
+)
+
+GEMINI_SEARCH_ADDENDUM = (
+    " WEB SEARCH: You have access to Google Search for current events, news, prices, sports scores. "
+    "Use it when needed. Summarize results in the reply language."
 )
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-" + str(uuid.uuid4()))
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 
-
-def _persistent_secret_key():
-    """A stable Flask secret key across restarts/workers so each visitor's
-    session cookie (which stores their anonymous user_id) doesn't get
-    invalidated every time the server restarts. Without this, a random key
-    was generated per-process, which silently "lost" every conversation
-    tied to the old session on every restart/redeploy/worker respawn —
-    the classic cause of "it only ever shows 1 chat".
-
-    Priority: FLASK_SECRET_KEY env var > a key file persisted next to this
-    script. Setting FLASK_SECRET_KEY explicitly is STRONGLY recommended for
-    any real deployment (Render, etc.), since some hosts wipe local disk
-    between deploys, which would defeat the file fallback too.
-    """
-    env_key = os.environ.get("FLASK_SECRET_KEY")
-    if env_key:
-        return env_key
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(base_dir, "chat_data")
-    os.makedirs(data_dir, exist_ok=True)
-    key_path = os.path.join(data_dir, "flask_secret.key")
-    if os.path.exists(key_path):
-        with open(key_path, "r") as f:
-            existing = f.read().strip()
-        if existing:
-            return existing
-    new_key = str(uuid.uuid4())
-    with open(key_path, "w") as f:
-        f.write(new_key)
-    return new_key
-
-
-app.secret_key = _persistent_secret_key()
-
-MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 8 MB
-
-# --- Temporary public image hosting (for NanoBanana image-to-image editing) --
-# NanoBanana's /generate endpoint needs a publicly reachable image URL for
-# edit-mode requests — it can't accept a raw base64 upload directly. So when a
-# user uploads a selfie for "Ghibli Me", we stash the bytes here in memory
-# under a random id and serve them back at /api/temp-image/<id>, giving
-# NanoBanana's servers a URL they can fetch. Entries expire on their own after
-# a short TTL so memory doesn't grow unbounded.
-_TEMP_IMAGES = {}
-_TEMP_IMAGE_TTL_SECONDS = 30 * 60  # 30 minutes
-
-
-def _store_temp_image(raw_bytes, mime_type):
-    # Opportunistic cleanup of anything past its TTL
-    cutoff = time.time() - _TEMP_IMAGE_TTL_SECONDS
-    for k in [k for k, v in _TEMP_IMAGES.items() if v["created"] < cutoff]:
-        _TEMP_IMAGES.pop(k, None)
-    img_id = uuid.uuid4().hex
-    _TEMP_IMAGES[img_id] = {"data": raw_bytes, "mime_type": mime_type or "image/png", "created": time.time()}
-    return img_id
-
-
-def nano_banana_submit(prompt, image_urls=None, num_images=1):
-    """Submits a NanoBanana generation/edit task. Returns (task_id, error)."""
-    if not NANO_BANANA_API_KEY:
-        return None, "NanoBanana API key not configured"
-    payload = {
-        "prompt": prompt,
-        "type": "IMAGETOIAMGE" if image_urls else "TEXTTOIAMGE",
-        "numImages": num_images,
-    }
-    if image_urls:
-        payload["imageUrls"] = image_urls
-    try:
-        resp = requests.post(
-            f"{NANO_BANANA_BASE}/generate",
-            headers={"Authorization": f"Bearer {NANO_BANANA_API_KEY}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=30,
-        )
-        data = resp.json()
-        if resp.status_code == 200 and data.get("code") == 200:
-            return data["data"]["taskId"], None
-        return None, data.get("msg") or f"NanoBanana error ({resp.status_code})"
-    except (requests.RequestException, ValueError) as e:
-        return None, str(e)
-
-
-def nano_banana_poll(task_id, max_wait=180, interval=3):
-    """Polls a NanoBanana task until it succeeds/fails/times out.
-    Returns (result_image_url, error)."""
-    headers = {"Authorization": f"Bearer {NANO_BANANA_API_KEY}"}
-    deadline = time.time() + max_wait
-    while time.time() < deadline:
-        try:
-            resp = requests.get(
-                f"{NANO_BANANA_BASE}/record-info",
-                params={"taskId": task_id}, headers=headers, timeout=15,
-            )
-            data = resp.json()
-        except (requests.RequestException, ValueError) as e:
-            return None, str(e)
-        flag = data.get("successFlag")
-        if flag == 1:
-            result = data.get("response") or {}
-            url = result.get("resultImageUrl")
-            if not url and isinstance(result.get("resultImageUrls"), list) and result["resultImageUrls"]:
-                url = result["resultImageUrls"][0]
-            if not url:
-                return None, "NanoBanana returned no result image"
-            return url, None
-        if flag in (2, 3):
-            return None, data.get("errorMessage") or "NanoBanana generation failed"
-        time.sleep(interval)
-    return None, "NanoBanana generation timed out"
-
-# --- Supabase config ---------------------------------------------------------
-# Never hardcode real keys here — always set these as environment variables:
-#   SUPABASE_URL  -> your project URL, e.g. https://xxxxx.supabase.co
-#   SUPABASE_KEY  -> your Supabase *secret* (service-role-style) key
-# The secret key grants full database access, so it must only ever live in
-# server-side environment variables/secret storage, never in source code,
-# client-side JS, or anything committed to a public repo.
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 def sb_headers():
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation",
-    }
+    return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json", "Prefer": "return=representation"}
 
-def sb(path):
-    return f"{SUPABASE_URL}/rest/v1/{path}"
-
-
-# --- User accounts (Supabase: users table) -----------------------------------
+def sb(path): return f"{SUPABASE_URL}/rest/v1/{path}"
 
 def current_username():
-    """Each visitor gets a unique anonymous ID stored in their browser cookie.
-    No login required — conversations are private per browser session."""
     if "user_id" not in session:
         session["user_id"] = str(uuid.uuid4())
         session.permanent = True
     return session["user_id"]
 
-
 def login_required(view):
-    """No-op decorator kept so all @login_required routes still work unchanged."""
     def wrapped(*args, **kwargs):
-        current_username()  # ensure session id is set
+        current_username()
         return view(*args, **kwargs)
     wrapped.__name__ = view.__name__
     return wrapped
-
-
-# --- Supabase / file storage helpers ----------------------------------------
 
 def list_conversations(username):
     if not SUPABASE_URL:
         return _list_conversations_file(username)
     try:
-        r = requests.get(
-            sb(f"conversations?username=eq.{username}&order=updated_at.desc&select=id,title,updated_at"),
-            headers=sb_headers(), timeout=10,
-        )
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
+        r = requests.get(sb(f"conversations?username=eq.{username}&order=updated_at.desc&select=id,title,updated_at"), headers=sb_headers(), timeout=10)
+        if r.status_code == 200: return r.json()
+    except: pass
     return []
 
-
 def load_conversation(username, conv_id):
-    if not SUPABASE_URL:
-        return _load_conversation_file(username, conv_id)
+    if not SUPABASE_URL: return _load_conversation_file(username, conv_id)
     try:
-        r = requests.get(
-            sb(f"conversations?id=eq.{conv_id}&username=eq.{username}"),
-            headers=sb_headers(), timeout=10,
-        )
-        if r.status_code == 200:
-            rows = r.json()
-            if rows:
-                row = rows[0]
-                return {
-                    "title": row["title"],
-                    "updated_at": row["updated_at"],
-                    "messages": row["messages"] if isinstance(row["messages"], list) else json.loads(row["messages"]),
-                }
-    except Exception:
-        pass
+        r = requests.get(sb(f"conversations?id=eq.{conv_id}&username=eq.{username}"), headers=sb_headers(), timeout=10)
+        if r.status_code == 200 and r.json():
+            row = r.json()[0]
+            return {"title": row["title"], "updated_at": row["updated_at"],
+                    "messages": row["messages"] if isinstance(row["messages"], list) else json.loads(row["messages"])}
+    except: pass
     return None
-
 
 def save_conversation(username, conv_id, data):
     data["updated_at"] = time.time()
-    if not SUPABASE_URL:
-        _save_conversation_file(username, conv_id, data)
-        return
+    if not SUPABASE_URL: _save_conversation_file(username, conv_id, data); return
     try:
-        headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
-        requests.post(
-            sb("conversations"),
-            headers=headers,
-            json={
-                "id": conv_id,
-                "username": username,
-                "title": data.get("title", "New chat"),
-                "updated_at": data["updated_at"],
-                "messages": data.get("messages", []),
-            },
-            timeout=15,
-        )
-    except Exception:
-        pass
-
+        h = {**sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
+        requests.post(sb("conversations"), headers=h, json={"id": conv_id, "username": username,
+            "title": data.get("title","New chat"), "updated_at": data["updated_at"], "messages": data.get("messages",[])}, timeout=15)
+    except: pass
 
 def delete_conversation(username, conv_id):
-    if not SUPABASE_URL:
-        _delete_conversation_file(username, conv_id)
-        return
-    try:
-        requests.delete(
-            sb(f"conversations?id=eq.{conv_id}&username=eq.{username}"),
-            headers=sb_headers(), timeout=10,
-        )
-    except Exception:
-        pass
+    if not SUPABASE_URL: _delete_conversation_file(username, conv_id); return
+    try: requests.delete(sb(f"conversations?id=eq.{conv_id}&username=eq.{username}"), headers=sb_headers(), timeout=10)
+    except: pass
 
-
-# --- Local file fallbacks for when Supabase is not configured ----------------
 import os as _os
 _BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
 _DATA_DIR = _os.path.join(_BASE_DIR, "chat_data")
 _os.makedirs(_DATA_DIR, exist_ok=True)
 
-def _user_conv_dir(username):
-    path = _os.path.join(_DATA_DIR, "conversations", username)
-    _os.makedirs(path, exist_ok=True)
-    return path
-
-def _conv_file(username, conv_id):
-    return _os.path.join(_user_conv_dir(username), f"{conv_id}.json")
-
-def _list_conversations_file(username):
-    folder = _user_conv_dir(username)
-    convs = []
-    for fname in _os.listdir(folder):
-        if not fname.endswith(".json"):
-            continue
-        path = _os.path.join(folder, fname)
+def _user_conv_dir(u):
+    p = _os.path.join(_DATA_DIR, "conversations", u); _os.makedirs(p, exist_ok=True); return p
+def _conv_file(u, c): return _os.path.join(_user_conv_dir(u), f"{c}.json")
+def _list_conversations_file(u):
+    folder = _user_conv_dir(u); convs = []
+    for f in _os.listdir(folder):
+        if not f.endswith(".json"): continue
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            convs.append({"id": fname[:-5], "title": d.get("title", "New chat"), "updated_at": d.get("updated_at", 0)})
-        except Exception:
-            continue
-    convs.sort(key=lambda c: c["updated_at"], reverse=True)
-    return convs
+            d = json.load(open(_os.path.join(folder,f)))
+            convs.append({"id":f[:-5],"title":d.get("title","New chat"),"updated_at":d.get("updated_at",0)})
+        except: pass
+    return sorted(convs, key=lambda c: c["updated_at"], reverse=True)
+def _load_conversation_file(u, c):
+    p = _conv_file(u,c)
+    if not _os.path.exists(p): return None
+    try: return json.load(open(p))
+    except: return None
+def _save_conversation_file(u, c, data):
+    with open(_conv_file(u,c),"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
+def _delete_conversation_file(u, c):
+    p = _conv_file(u,c)
+    if _os.path.exists(p): _os.remove(p)
 
-def _load_conversation_file(username, conv_id):
-    path = _conv_file(username, conv_id)
-    if not _os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-def _save_conversation_file(username, conv_id, data):
-    with open(_conv_file(username, conv_id), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def _delete_conversation_file(username, conv_id):
-    path = _conv_file(username, conv_id)
-    if _os.path.exists(path):
-        _os.remove(path)
-
-
-def make_title(first_message):
-    title = (first_message or "Attachment").strip().replace("\n", " ")
-    return title[:40] + ("…" if len(title) > 40 else "")
-
-
-# --- HTML pages ----------------------------------------------------------
+def make_title(msg):
+    if not msg or not msg.strip():
+        return "New chat"
+    t = msg.strip().replace("\n", " ")
+    # Just use the first 40 chars of the user's actual message
+    return t[:40] + ("…" if len(t) > 40 else "")
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ꮇʏᴛʜɪᴄ ᴀɪ</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Mythic AI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Devanagari:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --bg:#1a1a1a; --panel:#2a2a2a; --border:#3a3a3a;
-    --text:#ececec; --muted:#8e8ea0; --accent:#10a37f;
-    --accent-dim:#1a3a30; --user-bubble:#2a2a2a; --user-text:#ececec;
-    --ai-bubble:#1a1a1a; --sidebar-w:260px; --msg-font-size:14.5px;
-  }
-  * { box-sizing:border-box; margin:0; padding:0; }
-  html,body { height:100%; background:var(--bg); color:var(--text);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif; overflow:hidden; }
-  .layout { display:flex; height:100vh; }
-
-  /* Light theme override */
-  body.theme-light {
-    --bg:#f7f7f8; --panel:#ffffff; --border:#e3e3e6;
-    --text:#1f1f1f; --muted:#6b6b76; --accent-dim:#e3f5ef;
-    --user-bubble:#eef0f2; --user-text:#1f1f1f; --ai-bubble:#ffffff;
-  }
-
-  /* Sidebar */
-  #sidebar { width:var(--sidebar-w); flex-shrink:0; background:var(--panel);
-    border-right:1px solid var(--border); display:flex; flex-direction:column;
-    transition:margin-left .2s ease; }
-  #sidebar.hidden { margin-left:calc(-1 * var(--sidebar-w)); }
-  #new-chat-btn { margin:12px; padding:10px 14px; background:var(--accent); color:#fff;
-    border:none; border-radius:8px; font-size:13.5px; font-weight:600; cursor:pointer; text-align:left; }
-  #new-chat-btn:hover { opacity:.9; }
-  #conv-list { flex:1; overflow-y:auto; padding:0 8px; display:flex; flex-direction:column; gap:2px; }
-  .conv-item { display:flex; align-items:center; justify-content:space-between; gap:6px;
-    padding:9px 10px; border-radius:7px; cursor:pointer; font-size:13px; color:var(--muted); }
-  .conv-item:hover { background:var(--accent-dim); color:var(--text); }
-  .conv-item.active { background:var(--accent-dim); color:var(--accent); font-weight:500; }
-  .conv-item .title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
-  .conv-item .rename-btn { opacity:0; background:none; border:none; color:var(--muted);
-    cursor:pointer; font-size:12px; padding:2px 5px; flex-shrink:0; touch-action:manipulation; }
-  .conv-item .del-btn { opacity:0; background:none; border:none; color:var(--muted);
-    cursor:pointer; font-size:13px; padding:2px 5px; flex-shrink:0; touch-action:manipulation; }
-  .conv-item:hover .rename-btn { opacity:1; }
-  .conv-item:hover .del-btn { opacity:1; }
-  .conv-item .rename-btn:hover { color:var(--accent); }
-  .conv-item .del-btn:hover { color:#ef4444; }
-  #sidebar-footer { padding:12px; font-size:11px; color:var(--muted); border-top:1px solid var(--border); }
-
-  /* Main */
-  .app { display:flex; flex-direction:column; height:100vh; flex:1; min-width:0; }
-  header { padding:calc(14px + env(safe-area-inset-top)) 20px 14px; border-bottom:1px solid var(--border);
-    display:flex; align-items:center; justify-content:space-between; gap:10px;
-    background:var(--bg); position:relative; z-index:20; }
-  header .left { display:flex; align-items:center; gap:10px; min-width:0; }
-  header .right { display:flex; align-items:center; gap:8px; flex-shrink:0; }
-  header button { touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
-  #sidebar-toggle { background:none; border:1px solid var(--border); color:var(--muted);
-    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0; }
-  #sidebar-toggle:hover { background:var(--panel); }
-  header h1 { font-size:16px; font-weight:700; color:var(--accent); margin:0; }
-  #name-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
-  #name-btn:hover { background:var(--panel); }
-  #settings-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
-  #settings-btn:hover { background:var(--panel); }
-  #export-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
-  #export-btn:hover { background:var(--panel); }
-  #vip-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
-  #vip-btn:hover { background:var(--panel); }
-  #vip-btn.active { color:var(--accent); border-color:var(--accent); }
-
-  /* Fullscreen — now a small icon button in the header top-right, alongside
-     Settings, Export, and Profile. */
-  #fullscreen-btn { display:flex; align-items:center; justify-content:center;
-    width:36px; height:36px; border-radius:6px; flex-shrink:0;
-    background:none; border:1px solid var(--border);
-    color:var(--muted); font-size:15px; cursor:pointer; touch-action:manipulation;
-    -webkit-tap-highlight-color:transparent; }
-  #fullscreen-btn:hover { color:var(--text); border-color:var(--accent); background:var(--panel); }
-  #fullscreen-btn.active { color:var(--accent); border-color:var(--accent); }
-  #fullscreen-icon { font-size:15px; }
-
-  /* Fallback for browsers without a real Fullscreen API (iOS Safari, some in-app webviews):
-     hide the sidebar toggle/header chrome so the chat fills the screen. */
-  body.pseudo-fullscreen #sidebar-toggle,
-  body.pseudo-fullscreen header .left h1 { display:none; }
-  body.pseudo-fullscreen header { padding-top:calc(6px + env(safe-area-inset-top)); padding-bottom:6px; }
-
-  /* Name modal */
-  #name-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
-    z-index:200; align-items:center; justify-content:center; }
-  #name-modal-overlay.show { display:flex; }
-  #name-modal { background:var(--bg); border:1px solid var(--border); border-radius:14px;
-    padding:22px; width:90%; max-width:360px; box-shadow:0 10px 40px rgba(0,0,0,.3); }
-  #name-modal h3 { margin:0 0 6px; font-size:16px; color:var(--text); }
-  #name-modal p { margin:0 0 14px; font-size:12.5px; color:var(--muted); }
-  #name-input { width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px;
-    border:1.5px solid var(--border); background:var(--panel); color:var(--text);
-    font-size:14.5px; outline:none; }
-  #name-input:focus { border-color:var(--accent); }
-  #name-modal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }
-  #name-modal-actions button { padding:8px 14px; border-radius:8px; font-size:13px;
-    cursor:pointer; border:1px solid var(--border); background:none; color:var(--text); }
-  #name-cancel-btn:hover { background:var(--panel); }
-  #name-save-btn { background:var(--accent); color:#fff; border-color:var(--accent); }
-  #name-save-btn:hover { opacity:.9; }
-  #clear-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    font-size:12px; padding:6px 12px; border-radius:6px; cursor:pointer; flex-shrink:0; }
-  #clear-btn:hover { background:var(--panel); }
-
-  /* Settings modal */
-  #settings-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
-    z-index:200; align-items:center; justify-content:center; }
-  #settings-modal { background:var(--bg); border:1px solid var(--border); border-radius:14px;
-    padding:22px; width:92%; max-width:420px; max-height:86vh; overflow-y:auto;
-    box-shadow:0 10px 40px rgba(0,0,0,.3); }
-  #settings-modal h3 { margin:0 0 4px; font-size:17px; color:var(--text); }
-  #settings-modal p.sub { margin:0 0 16px; font-size:12.5px; color:var(--muted); }
-  .settings-section { margin-bottom:16px; }
-  .settings-section label { display:block; font-size:12px; color:var(--muted); margin-bottom:6px; font-weight:600; }
-  .settings-row { display:flex; gap:8px; flex-wrap:wrap; }
-  .settings-choice { flex:1; min-width:80px; padding:8px 10px; border-radius:8px; border:1.5px solid var(--border);
-    background:var(--panel); color:var(--muted); cursor:pointer; font-size:12.5px; font-family:inherit; text-align:center; }
-  .settings-choice:hover { border-color:var(--accent); }
-  #accent-color-input { width:44px; height:34px; border:1.5px solid var(--border); border-radius:8px;
-    background:var(--panel); cursor:pointer; padding:2px; }
-  #font-size-slider { width:100%; accent-color:var(--accent); }
-  #font-size-label { font-size:12px; color:var(--muted); }
-  .settings-select { width:100%; padding:9px 10px; border-radius:8px; border:1.5px solid var(--border);
-    background:var(--panel); color:var(--text); font-size:13px; font-family:inherit; outline:none; }
-  .settings-select:focus { border-color:var(--accent); }
-  #custom-instructions-input { width:100%; box-sizing:border-box; padding:9px 12px; border-radius:8px;
-    border:1.5px solid var(--border); background:var(--panel); color:var(--text);
-    font-size:13px; font-family:inherit; outline:none; resize:vertical; min-height:60px; }
-  #custom-instructions-input:focus { border-color:var(--accent); }
-  #settings-close-btn { width:100%; margin-top:6px; background:var(--accent); color:#fff; border:none;
-    border-radius:10px; padding:11px; font-size:14px; font-weight:700; cursor:pointer; font-family:inherit; }
-  #settings-close-btn:hover { opacity:.9; }
-
-  /* Message bubble density controlled by settings */
-  body.bubble-compact .msg { padding:7px 11px; border-radius:12px; }
-  body.bubble-compact #messages { gap:8px; }
-  body.bubble-comfortable .msg { padding:11px 15px; border-radius:18px; }
-  body.bubble-comfortable #messages { gap:16px; }
-  body.bubble-spacious .msg { padding:16px 20px; border-radius:22px; }
-  body.bubble-spacious #messages { gap:24px; }
-
-  /* Messages */
-  #messages-wrap { flex:1; overflow-y:auto; position:relative; }
-  #messages { padding:24px 20px; display:flex; flex-direction:column; gap:16px;
-    max-width:760px; margin:0 auto; width:100%; min-height:100%; }
-  .msg { max-width:80%; padding:11px 15px; border-radius:18px; line-height:1.6;
-    font-size:var(--msg-font-size); white-space:pre-wrap; word-wrap:break-word; }
-  .msg.user { align-self:flex-end; background:var(--user-bubble); color:var(--user-text);
-    border-bottom-right-radius:4px; }
-  .msg.ai { align-self:flex-start; background:var(--ai-bubble); color:var(--text);
-    border-bottom-left-radius:4px; }
-  .msg.error { align-self:center; background:#fef2f2; border:1px solid #fecaca;
-    color:#dc2626; font-size:13px; border-radius:10px; }
-  .msg img { max-width:100%; border-radius:10px; display:block; margin-top:8px; }
-  .attach-chip { font-size:11.5px; opacity:.75; margin-bottom:4px; }
-
-  /* Message row wraps the bubble + its action buttons (copy / regenerate) */
-  .msg-row { display:flex; flex-direction:column; max-width:80%; }
-  .msg-row.user { align-self:flex-end; align-items:flex-end; }
-  .msg-row.ai { align-self:flex-start; align-items:flex-start; }
-  .msg-row.error { align-self:center; align-items:center; max-width:90%; }
-  .msg-row .msg { max-width:100%; }
-  .msg-actions { display:flex; gap:4px; margin-top:3px; opacity:0; transition:opacity .15s;
-    height:22px; }
-  .msg-row:hover .msg-actions, .msg-row:focus-within .msg-actions { opacity:1; }
-  .msg-actions button { background:none; border:none; color:var(--muted); cursor:pointer;
-    font-size:12px; padding:2px 7px; border-radius:5px; touch-action:manipulation;
-    -webkit-tap-highlight-color:transparent; }
-  .msg-actions button:hover { background:var(--panel); color:var(--text); }
-  .msg-timestamp { font-size:10.5px; color:var(--muted); margin-top:2px; }
-  .empty-state { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
-    text-align:center; color:var(--muted); }
-  .empty-state h2 { font-size:22px; font-weight:700; color:var(--accent); margin-bottom:8px; }
-  .empty-state p { font-size:14px; }
-  .typing { align-self:flex-start; display:flex; gap:5px; padding:14px 16px;
-    background:var(--ai-bubble); border-radius:18px; border-bottom-left-radius:4px; }
-  .typing span { width:7px; height:7px; border-radius:50%; background:var(--muted);
-    animation:blink 1.2s infinite ease-in-out; }
-  .typing span:nth-child(2) { animation-delay:.2s; }
-  .typing span:nth-child(3) { animation-delay:.4s; }
-  @keyframes blink { 0%,80%,100%{opacity:.2} 40%{opacity:1} }
-
-  /* Scroll to bottom */
-  #scroll-btn { position:fixed; bottom:130px; right:24px; width:36px; height:36px;
-    border-radius:50%; background:var(--accent); color:#fff; border:none; cursor:pointer;
-    font-size:18px; display:none; align-items:center; justify-content:center;
-    box-shadow:0 2px 8px rgba(0,0,0,.15); z-index:10; }
-  #scroll-btn.show { display:flex; }
-
-  /* Image preview */
-  .gen-img { max-width:320px; border-radius:12px; display:block; margin-top:8px; }
-
-  /* Input area */
-  #pending-attach { max-width:760px; margin:0 auto; width:100%; padding:6px 20px 0;
-    display:none; align-items:center; gap:8px; font-size:12.5px; color:var(--muted); }
-  #pending-attach.show { display:flex; }
-  #pending-attach button { background:none; border:none; color:var(--muted); cursor:pointer; }
-  .input-area { padding:10px 20px 16px; border-top:1px solid var(--border);
-    background:var(--bg); max-width:760px; margin:0 auto; width:100%; }
-  .input-row { display:flex; gap:8px; align-items:flex-end; background:var(--panel);
-    border:1.5px solid var(--border); border-radius:14px; padding:8px 10px; }
-  .input-row:focus-within { border-color:var(--accent); }
-  .tool-btn { background:none; border:none; color:var(--muted); cursor:pointer;
-    width:36px; height:36px; border-radius:8px; font-size:18px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center;
-    touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
-  .tool-btn:hover { background:var(--accent-dim); color:var(--accent); }
-  .tool-btn.active { color:var(--accent); }
-  textarea { flex:1; resize:none; background:transparent; border:none; color:var(--text);
-    font-size:14.5px; font-family:inherit; line-height:1.4; max-height:140px;
-    outline:none; padding:4px 0; }
-  textarea::placeholder { color:var(--muted); }
-  #send-btn { background:var(--accent); color:#fff; border:none; border-radius:10px;
-    width:36px; height:36px; font-size:18px; cursor:pointer; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center;
-    touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
-  #send-btn:disabled { background:var(--accent-dim); color:var(--muted); cursor:not-allowed; }
-  #send-btn.generating { background:#ef4444; }
-  #send-btn.generating:hover { opacity:.9; }
-  #voice-btn.listening { color:#ef4444; animation:pulse 1s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-
-  /* Speaking indicator */
-  #speaking-indicator { display:none; align-items:center; gap:6px; font-size:12px;
-    color:var(--accent); padding:4px 0; }
-  #speaking-indicator.show { display:flex; }
-  #stop-speak-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    font-size:11px; padding:2px 8px; border-radius:4px; cursor:pointer; }
-  .quick-btn { background:var(--panel); border:1px solid var(--border); color:var(--text);
-    font-size:12.5px; padding:6px 14px; border-radius:20px; cursor:pointer;
-    transition:all .15s ease; white-space:nowrap; font-family:inherit; touch-action:manipulation; }
-  .quick-btn:hover { background:var(--accent-dim); border-color:var(--accent); color:var(--accent); }
-
-  #messages-wrap::-webkit-scrollbar, #conv-list::-webkit-scrollbar { width:6px; }
-  #messages-wrap::-webkit-scrollbar-thumb, #conv-list::-webkit-scrollbar-thumb
-    { background:var(--border); border-radius:4px; }
-  #sidebar-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
-    z-index:99; -webkit-tap-highlight-color:transparent; }
-
-  @media(max-width:768px) {
-    :root { --sidebar-w: 78vw; }
-
-    /* Sidebar slides in as overlay — never pushes content */
-    #sidebar { position:fixed; top:0; left:0; z-index:100; height:100%;
-      height:-webkit-fill-available; width:var(--sidebar-w) !important;
-      transform:translateX(0); transition:transform .25s ease;
-      box-shadow:4px 0 24px rgba(0,0,0,.5); }
-    #sidebar.hidden { transform:translateX(-105%); margin-left:0 !important; }
-
-    /* Show overlay when sidebar open */
-    #sidebar-overlay { display:block; }
-
-    /* Main app always takes full width */
-    .app { width:100% !important; flex:1; }
-
-    header { padding:calc(10px + env(safe-area-inset-top)) 12px 10px; }
-    header h1 { font-size:14px; }
-    #sidebar-toggle { width:38px; height:38px; font-size:14px; }
-    #name-btn { width:38px; height:38px; font-size:14px; }
-    #settings-btn { width:38px; height:38px; font-size:14px; }
-    #export-btn { width:38px; height:38px; font-size:14px; }
-    #vip-btn { width:38px; height:38px; font-size:14px; }
-    #clear-btn { font-size:11px; padding:8px 10px; min-height:38px; }
-    #speak-toggle { font-size:11px; padding:5px 8px; }
-    #fullscreen-btn { width:38px; height:38px; font-size:14px; }
-
-    #messages-wrap { overflow-y:auto; -webkit-overflow-scrolling:touch; }
-    #messages { padding:14px 10px; gap:12px; max-width:100%; }
-    .msg { max-width:90%; font-size:14px; padding:10px 12px; }
-    .msg-row { max-width:90%; }
-    .msg-actions { opacity:1; height:26px; } /* no hover on touch — keep always visible */
-    .msg-actions button { font-size:13px; padding:4px 9px; min-width:30px; min-height:26px; }
-
-    .input-area { padding:8px 10px max(10px,env(safe-area-inset-bottom)); }
-    .input-row { padding:6px 8px; }
-    textarea { font-size:16px; } /* 16px prevents iOS zoom */
-    .tool-btn { width:34px; height:34px; font-size:17px; }
-    #send-btn { width:34px; height:34px; font-size:16px; }
-
-    .empty-state h2 { font-size:19px; }
-    .empty-state p { font-size:13px; }
-    #scroll-btn { bottom:80px; right:12px; width:34px; height:34px; }
-
-    #new-chat-btn { margin:10px; padding:10px 12px; font-size:13.5px; }
-    .conv-item { padding:10px 8px; font-size:13px; min-height:44px; }
-    .conv-item .rename-btn { opacity:1; }
-    .conv-item .del-btn { opacity:1; }
-    #sidebar-footer { font-size:11px; padding:10px 12px; }
-  }
-
-  @media(max-width:380px) {
-    :root { --sidebar-w: 88vw; }
-    .msg { font-size:13.5px; }
-    header h1 { font-size:13px; }
-    #speak-toggle { display:none; }
-  }
+:root {
+  --bg:#1a1a1a; --panel:#2a2a2a; --border:#3a3a3a;
+  --text:#ececec; --muted:#8e8ea0; --accent:#10a37f;
+  --accent-dim:#1a3a30; --sidebar-w:260px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);
+  font-family:'Inter','Noto Sans Devanagari',-apple-system,sans-serif;overflow:hidden}
+.layout{display:flex;height:100vh}
+#sidebar{width:var(--sidebar-w);flex-shrink:0;background:var(--panel);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;transition:transform .25s ease}
+#sidebar.hidden{transform:translateX(-105%)}
+#new-chat-btn{margin:12px;padding:10px 14px;background:var(--accent);color:#fff;border:none;
+  border-radius:8px;font-size:13.5px;font-weight:600;cursor:pointer;text-align:left}
+#new-chat-btn:hover{opacity:.9}
+#conv-list{flex:1;overflow-y:auto;padding:0 8px;display:flex;flex-direction:column;gap:2px}
+.conv-item{display:flex;align-items:center;justify-content:space-between;gap:6px;
+  padding:9px 10px;border-radius:7px;cursor:pointer;font-size:13px;color:var(--muted)}
+.conv-item:hover,.conv-item.active{background:var(--accent-dim);color:var(--accent)}
+.conv-item .title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.conv-item .del-btn{opacity:0;background:none;border:none;color:var(--muted);cursor:pointer;
+  font-size:13px;padding:2px 5px;flex-shrink:0}
+.conv-item:hover .del-btn,.conv-item .del-btn{opacity:1}
+.conv-item .del-btn:hover{color:#ef4444}
+#sidebar-footer{padding:12px;font-size:11px;color:var(--muted);border-top:1px solid var(--border)}
+.app{display:flex;flex-direction:column;height:100vh;flex:1;min-width:0}
+header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;
+  align-items:center;justify-content:space-between;gap:8px;background:var(--bg);
+  padding-top:max(12px,env(safe-area-inset-top))}
+header .left{display:flex;align-items:center;gap:8px;min-width:0}
+header .right{display:flex;align-items:center;gap:6px;flex-shrink:0}
+header h1{font-size:16px;font-weight:700;color:var(--accent);margin:0}
+.hbtn{background:none;border:1px solid var(--border);color:var(--muted);width:36px;height:36px;
+  border-radius:6px;cursor:pointer;font-size:15px;display:flex;align-items:center;
+  justify-content:center;flex-shrink:0;touch-action:manipulation}
+.hbtn:hover{background:var(--panel);color:var(--text)}
+.hbtn.on{color:var(--accent);border-color:var(--accent)}
+#clear-btn:hover{color:#ef4444;border-color:#ef4444}
+#messages-wrap{flex:1;overflow-y:auto;position:relative;-webkit-overflow-scrolling:touch}
+#messages{padding:20px 16px;display:flex;flex-direction:column;gap:14px;
+  max-width:760px;margin:0 auto;width:100%;min-height:100%}
+.msg-row{display:flex;flex-direction:column;max-width:82%}
+.msg-row.user{align-self:flex-end;align-items:flex-end}
+.msg-row.ai{align-self:flex-start;align-items:flex-start}
+.msg-row.error{align-self:center;align-items:center;max-width:90%}
+.msg{padding:10px 14px;border-radius:18px;line-height:1.6;font-size:14.5px;
+  white-space:pre-wrap;word-wrap:break-word;max-width:100%}
+.msg.user{background:var(--panel);color:var(--text);border-bottom-right-radius:4px}
+.msg.ai{background:var(--bg);color:var(--text);border:1px solid var(--border);border-bottom-left-radius:4px}
+.msg.error{background:#fef2f2;border:1px solid #fecaca;color:#dc2626;font-size:13px;border-radius:10px}
+.msg img{max-width:100%;border-radius:10px;display:block;margin-top:8px}
+.attach-chip{font-size:11.5px;opacity:.75;margin-bottom:4px}
+.msg-actions{display:flex;gap:4px;margin-top:3px;opacity:0;transition:opacity .15s;height:24px}
+.msg-row:hover .msg-actions,.msg-row:focus-within .msg-actions{opacity:1}
+.msg-actions button{background:none;border:none;color:var(--muted);cursor:pointer;
+  font-size:12px;padding:3px 8px;border-radius:5px}
+.msg-actions button:hover{background:var(--panel);color:var(--text)}
+.empty-state{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  text-align:center;color:var(--muted);width:90%}
+.empty-state h2{font-size:22px;font-weight:700;color:var(--accent);margin-bottom:8px}
+.typing{align-self:flex-start;display:flex;gap:5px;padding:14px 16px;
+  background:var(--bg);border:1px solid var(--border);border-radius:18px;border-bottom-left-radius:4px}
+.typing span{width:7px;height:7px;border-radius:50%;background:var(--muted);animation:blink 1.2s infinite ease-in-out}
+.typing span:nth-child(2){animation-delay:.2s}
+.typing span:nth-child(3){animation-delay:.4s}
+@keyframes blink{0%,80%,100%{opacity:.2}40%{opacity:1}}
+#scroll-btn{position:fixed;bottom:130px;right:20px;width:36px;height:36px;border-radius:50%;
+  background:var(--accent);color:#fff;border:none;cursor:pointer;font-size:18px;
+  display:none;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,.3);z-index:10}
+#scroll-btn.show{display:flex}
+#pending-attach{max-width:760px;margin:0 auto;width:100%;padding:6px 16px 0;
+  display:none;align-items:center;gap:8px;font-size:12.5px;color:var(--muted)}
+#pending-attach.show{display:flex}
+#pending-attach button{background:none;border:none;color:var(--muted);cursor:pointer}
+#speaking-bar{display:none;align-items:center;gap:8px;font-size:12px;color:var(--accent);
+  padding:4px 16px;max-width:760px;margin:0 auto;width:100%}
+#speaking-bar.show{display:flex}
+#stop-speak-btn{background:none;border:1px solid var(--border);color:var(--muted);
+  font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer}
+#quick-actions{display:flex;gap:6px;padding:6px 16px 0;max-width:760px;
+  margin:0 auto;width:100%;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch}
+#quick-actions::-webkit-scrollbar{display:none}
+.quick-btn{background:var(--panel);border:1px solid var(--border);color:var(--text);
+  font-size:12px;padding:6px 12px;border-radius:20px;cursor:pointer;white-space:nowrap;
+  font-family:inherit;flex-shrink:0}
+.quick-btn:hover{background:var(--accent-dim);border-color:var(--accent);color:var(--accent)}
+.input-wrap{max-width:760px;margin:0 auto;width:100%;padding:8px 16px max(12px,env(safe-area-inset-bottom))}
+.input-row{display:flex;gap:8px;align-items:flex-end;background:var(--panel);
+  border:1.5px solid var(--border);border-radius:14px;padding:8px 10px}
+.input-row:focus-within{border-color:var(--accent)}
+.tool-btn{background:none;border:none;color:var(--muted);cursor:pointer;width:36px;height:36px;
+  border-radius:8px;font-size:18px;flex-shrink:0;display:flex;align-items:center;
+  justify-content:center;touch-action:manipulation}
+.tool-btn:hover{background:var(--accent-dim);color:var(--accent)}
+.tool-btn.listening{color:#ef4444;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+textarea{flex:1;resize:none;background:transparent;border:none;color:var(--text);
+  font-size:14.5px;font-family:inherit;line-height:1.4;max-height:140px;outline:none;padding:4px 0}
+textarea::placeholder{color:var(--muted)}
+#send-btn{background:var(--accent);color:#fff;border:none;border-radius:10px;width:36px;height:36px;
+  cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;touch-action:manipulation}
+#send-btn:disabled{opacity:.4;cursor:not-allowed}
+#send-btn.stop-mode{background:#ef4444}
+#messages-wrap::-webkit-scrollbar,#conv-list::-webkit-scrollbar{width:6px}
+#messages-wrap::-webkit-scrollbar-thumb,#conv-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+#sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:300;
+  align-items:center;justify-content:center;padding:16px}
+.modal-overlay.show{display:flex}
+.modal-box{background:var(--panel);border:1px solid var(--border);border-radius:16px;
+  padding:22px;width:100%;max-width:420px;max-height:90vh;overflow-y:auto}
+.modal-box h3{margin:0 0 6px;font-size:17px}
+.modal-box p{color:var(--muted);font-size:13px;margin:0 0 14px}
+.modal-input{width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);
+  border-radius:10px;padding:10px 12px;font-size:14px;font-family:inherit;outline:none}
+.modal-input:focus{border-color:var(--accent)}
+.modal-btn-row{display:flex;gap:8px;margin-top:12px}
+.btn-primary{flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;
+  padding:10px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit}
+.btn-secondary{flex:1;background:none;border:1px solid var(--border);color:var(--muted);
+  border-radius:8px;padding:10px;font-size:14px;cursor:pointer;font-family:inherit}
+.name-modal{background:var(--bg);border:1px solid var(--border);border-radius:14px;
+  padding:22px;width:90%;max-width:360px}
+@media(max-width:768px){
+  :root{--sidebar-w:80vw}
+  #sidebar{position:fixed;top:0;left:0;z-index:100;height:100%;height:-webkit-fill-available;
+    box-shadow:4px 0 24px rgba(0,0,0,.5)}
+  #sidebar-overlay{display:block}
+  .app{width:100%}
+  header{padding:10px 12px;padding-top:max(10px,env(safe-area-inset-top))}
+  header h1{font-size:14px}
+  .hbtn{width:34px;height:34px;font-size:14px}
+  #messages{padding:12px 10px;gap:12px}
+  .msg{font-size:14px;padding:9px 12px}
+  .msg-row{max-width:92%}
+  .msg-actions{opacity:1;height:28px}
+  .msg-actions button{min-height:28px;padding:4px 10px}
+  textarea{font-size:16px}
+  .tool-btn{width:34px;height:34px;font-size:17px}
+  #send-btn{width:34px;height:34px}
+  #scroll-btn{bottom:100px;right:12px}
+  .input-wrap{padding:6px 10px max(10px,env(safe-area-inset-bottom))}
+}
+@media(max-width:380px){
+  :root{--sidebar-w:90vw}
+  .msg{font-size:13.5px}
+}
 </style>
 </head>
 <body>
 <div class="layout">
-  <div id="sidebar-overlay" style="display:none;position:fixed;inset:0;background:#0007;z-index:99"></div>
-  <div id="sidebar">
+  <div id="sidebar-overlay"></div>
+  <div id="sidebar" class="hidden">
     <button id="new-chat-btn">+ New chat</button>
     <div id="conv-list"></div>
-    <div id="sidebar-footer">Ꮇʏᴛʜɪᴄ ᴀɪ &middot; by Aarav Singh</div>
+    <div id="sidebar-footer">Mythic AI &middot; by Aarav Singh</div>
   </div>
   <div class="app">
     <header>
       <div class="left">
-        <button id="sidebar-toggle" title="Toggle sidebar">☰</button>
-        <h1>Ꮇʏᴛʜɪᴄ ᴀɪ</h1>
+        <button class="hbtn" id="sidebar-toggle">☰</button>
+        <h1>Mythic AI</h1>
+        <select id="model-sel" title="Select model" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:4px 8px;font-size:12px;cursor:pointer;outline:none;max-width:110px;font-family:inherit">
+          <option value="mythic-1">Mythic 1</option>
+          <option value="mythic-2" selected>Mythic 2</option>
+          <option value="mythic-pro">Mythic Pro</option>
+          <option value="mythic-vip">Mythic VIP 🔒</option>
+        </select>
       </div>
       <div class="right">
-        <button id="vip-btn" title="Mythic VIP">✨</button>
-        <button id="fullscreen-btn" type="button" title="Fullscreen">
-          <span id="fullscreen-icon">⛶</span>
-        </button>
-        <button id="name-btn" title="What should Ꮇʏᴛʜɪᴄ ᴀɪ call you?">🙂</button>
-        <button id="settings-btn" title="Settings">⚙</button>
-        <button id="export-btn" title="Export this chat">⬇</button>
-        <button id="clear-btn">Delete chat</button>
+        <button class="hbtn" id="speak-toggle" title="Toggle voice">🔇</button>
+        <button class="hbtn" id="settings-btn" title="Settings">⚙️</button>
+        <button class="hbtn" id="fs-btn" title="Fullscreen">⛶</button>
+        <button class="hbtn" id="name-btn" title="Your name">🙂</button>
+        <button class="hbtn" id="export-btn" title="Export">⬇</button>
+        <button class="hbtn" id="clear-btn" title="Delete chat">🗑</button>
       </div>
     </header>
-
     <div id="messages-wrap">
       <div id="messages">
         <div class="empty-state" id="empty-state">
-          <h2>Ꮇʏᴛʜɪᴄ ᴀɪ</h2>
+          <h2>Mythic AI</h2>
           <p>Ask me anything, generate images, or just chat 👋</p>
         </div>
       </div>
     </div>
-
-    <button id="scroll-btn" title="Scroll to bottom">↓</button>
-
-    <div id="pending-attach">
-      📎 <span id="pending-attach-name"></span>
-      <button id="pending-attach-remove">✕</button>
-    </div>
-
-    <div id="speaking-indicator">
-      🔊 Speaking...
-      <button id="stop-speak-btn">Stop</button>
-    </div>
-
-    <!-- Quick action buttons -->
-    <div id="quick-actions" style="display:flex;gap:8px;padding:6px 20px 0;max-width:760px;margin:0 auto;width:100%;flex-wrap:wrap;">
-      <button class="quick-btn" id="img-gen-btn">🎨 Image</button>
+    <button id="scroll-btn">↓</button>
+    <div id="pending-attach">📎 <span id="pa-name"></span><button id="pa-remove">✕</button></div>
+    <div id="speaking-bar">🔊 Speaking... <button id="stop-speak-btn">Stop</button></div>
+    <div id="quick-actions">
+      <button class="quick-btn" id="img-btn">🎨 Image</button>
       <button class="quick-btn" id="ghibli-btn">🌿 Ghibli Me</button>
-      <button class="quick-btn" id="homework-btn">📚 Homework</button>
+      <button class="quick-btn" id="hw-btn">📚 Homework</button>
       <button class="quick-btn" id="weather-btn">🌤 Weather</button>
       <button class="quick-btn" id="search-btn">🔍 Search</button>
+      <button class="quick-btn" id="news-btn">📰 News</button>
     </div>
+    <div class="input-wrap">
       <form id="chat-form">
         <div class="input-row">
-          <!-- Attach file -->
           <input type="file" id="file-input" accept="image/*,.txt,.md,.csv,.json,.pdf" style="display:none">
-          <button class="tool-btn" id="attach-btn" type="button" title="Attach file">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-            </svg>
+          <button class="tool-btn" id="attach-btn" type="button" title="Attach">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
           </button>
-          <!-- Camera -->
           <input type="file" id="camera-input" accept="image/*" capture="environment" style="display:none">
-          <button class="tool-btn" id="camera-btn" type="button" title="Take photo">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-              <circle cx="12" cy="13" r="4"/>
-            </svg>
+          <input type="file" id="selfie-input" accept="image/*" capture="user" style="display:none">
+          <button class="tool-btn" id="camera-btn" type="button" title="Camera">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
           </button>
-          <textarea id="input" rows="1" placeholder="Message Ꮇʏᴛʜɪᴄ ᴀɪ..."></textarea>
-          <!-- Voice input -->
-          <button class="tool-btn" id="voice-btn" type="button" title="Voice input">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-              <line x1="12" y1="19" x2="12" y2="23"/>
-              <line x1="8" y1="23" x2="16" y2="23"/>
-            </svg>
+          <button class="tool-btn" id="selfie-btn" type="button" title="Selfie">🤳</button>
+          <textarea id="input" rows="1" placeholder="Message Mythic AI..."></textarea>
+          <button class="tool-btn" id="voice-btn" type="button" title="Voice">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
           </button>
-          <button id="send-btn" type="submit" title="Send">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
-            </svg>
+          <button id="send-btn" type="submit">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
           </button>
         </div>
       </form>
@@ -795,2193 +393,741 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<div id="name-modal-overlay">
-  <div id="name-modal">
-    <h3>What should Ꮇʏᴛʜɪᴄ ᴀɪ call you?</h3>
-    <p>Enter your preferred name — Ꮇʏᴛʜɪᴄ ᴀɪ will use it when it talks to you.</p>
-    <input type="text" id="name-input" maxlength="60" placeholder="e.g. Aarav" autocomplete="off">
-    <div id="name-modal-actions">
-      <button id="name-cancel-btn" type="button">Cancel</button>
-      <button id="name-save-btn" type="button">Save</button>
+<!-- Name modal -->
+<div class="modal-overlay" id="name-modal">
+  <div class="name-modal">
+    <h3 style="margin:0 0 6px;font-size:16px;">What should Mythic AI call you?</h3>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 14px;">Your name will be used in conversation.</p>
+    <input class="modal-input" type="text" id="name-input" maxlength="60" placeholder="e.g. Aarav" autocomplete="off">
+    <div class="modal-btn-row">
+      <button class="btn-secondary" id="name-cancel">Cancel</button>
+      <button class="btn-primary" id="name-save">Save</button>
     </div>
   </div>
 </div>
 
-<!-- Settings Modal -->
-<div id="settings-modal-overlay">
-  <div id="settings-modal">
-    <h3>Settings</h3>
-    <p class="sub">Customize how Ꮇʏᴛʜɪᴄ ᴀɪ looks and replies. Saved on this device.</p>
-
-    <div class="settings-section">
-      <label>Theme</label>
-      <div class="settings-row">
-        <button class="settings-choice" data-group="theme" data-value="dark">🌙 Dark</button>
-        <button class="settings-choice" data-group="theme" data-value="light">☀️ Light</button>
-        <button class="settings-choice" data-group="theme" data-value="system">🖥 System</button>
-      </div>
+<!-- Image modal -->
+<div class="modal-overlay" id="img-modal">
+  <div class="modal-box">
+    <h3>🎨 Generate Image</h3>
+    <p>Describe what you want to create</p>
+    <select class="modal-input" id="img-style" style="margin-bottom:10px;cursor:pointer">
+      <option value="">✨ Auto</option>
+      <option value="ghibli">🌿 Studio Ghibli</option>
+      <option value="anime">🎌 Anime</option>
+      <option value="realistic">📷 Realistic</option>
+      <option value="oil painting">🖼 Oil Painting</option>
+      <option value="watercolor">🎨 Watercolor</option>
+      <option value="3d render">🧊 3D Render</option>
+      <option value="cartoon">🐱 Cartoon</option>
+    </select>
+    <textarea class="modal-input" id="img-prompt" rows="3" placeholder="e.g. A sunset over mountains..." style="margin-bottom:10px;resize:none"></textarea>
+    <div id="img-result" style="display:none;text-align:center;margin-bottom:10px">
+      <img id="img-out" style="max-width:100%;border-radius:10px">
     </div>
-
-    <div class="settings-section">
-      <label>Accent color</label>
-      <input type="color" id="accent-color-input" value="#10a37f">
-    </div>
-
-    <div class="settings-section">
-      <label>Font size — <span id="font-size-label">14.5px</span></label>
-      <input type="range" id="font-size-slider" min="12" max="20" step="0.5" value="14.5">
-    </div>
-
-    <div class="settings-section">
-      <label>Bubble spacing</label>
-      <div class="settings-row">
-        <button class="settings-choice" data-group="bubble" data-value="compact">Compact</button>
-        <button class="settings-choice" data-group="bubble" data-value="comfortable">Comfortable</button>
-        <button class="settings-choice" data-group="bubble" data-value="spacious">Spacious</button>
-      </div>
-    </div>
-
-    <div class="settings-section">
-      <label>Reply tone</label>
-      <select id="tone-select" class="settings-select">
-        <option value="default">Default</option>
-        <option value="formal">Formal</option>
-        <option value="casual">Casual</option>
-        <option value="funny">Funny</option>
-        <option value="professional">Professional</option>
-      </select>
-    </div>
-
-    <div class="settings-section">
-      <label>Reply length</label>
-      <select id="length-select" class="settings-select">
-        <option value="default">Default</option>
-        <option value="short">Short</option>
-        <option value="medium">Medium</option>
-        <option value="long">Long</option>
-      </select>
-    </div>
-
-    <div class="settings-section">
-      <label>Custom instructions</label>
-      <textarea id="custom-instructions-input" placeholder="e.g. Always answer in bullet points"></textarea>
-    </div>
-
-    <button id="settings-close-btn" type="button">Done</button>
-  </div>
-</div>
-
-<!-- Ghibli Selfie Modal -->
-<div id="ghibli-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:300;align-items:center;justify-content:center;">
-  <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:440px;max-height:90vh;overflow-y:auto;">
-    <h3 style="margin:0 0 4px;font-size:18px;">🌿 Ghibli Me</h3>
-    <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Upload your photo and get a Studio Ghibli-style version of yourself</p>
-
-    <!-- Upload area -->
-    <div id="ghibli-upload-area" style="border:2px dashed var(--border);border-radius:12px;padding:24px;text-align:center;cursor:pointer;margin-bottom:12px;transition:border-color .2s;">
-      <div style="font-size:36px;margin-bottom:8px;">📸</div>
-      <div style="font-size:13px;color:var(--muted);">Click to upload your photo<br><span style="font-size:11px;">or drag & drop</span></div>
-      <input type="file" id="ghibli-file-input" accept="image/*" style="display:none">
-    </div>
-
-    <!-- Preview -->
-    <div id="ghibli-preview-wrap" style="display:none;margin-bottom:12px;text-align:center;">
-      <img id="ghibli-preview" style="max-width:100%;max-height:180px;border-radius:10px;border:2px solid var(--accent);">
-      <div style="font-size:11px;color:var(--muted);margin-top:4px;">Your photo ✓</div>
-    </div>
-
-    <!-- Style options -->
-    <div style="margin-bottom:12px;">
-      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Ghibli Style:</label>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
-        <button class="ghibli-style-btn" data-style="Studio Ghibli portrait, Spirited Away style, soft watercolor anime art" style="padding:8px;border-radius:8px;border:1.5px solid var(--accent);background:var(--accent-dim);color:var(--accent);cursor:pointer;font-size:12px;font-family:inherit;">🌊 Spirited Away</button>
-        <button class="ghibli-style-btn" data-style="Studio Ghibli portrait, My Neighbor Totoro style, soft forest anime art" style="padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--muted);cursor:pointer;font-size:12px;font-family:inherit;">🌳 Totoro Forest</button>
-        <button class="ghibli-style-btn" data-style="Studio Ghibli portrait, Howl's Moving Castle style, fantasy anime art" style="padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--muted);cursor:pointer;font-size:12px;font-family:inherit;">🏰 Howl's Castle</button>
-        <button class="ghibli-style-btn" data-style="Studio Ghibli portrait, Princess Mononoke style, nature anime art" style="padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--muted);cursor:pointer;font-size:12px;font-family:inherit;">🐺 Mononoke</button>
-      </div>
-    </div>
-
-    <!-- Extra prompt -->
-    <input id="ghibli-extra" type="text" placeholder="Add details (optional): e.g. forest background, sunset..."
-      style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:12px;font-family:inherit;">
-
-    <!-- Result -->
-    <div id="ghibli-result-wrap" style="display:none;margin-bottom:12px;text-align:center;">
-      <img id="ghibli-result" style="max-width:100%;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.4);">
-      <button id="ghibli-download-btn" style="margin-top:8px;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:8px 18px;font-size:13px;cursor:pointer;font-family:inherit;">⬇ Download</button>
-    </div>
-    <div id="ghibli-loading" style="display:none;text-align:center;padding:20px;">
-      <div style="font-size:32px;margin-bottom:8px;">🎨</div>
-      <div style="color:var(--muted);font-size:13px;">Creating your Ghibli portrait...<br><span style="font-size:11px;">This can take up to a minute or two</span></div>
-    </div>
-    <div id="ghibli-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px;background:#fef2f2;border-radius:6px;"></div>
-
-    <div style="display:flex;gap:8px;">
-      <button id="ghibli-generate-btn" style="flex:1;background:linear-gradient(135deg,#10a37f,#0d7a5f);color:#fff;border:none;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">✨ Create Ghibli Art</button>
-      <button id="ghibli-close-btn" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:12px 16px;font-size:14px;cursor:pointer;">✕</button>
+    <div id="img-loading" style="display:none;text-align:center;padding:16px;color:var(--muted)">⏳ Generating... (15-30 seconds)</div>
+    <div id="img-err" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px"></div>
+    <div class="modal-btn-row">
+      <button class="btn-primary" id="img-go">Generate</button>
+      <button class="btn-secondary" id="img-close">Close</button>
     </div>
   </div>
 </div>
 
-<!-- ─── IMAGE GENERATION MODAL ─────────────────────────────────────────────── -->
-<div id="img-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:300;align-items:center;justify-content:center;">
-  <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:440px;max-height:90vh;overflow-y:auto;">
-    <h3 style="margin:0 0 4px;font-size:18px;">🎨 Generate Image</h3>
-    <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Describe what you want to see</p>
-
-    <textarea id="img-prompt" rows="3" placeholder="e.g. a cozy cabin in a snowy forest, golden hour lighting"
-      style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:13px;outline:none;margin-bottom:12px;font-family:inherit;resize:vertical;"></textarea>
-
-    <div style="margin-bottom:14px;">
-      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Style (optional):</label>
-      <select id="img-style" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;outline:none;font-family:inherit;">
-        <option value="">✨ Auto (recommended)</option>
-        <option value="photorealistic, hyperrealistic DSLR photography, 8K resolution, cinematic">📸 Photorealistic</option>
-        <option value="professional book cover design, award-winning layout, elegant typography">📚 Book Cover</option>
-        <option value="Studio Ghibli anime style, soft watercolor, vibrant colors, beautiful">🌿 Anime / Ghibli</option>
-        <option value="digital painting, fantasy concept art, epic lighting, deviantart">🎭 Fantasy Art</option>
-        <option value="watercolor painting, soft pastel, dreamy, artistic brushstrokes">🖌 Watercolor</option>
-        <option value="3D render, Octane render, ultra realistic, physically based rendering">🧊 3D Render</option>
-        <option value="flat vector illustration, minimalist, clean lines, modern design">📐 Minimalist / Vector</option>
-        <option value="oil painting, impressionist, rich textures, museum quality">🖼 Oil Painting</option>
-        <option value="cinematic film still, dramatic lighting, movie poster quality, 35mm">🎬 Cinematic</option>
-        <option value="pixel art, retro 8-bit style, vibrant palette, game art">🕹 Pixel Art</option>
-        <option value="pencil sketch, detailed graphite drawing, fine art, black and white">✏️ Pencil Sketch</option>
-        <option value="logo design, professional brand identity, clean, scalable vector">🏷 Logo / Brand</option>
-      </select>
+<!-- Ghibli Me modal -->
+<div class="modal-overlay" id="ghibli-modal">
+  <div class="modal-box">
+    <h3>🌿 Ghibli Me</h3>
+    <p>Upload your photo and get a Studio Ghibli version of yourself</p>
+    <div id="ghibli-upload" style="border:2px dashed var(--border);border-radius:12px;padding:20px;text-align:center;cursor:pointer;margin-bottom:10px">
+      <div style="font-size:32px;margin-bottom:6px">📸</div>
+      <div style="font-size:13px;color:var(--muted)">Click to upload your photo</div>
+      <input type="file" id="ghibli-file" accept="image/*" style="display:none">
     </div>
-
-    <div id="img-loading" style="display:none;text-align:center;padding:20px;">
-      <div style="font-size:32px;margin-bottom:8px;">🎨</div>
-      <div style="color:var(--muted);font-size:13px;">Generating your image...<br>
-        <span style="font-size:11px;opacity:.7;">Auto-enhancing your prompt for best quality</span>
-      </div>
+    <div id="ghibli-preview-wrap" style="display:none;text-align:center;margin-bottom:10px">
+      <img id="ghibli-preview" style="max-height:160px;border-radius:10px;border:2px solid var(--accent)">
     </div>
-    <div id="img-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px;background:#fef2f2;border-radius:6px;"></div>
-
-    <div id="img-result" style="display:none;margin-bottom:12px;text-align:center;">
-      <img id="img-output" style="max-width:100%;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.4);cursor:zoom-in;">
-      <div style="display:flex;gap:8px;margin-top:8px;">
-        <button id="img-download-btn" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:8px;font-size:13px;cursor:pointer;font-family:inherit;">⬇ Download</button>
-        <button id="img-copy-btn" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:8px;font-size:13px;cursor:pointer;font-family:inherit;">📋 Copy</button>
-        <button id="img-fullscreen-btn" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:8px;font-size:13px;cursor:pointer;font-family:inherit;">⛶ View</button>
-      </div>
+    <input class="modal-input" type="text" id="ghibli-extra" placeholder="Extra details (optional)..." style="margin-bottom:10px">
+    <div id="ghibli-result-wrap" style="display:none;text-align:center;margin-bottom:10px">
+      <img id="ghibli-result" style="max-width:100%;border-radius:12px">
+      <button id="ghibli-dl" style="margin-top:8px;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:8px 18px;font-size:13px;cursor:pointer">⬇ Download</button>
     </div>
-
-    <div style="display:flex;gap:8px;">
-      <button id="img-generate-btn" style="flex:1;background:linear-gradient(135deg,#10a37f,#0d7a5f);color:#fff;border:none;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">✨ Generate</button>
-      <button id="img-close-btn" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:12px 16px;font-size:14px;cursor:pointer;">✕</button>
+    <div id="ghibli-loading" style="display:none;text-align:center;padding:16px;color:var(--muted)">🎨 Creating your Ghibli portrait...</div>
+    <div id="ghibli-err" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px;background:#fef2f2;border-radius:6px"></div>
+    <div class="modal-btn-row">
+      <button class="btn-primary" id="ghibli-go">✨ Create</button>
+      <button class="btn-secondary" id="ghibli-close">Close</button>
     </div>
   </div>
 </div>
 
-<!-- Fullscreen image viewer (for the "View" button in the image modal) -->
-<div id="img-viewer-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:400;align-items:center;justify-content:center;cursor:zoom-out;">
-  <img id="img-viewer-img" style="max-width:94%;max-height:94%;border-radius:8px;">
-</div>
-
-<!-- ─── WEATHER MODAL ───────────────────────────────────────────────────────── -->
-<div id="weather-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:300;align-items:center;justify-content:center;">
-  <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:460px;max-height:90vh;overflow-y:auto;">
-    <h3 style="margin:0 0 4px;font-size:18px;">🌤 Weather</h3>
-    <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Search any city, or use your current location</p>
-
-    <div style="display:flex;gap:8px;margin-bottom:12px;">
-      <input id="weather-city" type="text" placeholder="Search city or place..." autocomplete="off"
-        style="flex:1;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:13px;outline:none;font-family:inherit;">
-      <button id="weather-search-btn" style="background:var(--accent);color:#fff;border:none;border-radius:8px;padding:0 14px;font-size:14px;cursor:pointer;">🔍</button>
-      <button id="weather-location-btn" title="Use my location" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:0 12px;font-size:14px;cursor:pointer;">📍</button>
+<!-- Weather modal -->
+<div class="modal-overlay" id="weather-modal">
+  <div class="modal-box">
+    <h3>🌤 Weather Forecast</h3>
+    <p>Enter city name or use your location</p>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <input class="modal-input" type="text" id="weather-city" placeholder="e.g. Delhi, Mumbai..." style="flex:1">
+      <button id="weather-loc-btn" style="background:var(--panel);border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:8px 12px;font-size:18px;cursor:pointer">📍</button>
     </div>
-
-    <div id="weather-loading" style="display:none;text-align:center;padding:20px;">
-      <div style="font-size:32px;margin-bottom:8px;">🌍</div>
-      <div style="color:var(--muted);font-size:13px;">Fetching weather...</div>
-    </div>
-    <div id="weather-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px;background:#fef2f2;border-radius:6px;"></div>
-
-    <div id="weather-result" style="display:none;">
-      <div id="weather-content"></div>
-    </div>
-
-    <div style="display:flex;justify-content:flex-end;margin-top:14px;">
-      <button id="weather-close-btn" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:10px 16px;font-size:14px;cursor:pointer;">Close</button>
+    <div id="weather-result" style="display:none;background:var(--bg);border-radius:12px;padding:14px;margin-bottom:10px"></div>
+    <div id="weather-loading" style="display:none;text-align:center;padding:14px;color:var(--muted)">⏳ Fetching weather...</div>
+    <div id="weather-err" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px"></div>
+    <div class="modal-btn-row">
+      <button class="btn-primary" id="weather-go">Get Weather</button>
+      <button class="btn-secondary" id="weather-close">Close</button>
     </div>
   </div>
 </div>
 
 <script>
-const messagesWrap = document.getElementById('messages-wrap');
-const messagesEl   = document.getElementById('messages');
-const form         = document.getElementById('chat-form');
-const input        = document.getElementById('input');
-const sendBtn      = document.getElementById('send-btn');
-const clearBtn     = document.getElementById('clear-btn');
-const convListEl   = document.getElementById('conv-list');
-const newChatBtn   = document.getElementById('new-chat-btn');
-const sidebarToggle= document.getElementById('sidebar-toggle');
-const fullscreenBtn= document.getElementById('fullscreen-btn');
-const nameBtn       = document.getElementById('name-btn');
-const vipBtn        = document.getElementById('vip-btn');
+const $ = id => document.getElementById(id);
+const wrap    = $('messages-wrap');
+const msgs    = $('messages');
+const form    = $('chat-form');
+const inp     = $('input');
+const sendBtn = $('send-btn');
+const sidebar = $('sidebar');
+const overlay = $('sidebar-overlay');
 
-let selectedModel = 'mythic-2';
-let vipUnlocked   = false;
+let activeId = null, pendingFile = null, isGen = false, abortCtrl = null;
+let voiceOn = false, recognition = null;
 
-function updateVipBtn() {
-  vipBtn.textContent = vipUnlocked && selectedModel === 'mythic-vip' ? '✨' : (vipUnlocked ? '✨' : '🔒');
-  vipBtn.classList.toggle('active', selectedModel === 'mythic-vip');
-  vipBtn.title = vipUnlocked
-    ? (selectedModel === 'mythic-vip' ? 'Mythic VIP active — click to switch back' : 'Switch to Mythic VIP')
-    : 'Unlock Mythic VIP';
-}
+function resize() { inp.style.height='auto'; inp.style.height=Math.min(inp.scrollHeight,140)+'px'; }
+function getUserName() { return localStorage.getItem('mythic_name')||''; }
+function setUserName(n) { n ? localStorage.setItem('mythic_name',n) : localStorage.removeItem('mythic_name'); }
+function isMobile() { return window.innerWidth<=768; }
 
-function showVipModal() {
-  const existing = document.getElementById('vip-modal-overlay');
-  if (existing) { existing.style.display = 'flex'; return; }
-  const overlay = document.createElement('div');
-  overlay.id = 'vip-modal-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;display:flex;align-items:center;justify-content:center;';
-  overlay.innerHTML = `<div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:340px;">
-    <div style="font-size:22px;margin-bottom:6px;">🔒 VIP Access</div>
-    <div style="color:var(--muted);font-size:13px;margin-bottom:16px;">Mythic VIP is for VIP users only.</div>
-    <input id="vip-pw-in" type="password" placeholder="VIP password" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;margin-bottom:8px;font-family:inherit;">
-    <div id="vip-pw-err" style="color:#ef4444;font-size:12px;display:none;margin-bottom:8px;">Wrong password.</div>
-    <div style="display:flex;gap:8px;">
-      <button id="vip-pw-ok" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Unlock</button>
-      <button id="vip-pw-cancel" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px;font-size:14px;cursor:pointer;">Cancel</button>
-    </div></div>`;
-  document.body.appendChild(overlay);
-  const pwIn = overlay.querySelector('#vip-pw-in'), pwErr = overlay.querySelector('#vip-pw-err');
-  pwIn.focus();
-  overlay.querySelector('#vip-pw-cancel').addEventListener('click', () => {
-    overlay.style.display = 'none';
-  });
-  overlay.querySelector('#vip-pw-ok').addEventListener('click', async () => {
-    try {
-      const r = await fetch('/api/vip-unlock', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: pwIn.value.trim() })
-      });
-      const d = await r.json();
-      if (d.success) {
-        vipUnlocked = true;
-        overlay.style.display = 'none';
-        selectedModel = 'mythic-vip';
-        updateVipBtn();
-      } else {
-        pwErr.style.display = 'block'; pwIn.value = ''; pwIn.focus();
-      }
-    } catch {
-      pwErr.textContent = 'Network error — try again.';
-      pwErr.style.display = 'block';
-    }
-  });
-  pwIn.addEventListener('keydown', e => { if (e.key === 'Enter') overlay.querySelector('#vip-pw-ok').click(); });
-}
+// Sidebar
+function openSb() { sidebar.classList.remove('hidden'); if(isMobile()) overlay.style.display='block'; }
+function closeSb() { sidebar.classList.add('hidden'); overlay.style.display='none'; }
+$('sidebar-toggle').addEventListener('click', ()=> sidebar.classList.contains('hidden') ? openSb() : closeSb());
+overlay.addEventListener('click', closeSb);
 
-// Pull default model + VIP status from the backend (provider itself is chosen
-// automatically server-side — this only tracks the VIP-tier flag)
-(async () => {
-  try {
-    const [mr, vr] = await Promise.all([
-      fetch('/api/models').then(r => r.json()),
-      fetch('/api/vip-status').then(r => r.json()),
-    ]);
-    vipUnlocked = !!vr.vip;
-    if (mr && mr.default) selectedModel = mr.default;
-  } catch {
-    // Backend didn't respond — defaults above still work fine.
-  }
-  updateVipBtn();
-})();
-
-vipBtn.addEventListener('click', () => {
-  if (!vipUnlocked) { showVipModal(); return; }
-  selectedModel = selectedModel === 'mythic-vip' ? 'mythic-2' : 'mythic-vip';
-  updateVipBtn();
+// Scroll
+wrap.addEventListener('scroll', ()=>{
+  const near = wrap.scrollHeight-wrap.scrollTop-wrap.clientHeight < 120;
+  $('scroll-btn').classList.toggle('show', !near);
 });
+$('scroll-btn').addEventListener('click', ()=> wrap.scrollTo({top:wrap.scrollHeight,behavior:'smooth'}));
+function scrollBottom() { requestAnimationFrame(()=> wrap.scrollTo({top:wrap.scrollHeight,behavior:'smooth'})); }
 
-const nameModalOverlay = document.getElementById('name-modal-overlay');
-const nameInput     = document.getElementById('name-input');
-const nameCancelBtn = document.getElementById('name-cancel-btn');
-const nameSaveBtn   = document.getElementById('name-save-btn');
-const exportBtn     = document.getElementById('export-btn');
-const sidebar      = document.getElementById('sidebar');
-const fileInput    = document.getElementById('file-input');
-const attachBtn    = document.getElementById('attach-btn');
-const cameraInput  = document.getElementById('camera-input');
-const cameraBtn    = document.getElementById('camera-btn');
-const voiceBtn     = document.getElementById('voice-btn');
-const pendingAttach= document.getElementById('pending-attach');
-const pendingName  = document.getElementById('pending-attach-name');
-const pendingRemove= document.getElementById('pending-attach-remove');
-const scrollBtn    = document.getElementById('scroll-btn');
-const speakingIndicator = document.getElementById('speaking-indicator');
-const stopSpeakBtn = document.getElementById('stop-speak-btn');
+function clearEmpty() { const e=$('empty-state'); if(e) e.remove(); }
+function showEmpty() { msgs.innerHTML='<div class="empty-state" id="empty-state"><h2>Mythic AI</h2><p>Ask me anything, generate images, or just chat 👋</p></div>'; }
 
-let activeConvId = null;
-let pendingFile  = null;
-let recognition  = null;
-let currentUtterance = null;
-
-// --- Scroll button ---
-messagesWrap.addEventListener('scroll', () => {
-  const nearBottom = messagesWrap.scrollHeight - messagesWrap.scrollTop - messagesWrap.clientHeight < 120;
-  scrollBtn.classList.toggle('show', !nearBottom);
-});
-scrollBtn.addEventListener('click', () => {
-  messagesWrap.scrollTo({ top: messagesWrap.scrollHeight, behavior: 'smooth' });
-});
-function scrollToBottom() {
-  requestAnimationFrame(() => {
-    messagesWrap.scrollTo({ top: messagesWrap.scrollHeight, behavior: 'smooth' });
-  });
-}
-
-function clearEmptyState() {
-  const es = document.getElementById('empty-state');
-  if (es) es.remove();
-}
-function showEmptyState() {
-  messagesEl.innerHTML = '<div class="empty-state" id="empty-state"><h2>Ꮇʏᴛʜɪᴄ ᴀɪ</h2><p>Ask me anything, generate images, or just chat 👋</p></div>';
-}
-
-let addMessage = function(role, text, attachment) {
-  clearEmptyState();
-  const row = document.createElement('div');
-  row.className = 'msg-row ' + role;
-
-  const div = document.createElement('div');
-  div.className = 'msg ' + role;
-  if (attachment) {
-    const chip = document.createElement('div');
-    chip.className = 'attach-chip';
-    chip.textContent = '📎 ' + attachment.name;
-    div.appendChild(chip);
-    if (attachment.mimeType && attachment.mimeType.startsWith('image/') && attachment.dataBase64) {
-      const img = document.createElement('img');
-      img.src = 'data:' + attachment.mimeType + ';base64,' + attachment.dataBase64;
-      div.appendChild(img);
+function addMsg(role, text, attach) {
+  clearEmpty();
+  const row = document.createElement('div'); row.className='msg-row '+role;
+  const bubble = document.createElement('div'); bubble.className='msg '+role;
+  if(attach) {
+    const chip=document.createElement('div'); chip.className='attach-chip'; chip.textContent='📎 '+attach.name; bubble.appendChild(chip);
+    if(attach.mimeType&&attach.mimeType.startsWith('image/')&&attach.dataBase64) {
+      const img=document.createElement('img'); img.src='data:'+attach.mimeType+';base64,'+attach.dataBase64; bubble.appendChild(img);
     }
   }
-  const textNode = document.createElement('div');
-  textNode.className = 'msg-text';
-  textNode.textContent = text;
-  div.appendChild(textNode);
-  row.appendChild(div);
-
-  if (role === 'user' || role === 'ai') {
-    row.appendChild(buildMsgActions(row, textNode, role));
+  const tn=document.createElement('div'); tn.className='msg-text'; tn.textContent=text; bubble.appendChild(tn); row.appendChild(bubble);
+  if(role==='user'||role==='ai') {
+    const acts=document.createElement('div'); acts.className='msg-actions';
+    const cpBtn=document.createElement('button'); cpBtn.textContent='📋'; cpBtn.title='Copy';
+    cpBtn.addEventListener('click', async()=>{
+      try { await navigator.clipboard.writeText(tn.textContent); } catch { const t=document.createElement('textarea'); t.value=tn.textContent; document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove(); }
+      const o=cpBtn.textContent; cpBtn.textContent='✓'; setTimeout(()=>cpBtn.textContent=o,1200);
+    }); acts.appendChild(cpBtn);
+    if(role==='ai') { const rg=document.createElement('button'); rg.textContent='↻'; rg.title='Regenerate'; rg.addEventListener('click',()=>{ if(!isGen){row.remove();streamReply({regenerate:true});} }); acts.appendChild(rg); }
+    row.appendChild(acts);
   }
-
-  messagesEl.appendChild(row);
-  scrollToBottom();
-  return textNode;
-};
-
-let buildMsgActions = function(row, textNode, role) {
-  const actions = document.createElement('div');
-  actions.className = 'msg-actions';
-
-  const copyBtn = document.createElement('button');
-  copyBtn.type = 'button';
-  copyBtn.className = 'copy-btn';
-  copyBtn.title = 'Copy';
-  copyBtn.textContent = '📋';
-  copyBtn.addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText(textNode.textContent);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = textNode.textContent;
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand('copy'); } catch {}
-      ta.remove();
-    }
-    const orig = copyBtn.textContent;
-    copyBtn.textContent = '✓';
-    setTimeout(() => { copyBtn.textContent = orig; }, 1200);
-  });
-  actions.appendChild(copyBtn);
-
-  if (role === 'ai') {
-    const regenBtn = document.createElement('button');
-    regenBtn.type = 'button';
-    regenBtn.className = 'regen-btn';
-    regenBtn.title = 'Regenerate response';
-    regenBtn.textContent = '↻';
-    regenBtn.addEventListener('click', () => regenerateLast(row));
-    actions.appendChild(regenBtn);
-  }
-  return actions;
-};
-
-function addImageMessage(role, base64, caption) {
-  clearEmptyState();
-  const div = document.createElement('div');
-  div.className = 'msg ' + role;
-  if (caption) {
-    const cap = document.createElement('div');
-    cap.textContent = caption;
-    cap.style.marginBottom = '8px';
-    div.appendChild(cap);
-  }
-  const img = document.createElement('img');
-  img.className = 'gen-img';
-  img.src = 'data:image/png;base64,' + base64;
-  div.appendChild(img);
-  messagesEl.appendChild(div);
-  scrollToBottom();
+  msgs.appendChild(row); scrollBottom(); return tn;
 }
 
-function showTyping() {
-  const div = document.createElement('div');
-  div.className = 'typing'; div.id = 'typing-indicator';
-  div.innerHTML = '<span></span><span></span><span></span>';
-  messagesEl.appendChild(div);
-  scrollToBottom();
-}
-function hideTyping() {
-  const el = document.getElementById('typing-indicator');
-  if (el) el.remove();
-}
+function showTyping() { const d=document.createElement('div'); d.className='typing'; d.id='typ'; d.innerHTML='<span></span><span></span><span></span>'; msgs.appendChild(d); scrollBottom(); }
+function hideTyping() { const e=$('typ'); if(e) e.remove(); }
 
-// --- Text-to-speech ---
+// Voice output
+function isHindi(t) { return /[\u0900-\u097F]/.test(t); }
 function speak(text) {
-  if (!window.speechSynthesis) return;
-  window.speechSynthesis.cancel();
-  const plain = text.replace(/[#*`_~>]/g, '').trim();
-  if (!plain) return;
-  currentUtterance = new SpeechSynthesisUtterance(plain);
-  currentUtterance.rate = 1.05;
-  currentUtterance.onstart = () => speakingIndicator.classList.add('show');
-  currentUtterance.onend = () => speakingIndicator.classList.remove('show');
-  currentUtterance.onerror = () => speakingIndicator.classList.remove('show');
-  window.speechSynthesis.speak(currentUtterance);
-}
-stopSpeakBtn.addEventListener('click', () => {
-  window.speechSynthesis && window.speechSynthesis.cancel();
-  speakingIndicator.classList.remove('show');
-});
-
-// --- Voice input ---
-function setupVoice() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) { voiceBtn.title = 'Voice not supported in this browser'; return; }
-  recognition = new SR();
-  recognition.continuous = false;
-  recognition.interimResults = true;
-  recognition.lang = 'en-US';
-  let finalTranscript = '';
-  recognition.onstart  = () => { voiceBtn.classList.add('active', 'listening'); finalTranscript = ''; };
-  recognition.onresult = (e) => {
-    finalTranscript = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      if (e.results[i].isFinal) finalTranscript += e.results[i][0].transcript;
-      else input.value = e.results[i][0].transcript;
-    }
-    if (finalTranscript) input.value = finalTranscript;
-  };
-  recognition.onend = () => {
-    voiceBtn.classList.remove('active', 'listening');
-    if (input.value.trim()) form.requestSubmit();
-  };
-  recognition.onerror = () => voiceBtn.classList.remove('active', 'listening');
-}
-setupVoice();
-voiceBtn.addEventListener('click', () => {
-  if (!recognition) { alert('Voice input is not supported in this browser. Try Chrome.'); return; }
-  if (voiceBtn.classList.contains('listening')) { recognition.stop(); return; }
-  recognition.start();
-});
-
-// --- File / camera attach ---
-function handleFileSelect(file) {
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const dataUrl = e.target.result;
-    const base64  = dataUrl.split(',')[1];
-    pendingFile = { name: file.name, mimeType: file.type || 'application/octet-stream', dataBase64: base64 };
-    pendingName.textContent = file.name;
-    pendingAttach.classList.add('show');
-  };
-  reader.readAsDataURL(file);
-}
-attachBtn.addEventListener('click', () => fileInput.click());
-cameraBtn.addEventListener('click', () => cameraInput.click());
-fileInput.addEventListener('change', () => handleFileSelect(fileInput.files[0]));
-cameraInput.addEventListener('change', () => handleFileSelect(cameraInput.files[0]));
-pendingRemove.addEventListener('click', () => {
-  pendingFile = null;
-  fileInput.value = '';
-  cameraInput.value = '';
-  pendingAttach.classList.remove('show');
-});
-
-// --- Image generation detection ---
-const IMAGE_KEYWORDS = /\b(generate|create|draw|make|paint|render|show me|ghibli|anime|realistic|cartoon|portrait|landscape|art|artwork|image of|picture of|photo of|illustration)\b/i;
-async function tryGenerateImage(prompt) {
-  try {
-    const r = await fetch('/api/generate-image', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt })
-    });
-    const d = await r.json();
-    if (d.image) {
-      addImageMessage('ai', d.image, '');
-      return true;
-    }
-  } catch {}
-  return false;
-}
-
-// --- Conversations ---
-async function loadConversationList() {
-  try {
-    const r = await fetch('/api/conversations');
-    const d = await r.json();
-    const convs = d.conversations || [];
-    convListEl.innerHTML = '';
-    convs.forEach(c => {
-      const item = document.createElement('div');
-      item.className = 'conv-item' + (c.id === activeConvId ? ' active' : '');
-      item.innerHTML = '<span class="title"></span>'
-        + '<button class="rename-btn" title="Rename">✎</button>'
-        + '<button class="del-btn" title="Delete">✕</button>';
-      item.querySelector('.title').textContent = c.title;
-      item.addEventListener('click', (e) => {
-        if (!e.target.classList.contains('del-btn') && !e.target.classList.contains('rename-btn')) openConversation(c.id);
-      });
-      item.querySelector('.rename-btn').addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const newTitle = prompt('Rename chat:', c.title);
-        if (!newTitle || !newTitle.trim() || newTitle.trim() === c.title) return;
-        await fetch('/api/conversations/' + c.id, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: newTitle.trim() })
-        });
-        loadConversationList();
-      });
-      item.querySelector('.del-btn').addEventListener('click', async (e) => {
-        e.stopPropagation();
-        await fetch('/api/conversations/' + c.id, { method: 'DELETE' });
-        if (c.id === activeConvId) startNewChat();
-        else loadConversationList();
-      });
-      convListEl.appendChild(item);
-    });
-    return convs;
-  } catch { return []; }
-}
-
-async function openConversation(convId) {
-  activeConvId = convId;
-  try {
-    const r = await fetch('/api/conversations/' + convId);
-    if (!r.ok) return;
-    const d = await r.json();
-    messagesEl.innerHTML = '';
-    (d.messages || []).forEach(m => addMessage(m.role, m.text, m.attachment));
-    loadConversationList();
-  } catch {}
-  if (isMobile()) closeSidebar();
-}
-
-function startNewChat() {
-  activeConvId = null;
-  messagesEl.innerHTML = '';
-  showEmptyState();
-  loadConversationList();
-}
-
-// --- Send / regenerate / stop ---
-let isGenerating = false;
-let currentAbortController = null;
-
-function setGenerating(state) {
-  isGenerating = state;
-  sendBtn.classList.toggle('generating', state);
-  sendBtn.title = state ? 'Stop generating' : 'Send';
-  sendBtn.innerHTML = state
-    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>'
-    : '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>';
-}
-
-async function streamReply({ message = null, attachment = null, regenerate = false } = {}) {
-  showTyping();
-  setGenerating(true);
-  currentAbortController = new AbortController();
-
-  // Check if user wants an image (only on fresh sends, not regenerate)
-  if (!regenerate) {
-    const wantsImage = IMAGE_KEYWORDS.test(message || '') && !attachment;
-    if (wantsImage) {
-      hideTyping();
-      const generated = await tryGenerateImage(message);
-      if (generated) { setGenerating(false); loadConversationList(); return; }
-      showTyping();
-    }
-  }
-
-  let aiTextNode = null;
-  try {
-    const r = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: currentAbortController.signal,
-      body: JSON.stringify({
-        message: message || '',
-        conversation_id: activeConvId,
-        attachment,
-        user_name: getUserName(),
-        regenerate: !!regenerate,
-        model: selectedModel,
-      })
-    });
-    if (!r.ok || !r.body) {
-      hideTyping();
-      addMessage('error', 'Something went wrong. Try again.');
-      return;
-    }
-    hideTyping();
-    aiTextNode = addMessage('ai', '');
-
-    const convId = r.headers.get('X-Conversation-Id');
-    if (convId) activeConvId = convId;
-
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let fullText = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      fullText += chunk;
-      aiTextNode.textContent = fullText;
-      scrollToBottom();
-    }
-    speak(fullText);
-    loadConversationList();
-  } catch (err) {
-    hideTyping();
-    if (err.name === 'AbortError') {
-      // User hit stop — keep whatever text streamed in so far, just mark it as stopped.
-      if (aiTextNode && !aiTextNode.textContent.trim()) aiTextNode.textContent = '[Stopped]';
-    } else {
-      addMessage('error', 'Network error: ' + err.message);
-    }
-  } finally {
-    setGenerating(false);
-    currentAbortController = null;
-  }
-}
-
-function regenerateLast(row) {
-  if (isGenerating) return;
-  row.remove();
-  streamReply({ regenerate: true });
-}
-
-form.addEventListener('submit', (e) => {
-  e.preventDefault();
-  if (isGenerating) return;
-  const text = input.value.trim();
-  if (!text && !pendingFile) return;
-  const attachment = pendingFile;
-  pendingFile = null;
-  fileInput.value = ''; cameraInput.value = '';
-  pendingAttach.classList.remove('show');
-  addMessage('user', text, attachment);
-  input.value = '';
-  input.style.height = 'auto';
-  const tonePrefix = getTonePrefix();
-  streamReply({ message: tonePrefix + text, attachment });
-});
-
-sendBtn.addEventListener('click', (e) => {
-  if (isGenerating) {
-    e.preventDefault();
-    if (currentAbortController) currentAbortController.abort();
-  }
-});
-
-input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
-});
-function autoResize() {
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 140) + 'px';
-}
-input.addEventListener('input', autoResize);
-
-const sidebarOverlay = document.getElementById('sidebar-overlay');
-
-function isMobile() { return window.innerWidth <= 768; }
-
-function openSidebar() {
-  sidebar.classList.remove('hidden');
-  if (isMobile()) sidebarOverlay.style.display = 'block';
-}
-function closeSidebar() {
-  sidebar.classList.add('hidden');
-  sidebarOverlay.style.display = 'none';
-}
-sidebarToggle.addEventListener('click', () => {
-  sidebar.classList.contains('hidden') ? openSidebar() : closeSidebar();
-});
-sidebarOverlay.addEventListener('click', closeSidebar);
-
-// Fullscreen toggle (works on Android/desktop; iOS Safari has no real Fullscreen API,
-// so it falls back to a "pseudo-fullscreen" mode that maximizes the app view instead)
-const fullscreenIcon  = document.getElementById('fullscreen-icon');
-const fsSupported = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
-
-function isFullscreen() {
-  return !!(document.fullscreenElement || document.webkitFullscreenElement) ||
-    document.body.classList.contains('pseudo-fullscreen');
-}
-function updateFullscreenBtn() {
-  if (isFullscreen()) {
-    fullscreenIcon.textContent = '⤢';
-    fullscreenBtn.classList.add('active');
-    fullscreenBtn.title = 'Exit fullscreen';
+  if(!voiceOn||!window.speechSynthesis) return;
+  speechSynthesis.cancel();
+  const plain=text.replace(/[#*`_~>]/g,'').trim(); if(!plain) return;
+  const utt=new SpeechSynthesisUtterance(plain);
+  utt.rate=0.95; utt.pitch=1.1;
+  const hindi=isHindi(plain); utt.lang=hindi?'hi-IN':'en-IN';
+  const voices=speechSynthesis.getVoices();
+  let v=null;
+  if(hindi) {
+    v=voices.find(x=>x.lang.startsWith('hi')&&/female|woman|lekha|kalpana|aditi|riya/i.test(x.name))||voices.find(x=>x.lang.startsWith('hi'));
   } else {
-    fullscreenIcon.textContent = '⛶';
-    fullscreenBtn.classList.remove('active');
-    fullscreenBtn.title = 'Fullscreen';
+    v=voices.find(x=>x.lang==='en-IN')||voices.find(x=>x.lang.startsWith('en')&&/female|woman|samantha|victoria|karen|sonia|aria|jenny|zira/i.test(x.name))||voices.find(x=>x.lang.startsWith('en'));
   }
+  if(v) utt.voice=v;
+  utt.onstart=()=>$('speaking-bar').classList.add('show');
+  utt.onend=utt.onerror=()=>$('speaking-bar').classList.remove('show');
+  speechSynthesis.speak(utt);
 }
-async function toggleFullscreen() {
-  const el = document.documentElement;
-  try {
-    if (fsSupported) {
-      if (!document.fullscreenElement && !document.webkitFullscreenElement) {
-        if (el.requestFullscreen) await el.requestFullscreen();
-        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-      } else {
-        if (document.exitFullscreen) await document.exitFullscreen();
-        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-      }
-    } else {
-      // iOS Safari / in-app browsers: real Fullscreen API isn't available,
-      // so just maximize the app view (hides scroll bounce, fills the screen).
-      document.body.classList.toggle('pseudo-fullscreen');
-      updateFullscreenBtn();
-    }
-  } catch (err) {
-    console.warn('Fullscreen request failed:', err);
-    // Even on failure, fall back to pseudo-fullscreen so the button still does something
-    document.body.classList.toggle('pseudo-fullscreen');
-    updateFullscreenBtn();
-  }
-}
-fullscreenBtn.addEventListener('click', toggleFullscreen);
-document.addEventListener('fullscreenchange', updateFullscreenBtn);
-document.addEventListener('webkitfullscreenchange', updateFullscreenBtn);
-
-// "What should Ꮇʏᴛʜɪᴄ ᴀɪ call you?" — stored locally, sent with every chat request
-function getUserName() { return localStorage.getItem('mythic_user_name') || ''; }
-function setUserName(name) {
-  if (name) localStorage.setItem('mythic_user_name', name);
-  else localStorage.removeItem('mythic_user_name');
-}
-function openNameModal() {
-  nameInput.value = getUserName();
-  nameModalOverlay.classList.add('show');
-  setTimeout(() => nameInput.focus(), 50);
-}
-function closeNameModal() { nameModalOverlay.classList.remove('show'); }
-nameBtn.addEventListener('click', openNameModal);
-nameCancelBtn.addEventListener('click', closeNameModal);
-nameModalOverlay.addEventListener('click', (e) => { if (e.target === nameModalOverlay) closeNameModal(); });
-nameSaveBtn.addEventListener('click', () => {
-  setUserName(nameInput.value.trim());
-  closeNameModal();
-});
-nameInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); nameSaveBtn.click(); }
-  else if (e.key === 'Escape') closeNameModal();
-});
-// First-time visitors get a gentle one-time prompt
-if (!localStorage.getItem('mythic_name_prompted')) {
-  localStorage.setItem('mythic_name_prompted', '1');
-  setTimeout(openNameModal, 600);
-}
-
-// Hide sidebar by default on mobile
-if (isMobile()) sidebar.classList.add('hidden');
-newChatBtn.addEventListener('click', startNewChat);
-clearBtn.addEventListener('click', async () => {
-  if (!activeConvId) return;
-  await fetch('/api/conversations/' + activeConvId, { method: 'DELETE' });
-  startNewChat();
+if(window.speechSynthesis){ speechSynthesis.getVoices(); speechSynthesis.onvoiceschanged=()=>speechSynthesis.getVoices(); }
+$('stop-speak-btn').addEventListener('click',()=>{ speechSynthesis&&speechSynthesis.cancel(); $('speaking-bar').classList.remove('show'); });
+const spkToggle=$('speak-toggle');
+spkToggle.addEventListener('click',()=>{
+  voiceOn=!voiceOn; spkToggle.textContent=voiceOn?'🔊':'🔇'; spkToggle.classList.toggle('on',voiceOn);
+  if(!voiceOn){ speechSynthesis&&speechSynthesis.cancel(); $('speaking-bar').classList.remove('show'); }
 });
 
-exportBtn.addEventListener('click', async () => {
-  if (!activeConvId) { alert('Start or open a chat first.'); return; }
-  try {
-    const r = await fetch('/api/conversations/' + activeConvId);
-    if (!r.ok) return;
-    const d = await r.json();
-    const lines = [`# ${d.title || 'Ꮇʏᴛʜɪᴄ ᴀɪ chat'}`, ''];
-    (d.messages || []).forEach(m => {
-      lines.push(m.role === 'user' ? 'You:' : 'Ꮇʏᴛʜɪᴄ ᴀɪ:');
-      lines.push(m.text || (m.attachment ? `[attachment: ${m.attachment.name}]` : ''));
-      lines.push('');
-    });
-    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = (d.title || 'chat').replace(/[^a-z0-9_ -]/gi, '').trim().slice(0, 60) + '.txt';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  } catch (err) {
-    alert('Export failed: ' + err.message);
-  }
-});
-
-// Initial load
-// ─── SETTINGS ────────────────────────────────────────────────────────────────
-const settingsBtn        = document.getElementById('settings-btn');
-const settingsModalOverlay=document.getElementById('settings-modal-overlay');
-const settingsCloseBtn   = document.getElementById('settings-close-btn');
-const accentColorInput   = document.getElementById('accent-color-input');
-const fontSizeSlider     = document.getElementById('font-size-slider');
-const fontSizeLabel      = document.getElementById('font-size-label');
-const toneSelect         = document.getElementById('tone-select');
-const lengthSelect       = document.getElementById('length-select');
-const customInstructions = document.getElementById('custom-instructions-input');
-
-// Load saved settings
-function loadSettings() {
-  const s = JSON.parse(localStorage.getItem('mythic_settings') || '{}');
-  // Theme
-  const theme = s.theme || 'dark';
-  applyTheme(theme);
-  document.querySelectorAll('[data-group="theme"]').forEach(b => {
-    b.style.borderColor = b.dataset.value === theme ? 'var(--accent)' : 'var(--border)';
-    b.style.color = b.dataset.value === theme ? 'var(--accent)' : '';
-  });
-  // Accent
-  const accent = s.accent || '#10a37f';
-  accentColorInput.value = accent;
-  document.documentElement.style.setProperty('--accent', accent);
-  // Font size
-  const fs = s.fontSize || '14.5';
-  fontSizeSlider.value = fs;
-  fontSizeLabel.textContent = fs + 'px';
-  document.documentElement.style.setProperty('--msg-font-size', fs + 'px');
-  // Bubble style
-  const bubble = s.bubble || 'comfortable';
-  document.body.classList.remove('bubble-compact','bubble-comfortable','bubble-spacious');
-  document.body.classList.add('bubble-' + bubble);
-  document.querySelectorAll('[data-group="bubble"]').forEach(b => {
-    b.style.borderColor = b.dataset.value === bubble ? 'var(--accent)' : 'var(--border)';
-    b.style.color = b.dataset.value === bubble ? 'var(--accent)' : '';
-  });
-  // Tone & Length
-  if (toneSelect) toneSelect.value = s.tone || 'default';
-  if (lengthSelect) lengthSelect.value = s.length || 'default';
-  // Custom instructions
-  if (customInstructions) customInstructions.value = s.customInstructions || '';
-}
-
-function saveSettings() {
-  const s = JSON.parse(localStorage.getItem('mythic_settings') || '{}');
-  s.theme = document.body.classList.contains('theme-light') ? 'light' : 'dark';
-  s.accent = accentColorInput.value;
-  s.fontSize = fontSizeSlider.value;
-  const bubs = ['compact','comfortable','spacious'].find(b => document.body.classList.contains('bubble-'+b)) || 'comfortable';
-  s.bubble = bubs;
-  s.tone = toneSelect ? toneSelect.value : 'default';
-  s.length = lengthSelect ? lengthSelect.value : 'default';
-  s.customInstructions = customInstructions ? customInstructions.value : '';
-  localStorage.setItem('mythic_settings', JSON.stringify(s));
-}
-
-function applyTheme(t) {
-  if (t === 'system') {
-    const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    document.body.classList.toggle('theme-light', !dark);
-  } else {
-    document.body.classList.toggle('theme-light', t === 'light');
-  }
-}
-
-settingsBtn.addEventListener('click', () => { settingsModalOverlay.style.display = 'flex'; });
-settingsCloseBtn.addEventListener('click', () => { saveSettings(); settingsModalOverlay.style.display = 'none'; });
-settingsModalOverlay.addEventListener('click', e => { if (e.target === settingsModalOverlay) { saveSettings(); settingsModalOverlay.style.display = 'none'; } });
-
-document.querySelectorAll('.settings-choice').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const group = btn.dataset.group;
-    document.querySelectorAll(`[data-group="${group}"]`).forEach(b => {
-      b.style.borderColor = 'var(--border)'; b.style.color = '';
-    });
-    btn.style.borderColor = 'var(--accent)'; btn.style.color = 'var(--accent)';
-    if (group === 'theme') applyTheme(btn.dataset.value);
-    if (group === 'bubble') {
-      document.body.classList.remove('bubble-compact','bubble-comfortable','bubble-spacious');
-      document.body.classList.add('bubble-' + btn.dataset.value);
-    }
-    saveSettings();
-  });
-});
-
-accentColorInput.addEventListener('input', () => {
-  document.documentElement.style.setProperty('--accent', accentColorInput.value);
-});
-fontSizeSlider.addEventListener('input', () => {
-  fontSizeLabel.textContent = fontSizeSlider.value + 'px';
-  document.documentElement.style.setProperty('--msg-font-size', fontSizeSlider.value + 'px');
-});
-
-loadSettings();
-
-// ─── MARKDOWN RENDERING ──────────────────────────────────────────────────────
-function renderMarkdown(text) {
-  const div = document.createElement('div');
-  div.className = 'msg-text md-rendered';
-  // Escape HTML first
-  let html = text
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  // Code blocks (must come before inline code)
-  html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
-    `<pre><code class="lang-${lang}">${code.trim()}</code></pre>`);
-  // Inline code
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // Bold
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  // Italic
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-  // Headers
-  html = html.replace(/^### (.+)$/gm, '<h3 style="font-size:14px;margin:6px 0 3px;font-weight:700;">$1</h3>');
-  html = html.replace(/^## (.+)$/gm, '<h2 style="font-size:15px;margin:8px 0 4px;font-weight:700;">$1</h2>');
-  html = html.replace(/^# (.+)$/gm, '<h1 style="font-size:17px;margin:10px 0 5px;font-weight:700;">$1</h1>');
-  // Unordered lists
-  html = html.replace(/(^|\n)([\-\*] .+(\n[\-\*] .+)*)/g, (_, pre, block) =>
-    pre + '<ul>' + block.replace(/[\-\*] (.+)/g, '<li>$1</li>') + '</ul>');
-  // Ordered lists
-  html = html.replace(/(^|\n)(\d+\. .+(\n\d+\. .+)*)/g, (_, pre, block) =>
-    pre + '<ol>' + block.replace(/\d+\. (.+)/g, '<li>$1</li>') + '</ol>');
-  // Line breaks
-  html = html.replace(/\n/g, '<br>');
-  div.innerHTML = html;
-  return div;
-}
-
-// Override addMessage to use markdown for AI
-const _origAddMessage = addMessage;
-addMessage = function(role, text, attachment) {
-  const textNode = _origAddMessage(role, text, attachment);
-  if (role === 'ai' && text) {
-    try {
-      const md = renderMarkdown(text);
-      textNode.parentNode.replaceChild(md, textNode);
-      return md;
-    } catch { return textNode; }
-  }
-  return textNode;
-};
-
-// ─── MESSAGE TIMESTAMPS ───────────────────────────────────────────────────────
-const _origAddMsg2 = addMessage;
-function addMessageWithTimestamp(role, text, attachment) {
-  const node = _origAddMsg2(role, text, attachment);
-  const row = node.closest ? node.closest('.msg-row') : null;
-  if (row) {
-    const ts = document.createElement('div');
-    ts.className = 'msg-timestamp';
-    ts.textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-    row.appendChild(ts);
-  }
-  return node;
-}
-// Monkey-patch addMessage to include timestamp
-const _rawAdd = addMessage;
-window._addMsgFinal = function(role, text, attachment) {
-  const node = _rawAdd(role, text, attachment);
-  const row = node && node.closest ? node.closest('.msg-row') : null;
-  if (row && !row.querySelector('.msg-timestamp')) {
-    const ts = document.createElement('div');
-    ts.className = 'msg-timestamp';
-    ts.textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-    row.appendChild(ts);
-  }
-  return node;
-};
-
-// ─── FOLLOW-UP SUGGESTIONS ───────────────────────────────────────────────────
-async function addFollowupSuggestions(aiText) {
-  if (!aiText || aiText.length < 50) return;
-  try {
-    const r = await fetch('/api/chat', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        message: `Based on this AI reply, suggest 3 short follow-up questions the user might ask. Reply ONLY with 3 questions, one per line, no numbering, no extra text:\n\n${aiText.slice(0,400)}`,
-        conversation_id: null, model: 'mythic-1.0', user_name: ''
-      })
-    });
-    if (!r.ok) return;
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let full = '';
-    while (true) { const {done,value} = await reader.read(); if(done) break; full += dec.decode(value,{stream:true}); }
-    const qs = full.trim().split('\n').filter(q => q.trim().length > 5).slice(0,3);
-    if (!qs.length) return;
-    const wrap = document.createElement('div');
-    wrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;max-width:100%;';
-    qs.forEach(q => {
-      const btn = document.createElement('button');
-      btn.textContent = q.trim().replace(/^["']|["']$/g,'');
-      btn.style.cssText = 'background:var(--panel);border:1px solid var(--border);color:var(--muted);font-size:11.5px;padding:5px 10px;border-radius:16px;cursor:pointer;font-family:inherit;text-align:left;';
-      btn.addEventListener('click', () => {
-        input.value = btn.textContent; input.focus(); autoResize();
-        form.requestSubmit(); wrap.remove();
-      });
-      wrap.appendChild(btn);
-    });
-    messagesEl.appendChild(wrap);
-    scrollToBottom();
-  } catch {}
-}
-
-// ─── MESSAGE REACTIONS ────────────────────────────────────────────────────────
-function addReactionBar(row) {
-  if (row.querySelector('.reaction-bar')) return;
-  const bar = document.createElement('div');
-  bar.className = 'reaction-bar';
-  bar.style.cssText = 'display:flex;gap:4px;margin-top:3px;';
-  ['👍','👎','❤️','😂','🔖'].forEach(emoji => {
-    const btn = document.createElement('button');
-    btn.textContent = emoji;
-    btn.style.cssText = 'background:none;border:1px solid var(--border);border-radius:12px;padding:2px 7px;font-size:13px;cursor:pointer;touch-action:manipulation;';
-    btn.addEventListener('click', () => {
-      btn.style.borderColor = btn.style.borderColor === 'var(--accent)' ? 'var(--border)' : 'var(--accent)';
-      btn.style.background  = btn.style.background === 'var(--accent-dim)' ? '' : 'var(--accent-dim)';
-    });
-    bar.appendChild(btn);
-  });
-  row.appendChild(bar);
-}
-
-// ─── MESSAGE SEARCH ───────────────────────────────────────────────────────────
-function addSearchUI() {
-  const searchWrap = document.createElement('div');
-  searchWrap.id = 'msg-search-wrap';
-  searchWrap.style.cssText = 'display:none;position:fixed;top:70px;left:50%;transform:translateX(-50%);z-index:150;background:var(--panel);border:1.5px solid var(--accent);border-radius:10px;padding:8px 12px;display:flex;gap:8px;align-items:center;min-width:280px;box-shadow:0 4px 20px rgba(0,0,0,.3);';
-  searchWrap.innerHTML = '<input id="msg-search-input" placeholder="Search messages..." style="background:transparent;border:none;color:var(--text);font-size:14px;outline:none;flex:1;font-family:inherit;"><span id="msg-search-count" style="color:var(--muted);font-size:12px;"></span><button id="msg-search-close" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;">✕</button>';
-  searchWrap.style.display = 'none';
-  document.body.appendChild(searchWrap);
-
-  let highlights = [];
-  document.getElementById('msg-search-input').addEventListener('input', e => {
-    highlights.forEach(el => { el.style.background = ''; el.style.outline = ''; });
-    highlights = [];
-    const q = e.target.value.trim().toLowerCase();
-    if (!q) { document.getElementById('msg-search-count').textContent = ''; return; }
-    document.querySelectorAll('.msg-text,.md-rendered').forEach(el => {
-      if (el.textContent.toLowerCase().includes(q)) {
-        el.style.background = 'rgba(255,200,0,.15)';
-        el.style.outline = '2px solid rgba(255,200,0,.4)';
-        highlights.push(el);
-      }
-    });
-    document.getElementById('msg-search-count').textContent = highlights.length ? `${highlights.length} found` : 'no results';
-    if (highlights.length) highlights[0].scrollIntoView({behavior:'smooth',block:'center'});
-  });
-  document.getElementById('msg-search-close').addEventListener('click', () => {
-    searchWrap.style.display = 'none';
-    highlights.forEach(el => { el.style.background = ''; el.style.outline = ''; });
-  });
-  return searchWrap;
-}
-const msgSearchWrap = addSearchUI();
-
-// Keyboard shortcut Ctrl+F to search messages
-document.addEventListener('keydown', e => {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'f' && !settingsModalOverlay.style.display.includes('flex')) {
-    e.preventDefault();
-    msgSearchWrap.style.display = 'flex';
-    setTimeout(() => document.getElementById('msg-search-input').focus(), 50);
-  }
-  if (e.key === 'Escape') msgSearchWrap.style.display = 'none';
-});
-
-// ─── PWA SUPPORT ─────────────────────────────────────────────────────────────
-if ('serviceWorker' in navigator && navigator.serviceWorker) {
-  // Inline service worker for offline caching
-  const swCode = `
-const CACHE = 'mythic-ai-v1';
-const OFFLINE = ['/', '/static/app.js'];
-self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(['/']))));
-self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
-  e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
-});`;
-  const blob = new Blob([swCode], {type:'application/javascript'});
-  navigator.serviceWorker.register(URL.createObjectURL(blob)).catch(()=>{});
-}
-
-// ─── WIRE REACTIONS INTO MSG ACTIONS ─────────────────────────────────────────
-// Patch buildMsgActions to add reaction button
-const _origBuildActions = buildMsgActions;
-buildMsgActions = function(row, textNode, role) {
-  const actions = _origBuildActions(row, textNode, role);
-  if (role === 'ai') {
-    const reactBtn = document.createElement('button');
-    reactBtn.type = 'button'; reactBtn.title = 'React'; reactBtn.textContent = '😊';
-    reactBtn.addEventListener('click', () => addReactionBar(row));
-    actions.appendChild(reactBtn);
-    // 🔊 speak button
-    const sp = document.createElement('button');
-    sp.type='button'; sp.title='Read aloud'; sp.textContent='🔊';
-    sp.addEventListener('click', () => {
-      if (sp.textContent === '⏹') { stopSpeaking(); sp.textContent='🔊'; return; }
-      sp.textContent='⏹'; speak(textNode.textContent || (textNode.innerText || ''));
-      if (currentUtterance) {
-        currentUtterance.onend = () => sp.textContent='🔊';
-        currentUtterance.onerror = () => sp.textContent='🔊';
-      }
-    });
-    actions.appendChild(sp);
-  }
-  return actions;
-};
-
-function stopSpeaking() { if(window.speechSynthesis) window.speechSynthesis.cancel(); }
-
-// ─── TONE/LENGTH INJECTION ────────────────────────────────────────────────────
-function getTonePrefix() {
-  const s = JSON.parse(localStorage.getItem('mythic_settings') || '{}');
-  const tone = s.tone || 'default';
-  const length = s.length || 'default';
-  let parts = [];
-  if (tone === 'formal') parts.push('Reply in a formal, professional tone.');
-  if (tone === 'casual') parts.push('Reply in a casual, friendly tone.');
-  if (tone === 'funny') parts.push('Be funny and use wit and humor in your reply.');
-  if (tone === 'professional') parts.push('Use a professional, business-appropriate tone.');
-  if (length === 'short') parts.push('Keep your reply very short — 1-3 sentences max.');
-  if (length === 'medium') parts.push('Keep your reply medium length — a few paragraphs.');
-  if (length === 'long') parts.push('Give a thorough, detailed, long reply.');
-  const ci = customInstructions ? customInstructions.value.trim() : '';
-  if (ci) parts.push(ci);
-  return parts.length ? '[Instructions: ' + parts.join(' ') + '] ' : '';
-}
-
-// ─── AUTO FOLLOW-UPS AFTER AI REPLY ──────────────────────────────────────────
-// Hook into streamReply completion by patching the form submit
-const _origFormSubmit = form.onsubmit;
-form.addEventListener('submit', async () => {
-  // Wait for generation to finish then add follow-ups
-  const checkDone = setInterval(() => {
-    if (!isGenerating) {
-      clearInterval(checkDone);
-      const allRows = messagesEl.querySelectorAll('.msg-row.ai');
-      if (allRows.length) {
-        const lastRow = allRows[allRows.length - 1];
-        const textEl = lastRow.querySelector('.msg-text,.md-rendered');
-        if (textEl && !lastRow.querySelector('.reaction-bar')) {
-          addReactionBar(lastRow);
-          setTimeout(() => addFollowupSuggestions(textEl.textContent || textEl.innerText || ''), 300);
-        }
-      }
-    }
-  }, 500);
-});
-
-// ─── INITIAL LOAD ─────────────────────────────────────────────────────────────
-(async () => {
-  const convs = await loadConversationList();
-  if (convs.length > 0) openConversation(convs[0].id);
-  else showEmptyState();
+// Voice input
+(function(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition; if(!SR) return;
+  recognition=new SR(); recognition.continuous=false; recognition.interimResults=true; recognition.lang='hi-IN';
+  recognition.onstart=()=>$('voice-btn').classList.add('listening');
+  recognition.onresult=e=>{ let fin=''; for(let i=e.resultIndex;i<e.results.length;i++){ if(e.results[i].isFinal) fin+=e.results[i][0].transcript; else inp.value=e.results[i][0].transcript; } if(fin) inp.value=fin; resize(); };
+  recognition.onend=()=>{ $('voice-btn').classList.remove('listening'); if(inp.value.trim()) form.requestSubmit(); };
+  recognition.onerror=()=>$('voice-btn').classList.remove('listening');
 })();
+$('voice-btn').addEventListener('click',()=>{ if(!recognition){alert('Voice not supported. Try Chrome.');return;} recognition.classList&&recognition.stop ? recognition.stop() : (document.getElementById('voice-btn').classList.contains('listening')?recognition.stop():recognition.start()); });
+$('voice-btn').addEventListener('click',()=>{ if(!recognition){alert('Voice not supported. Try Chrome.');return;} $('voice-btn').classList.contains('listening')?recognition.stop():recognition.start(); });
 
-const imgGenBtn   = document.getElementById('img-gen-btn');
-const ghibliBtn   = document.getElementById('ghibli-btn');
-const homeworkBtn = document.getElementById('homework-btn');
-const weatherBtn2 = document.getElementById('weather-btn');
-const searchBtn   = document.getElementById('search-btn');
+// File attach
+function handleFile(file){ if(!file) return; const r=new FileReader(); r.onload=e=>{ const b64=e.target.result.split(',')[1]; pendingFile={name:file.name,mimeType:file.type||'application/octet-stream',dataBase64:b64}; $('pa-name').textContent=file.name; $('pending-attach').classList.add('show'); }; r.readAsDataURL(file); }
+$('attach-btn').addEventListener('click',()=>$('file-input').click());
+$('camera-btn').addEventListener('click',()=>$('camera-input').click());
+$('selfie-btn').addEventListener('click',()=>$('selfie-input').click());
+$('file-input').addEventListener('change',()=>handleFile($('file-input').files[0]));
+$('camera-input').addEventListener('change',()=>handleFile($('camera-input').files[0]));
+$('selfie-input').addEventListener('change',()=>handleFile($('selfie-input').files[0]));
+$('pa-remove').addEventListener('click',()=>{ pendingFile=null; $('file-input').value=''; $('camera-input').value=''; $('selfie-input').value=''; $('pending-attach').classList.remove('show'); });
 
-if (imgGenBtn) imgGenBtn.addEventListener('click', () => {
-  const imgModal = document.getElementById('img-modal-overlay');
-  if (imgModal) { imgModal.style.display = 'flex'; document.getElementById('img-prompt').focus(); }
-});
-if (homeworkBtn) homeworkBtn.addEventListener('click', () => {
-  input.value = 'Help me with my homework: '; input.focus(); autoResize();
-  input.setSelectionRange(input.value.length, input.value.length);
-});
-if (weatherBtn2) weatherBtn2.addEventListener('click', () => {
-  const wm = document.getElementById('weather-modal-overlay');
-  if (wm) { wm.style.display = 'flex'; document.getElementById('weather-city').focus(); }
-});
-if (searchBtn) searchBtn.addEventListener('click', () => {
-  const q = prompt('What do you want to search for?');
-  if (!q || !q.trim()) return;
-  input.value = 'Search: ' + q.trim(); autoResize(); form.requestSubmit();
-});
-
-// ─── GHIBLI SELFIE MODAL ─────────────────────────────────────────────────────
-const ghibliModal     = document.getElementById('ghibli-modal-overlay');
-const ghibliUploadArea= document.getElementById('ghibli-upload-area');
-const ghibliFileInput = document.getElementById('ghibli-file-input');
-const ghibliPreviewWrap=document.getElementById('ghibli-preview-wrap');
-const ghibliPreview   = document.getElementById('ghibli-preview');
-const ghibliResult    = document.getElementById('ghibli-result');
-const ghibliResultWrap= document.getElementById('ghibli-result-wrap');
-const ghibliLoading   = document.getElementById('ghibli-loading');
-const ghibliError     = document.getElementById('ghibli-error');
-const ghibliGenerateBtn=document.getElementById('ghibli-generate-btn');
-const ghibliCloseBtn  = document.getElementById('ghibli-close-btn');
-const ghibliDownloadBtn=document.getElementById('ghibli-download-btn');
-const ghibliExtraInput= document.getElementById('ghibli-extra');
-
-let ghibliBase64 = null;
-let ghibliMimeType = 'image/jpeg';
-let ghibliSelectedStyle = 'Studio Ghibli portrait, Spirited Away style, soft watercolor anime art';
-
-// Open/close
-if (ghibliBtn) ghibliBtn.addEventListener('click', () => {
-  ghibliModal.style.display = 'flex';
-  ghibliBase64 = null;
-  ghibliPreviewWrap.style.display = 'none';
-  ghibliResultWrap.style.display = 'none';
-  ghibliError.style.display = 'none';
-  ghibliLoading.style.display = 'none';
-});
-if (ghibliCloseBtn) ghibliCloseBtn.addEventListener('click', () => ghibliModal.style.display = 'none');
-ghibliModal.addEventListener('click', e => { if (e.target === ghibliModal) ghibliModal.style.display = 'none'; });
-
-// Style selector
-document.querySelectorAll('.ghibli-style-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.ghibli-style-btn').forEach(b => {
-      b.style.borderColor = 'var(--border)'; b.style.background = 'var(--panel)'; b.style.color = 'var(--muted)';
-    });
-    btn.style.borderColor = 'var(--accent)'; btn.style.background = 'var(--accent-dim)'; btn.style.color = 'var(--accent)';
-    ghibliSelectedStyle = btn.dataset.style;
-  });
-});
-
-// Upload area
-ghibliUploadArea.addEventListener('click', () => ghibliFileInput.click());
-ghibliUploadArea.addEventListener('dragover', e => { e.preventDefault(); ghibliUploadArea.style.borderColor = 'var(--accent)'; });
-ghibliUploadArea.addEventListener('dragleave', () => { ghibliUploadArea.style.borderColor = 'var(--border)'; });
-ghibliUploadArea.addEventListener('drop', e => {
-  e.preventDefault(); ghibliUploadArea.style.borderColor = 'var(--border)';
-  const file = e.dataTransfer.files[0];
-  if (file && file.type.startsWith('image/')) loadGhibliPhoto(file);
-});
-ghibliFileInput.addEventListener('change', () => {
-  if (ghibliFileInput.files[0]) loadGhibliPhoto(ghibliFileInput.files[0]);
-});
-
-function loadGhibliPhoto(file) {
-  const reader = new FileReader();
-  reader.onload = e => {
-    ghibliBase64 = e.target.result.split(',')[1];
-    ghibliMimeType = file.type || 'image/jpeg';
-    ghibliPreview.src = e.target.result;
-    ghibliPreviewWrap.style.display = 'block';
-    ghibliResultWrap.style.display = 'none';
-    ghibliError.style.display = 'none';
-    ghibliUploadArea.style.borderColor = 'var(--accent)';
-  };
-  reader.readAsDataURL(file);
+// Fullscreen
+const fsBtn=$('fs-btn');
+async function toggleFs(){
+  const el=document.documentElement;
+  try{ if(!document.fullscreenElement&&!document.webkitFullscreenElement){ el.requestFullscreen?await el.requestFullscreen():el.webkitRequestFullscreen&&el.webkitRequestFullscreen(); } else { document.exitFullscreen?await document.exitFullscreen():document.webkitExitFullscreen&&document.webkitExitFullscreen(); } }catch(e){ document.body.classList.toggle('pseudo-fs'); }
+  fsBtn.textContent=document.fullscreenElement||document.webkitFullscreenElement?'⤢':'⛶';
 }
+fsBtn.addEventListener('click',toggleFs);
+document.addEventListener('fullscreenchange',()=>fsBtn.textContent=document.fullscreenElement?'⤢':'⛶');
 
-// Generate Ghibli image
-ghibliGenerateBtn.addEventListener('click', async () => {
-  const extra = ghibliExtraInput.value.trim();
-  const prompt = `${ghibliSelectedStyle}, beautiful detailed portrait of a person, ${extra ? extra + ', ' : ''}masterpiece, best quality, highly detailed, cinematic lighting, soft colors, dreamy atmosphere`;
+// Name modal
+function openNameModal(){ $('name-input').value=getUserName(); $('name-modal').classList.add('show'); setTimeout(()=>$('name-input').focus(),50); }
+function closeNameModal(){ $('name-modal').classList.remove('show'); }
+$('name-btn').addEventListener('click',openNameModal);
+$('name-cancel').addEventListener('click',closeNameModal);
+$('name-modal').addEventListener('click',e=>{ if(e.target===$('name-modal')) closeNameModal(); });
+$('name-save').addEventListener('click',()=>{ setUserName($('name-input').value.trim()); closeNameModal(); });
+$('name-input').addEventListener('keydown',e=>{ if(e.key==='Enter') $('name-save').click(); else if(e.key==='Escape') closeNameModal(); });
+if(!localStorage.getItem('mythic_name_asked')){ localStorage.setItem('mythic_name_asked','1'); setTimeout(openNameModal,700); }
 
-  ghibliError.style.display = 'none';
-  ghibliResultWrap.style.display = 'none';
-  ghibliLoading.style.display = 'block';
-  ghibliGenerateBtn.disabled = true;
+// Export
+$('export-btn').addEventListener('click',async()=>{
+  if(!activeId){alert('Open a chat first.');return;}
+  try{ const r=await fetch('/api/conversations/'+activeId); if(!r.ok) return; const d=await r.json();
+  const lines=[`# ${d.title||'Mythic AI chat'}`,'']; (d.messages||[]).forEach(m=>{ lines.push(m.role==='user'?'You:':'Mythic AI:'); lines.push(m.text||(m.attachment?'[attachment: '+m.attachment.name+']':'')); lines.push(''); });
+  const blob=new Blob([lines.join('\n')],{type:'text/plain'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='mythic-chat.txt'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); }catch(e){alert('Export failed: '+e.message);}
+});
 
-  // If a photo is uploaded, we pass it to the backend (NanoBanana can do real
-  // image-to-image; Pollinations will ignore it and generate from the prompt).
-  const bodyPayload = { prompt };
-  if (ghibliBase64) {
-    bodyPayload.imageBase64 = ghibliBase64;
-    bodyPayload.mimeType = ghibliMimeType;
-  }
+// Conversations
+async function loadList(){
+  try{ const r=await fetch('/api/conversations'); const d=await r.json(); const convs=d.conversations||[];
+  $('conv-list').innerHTML='';
+  convs.forEach(c=>{ const item=document.createElement('div'); item.className='conv-item'+(c.id===activeId?' active':'');
+    item.innerHTML='<span class="title"></span><button class="del-btn" title="Delete">✕</button>';
+    item.querySelector('.title').textContent=c.title;
+    item.addEventListener('click',e=>{ if(!e.target.classList.contains('del-btn')) openConv(c.id); });
+    item.querySelector('.del-btn').addEventListener('click',async e=>{ e.stopPropagation(); await fetch('/api/conversations/'+c.id,{method:'DELETE'}); if(c.id===activeId) newChat(); else loadList(); });
+    $('conv-list').appendChild(item);
+  }); return convs; }catch{return[];}
+}
+async function openConv(id){ activeId=id; try{ const r=await fetch('/api/conversations/'+id); if(!r.ok) return; const d=await r.json(); msgs.innerHTML=''; (d.messages||[]).forEach(m=>addMsg(m.role,m.text,m.attachment)); loadList(); }catch{} if(isMobile()) closeSb(); }
+function newChat(){ activeId=null; msgs.innerHTML=''; showEmpty(); loadList(); if(isMobile()) closeSb(); }
+$('new-chat-btn').addEventListener('click',newChat);
+$('clear-btn').addEventListener('click',async()=>{ if(!activeId) return; await fetch('/api/conversations/'+activeId,{method:'DELETE'}); newChat(); });
 
-  try {
-    const r = await fetch('/api/generate-image', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(bodyPayload)
-    });
-    const text = await r.text();
-    let d;
-    try { d = JSON.parse(text); }
-    catch { d = {error: `Server error (${r.status}). Please try again in a moment.`}; }
-    ghibliLoading.style.display = 'none';
-    if (d.image) {
-      ghibliResult.src = 'data:image/png;base64,' + d.image;
-      ghibliResultWrap.style.display = 'block';
-      // Also show in chat
-      clearEmptyState();
-      const row = document.createElement('div'); row.className = 'msg-row ai';
-      const bubble = document.createElement('div'); bubble.className = 'msg ai';
-      bubble.style.padding = '8px';
-      const cap = document.createElement('div');
-      cap.textContent = '🌿 Your Ghibli portrait';
-      cap.style.cssText = 'font-size:12px;color:var(--muted);margin-bottom:8px;';
-      const img = document.createElement('img');
-      img.src = 'data:image/png;base64,' + d.image;
-      img.style.cssText = 'max-width:100%;border-radius:12px;display:block;cursor:pointer;';
-      img.title = 'Click to download';
-      img.addEventListener('click', () => downloadGhibliImage(d.image));
-      bubble.appendChild(cap); bubble.appendChild(img); row.appendChild(bubble);
-      messagesEl.appendChild(row); scrollToBottom();
-    } else {
-      ghibliError.textContent = d.error || 'Generation failed. Try again.';
-      ghibliError.style.display = 'block';
+// Send / stream
+function setGen(on){ isGen=on; sendBtn.classList.toggle('stop-mode',on); sendBtn.title=on?'Stop':'Send'; sendBtn.innerHTML=on?'<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>':'<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>'; }
+
+const IMG_RE=/\b(generate|create|draw|make|paint|render|ghibli|anime|cartoon|portrait|image of|picture of|illustration)\b/i;
+const NEWS_RE=/\b(news|khabar|headline|aaj ki|cricket|score|match|breaking)\b/i;
+const SRCH_RE=/^search:\s*/i;
+
+async function streamReply({message='',attachment=null,regenerate=false}={}){
+  showTyping(); setGen(true); abortCtrl=new AbortController();
+  let newsCtx=null;
+  if(!regenerate&&message){
+    if(SRCH_RE.test(message)){
+      const q=message.replace(SRCH_RE,'').trim();
+      try{ const r=await fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})}); const d=await r.json(); if(d.results&&d.results.length) newsCtx='Search results for "'+q+'":\n'+d.results.map((x,i)=>`${i+1}. ${x.title}: ${x.snippet}`).join('\n'); }catch{}
+    } else if(NEWS_RE.test(message)){
+      try{ const r=await fetch('/api/news',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:message.length<80?message:null})}); const d=await r.json(); if(d.articles&&d.articles.length) newsCtx=d.articles.map((a,i)=>`${i+1}. ${a.title} (${a.source})`).join('\n'); }catch{}
     }
-  } catch (e) {
-    ghibliLoading.style.display = 'none';
-    ghibliError.textContent = 'Network error: ' + e.message;
-    ghibliError.style.display = 'block';
-  } finally { ghibliGenerateBtn.disabled = false; }
-});
-
-function downloadGhibliImage(b64) {
-  const a = document.createElement('a');
-  a.href = 'data:image/png;base64,' + b64;
-  a.download = 'mythic-ai-ghibli-portrait.png';
-  document.body.appendChild(a); a.click(); a.remove();
-}
-if (ghibliDownloadBtn) ghibliDownloadBtn.addEventListener('click', () => {
-  if (ghibliResult.src) downloadGhibliImage(ghibliResult.src.split(',')[1]);
-});
-
-// ─── IMAGE GENERATION MODAL JS ───────────────────────────────────────────────
-const imgModalOverlay = document.getElementById('img-modal-overlay');
-const imgPromptEl     = document.getElementById('img-prompt');
-const imgStyleEl      = document.getElementById('img-style');
-const imgResultEl     = document.getElementById('img-result');
-const imgOutputEl     = document.getElementById('img-output');
-const imgLoadingEl    = document.getElementById('img-loading');
-const imgErrorEl      = document.getElementById('img-error');
-const imgGenerateBtn2 = document.getElementById('img-generate-btn');
-const imgCloseBtn2    = document.getElementById('img-close-btn');
-const imgDownloadBtn2 = document.getElementById('img-download-btn');
-const imgCopyBtn2     = document.getElementById('img-copy-btn');
-const imgFullscreenBtn2 = document.getElementById('img-fullscreen-btn');
-const imgViewerOverlay = document.getElementById('img-viewer-overlay');
-const imgViewerImg     = document.getElementById('img-viewer-img');
-let lastGeneratedImageB64 = null;
-
-if (imgGenerateBtn2) imgGenerateBtn2.addEventListener('click', async () => {
-  const prompt = imgPromptEl.value.trim();
-  const style = imgStyleEl ? imgStyleEl.value : '';
-  if (!prompt) { imgErrorEl.textContent = 'Please enter a description first.'; imgErrorEl.style.display = 'block'; return; }
-  imgResultEl.style.display = 'none'; imgErrorEl.style.display = 'none';
-  imgLoadingEl.style.display = 'block'; imgGenerateBtn2.disabled = true;
-  try {
-    const r = await fetch('/api/generate-image', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({prompt, style})
-    });
-    // Always parse response text first — avoids crashing on HTML error pages
-    const text = await r.text();
-    let d;
-    try { d = JSON.parse(text); }
-    catch { d = {error: `Server error (${r.status}). Please try again in a moment.`}; }
-    imgLoadingEl.style.display = 'none';
-    if (d.image) {
-      lastGeneratedImageB64 = d.image;
-      imgOutputEl.src = 'data:image/png;base64,' + d.image;
-      imgResultEl.style.display = 'block';
-      clearEmptyState();
-      const row = document.createElement('div'); row.className = 'msg-row ai';
-      const bubble = document.createElement('div'); bubble.className = 'msg ai'; bubble.style.padding='8px';
-      const cap = document.createElement('div'); cap.textContent = '🎨 ' + prompt;
-      cap.style.cssText = 'font-size:12px;opacity:.7;margin-bottom:8px;';
-      const img = document.createElement('img');
-      img.src = 'data:image/png;base64,' + d.image;
-      img.style.cssText = 'max-width:100%;border-radius:10px;display:block;';
-      bubble.appendChild(cap); bubble.appendChild(img); row.appendChild(bubble);
-      messagesEl.appendChild(row); scrollToBottom();
-    } else {
-      imgErrorEl.textContent = d.error || 'Image generation failed. Try again.';
-      imgErrorEl.style.display = 'block';
-    }
-  } catch(e) {
-    imgLoadingEl.style.display = 'none';
-    imgErrorEl.textContent = 'Connection error: ' + e.message + '. Check your internet and try again.';
-    imgErrorEl.style.display = 'block';
   }
-  finally { imgGenerateBtn2.disabled = false; }
-});
-if (imgCloseBtn2) imgCloseBtn2.addEventListener('click', () => imgModalOverlay.style.display='none');
-if (imgModalOverlay) imgModalOverlay.addEventListener('click', e => { if(e.target===imgModalOverlay) imgModalOverlay.style.display='none'; });
-if (imgPromptEl) imgPromptEl.addEventListener('keydown', e => { if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();imgGenerateBtn2.click();} });
-if (imgDownloadBtn2) imgDownloadBtn2.addEventListener('click', () => {
-  if (!lastGeneratedImageB64) return;
-  const a = document.createElement('a');
-  a.href = 'data:image/png;base64,' + lastGeneratedImageB64;
-  a.download = 'mythic-ai-image-' + Date.now() + '.png';
-  document.body.appendChild(a); a.click(); a.remove();
-});
-if (imgCopyBtn2) imgCopyBtn2.addEventListener('click', async () => {
-  if (!lastGeneratedImageB64) return;
-  try {
-    const res = await fetch('data:image/png;base64,' + lastGeneratedImageB64);
-    const blob = await res.blob();
-    await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-    const orig = imgCopyBtn2.textContent;
-    imgCopyBtn2.textContent = '✓ Copied';
-    setTimeout(() => { imgCopyBtn2.textContent = orig; }, 1200);
-  } catch { imgErrorEl.textContent = 'Copy not supported in this browser.'; imgErrorEl.style.display = 'block'; }
-});
-if (imgFullscreenBtn2) imgFullscreenBtn2.addEventListener('click', () => {
-  if (!lastGeneratedImageB64) return;
-  imgViewerImg.src = 'data:image/png;base64,' + lastGeneratedImageB64;
-  imgViewerOverlay.style.display = 'flex';
-});
-if (imgViewerOverlay) imgViewerOverlay.addEventListener('click', () => imgViewerOverlay.style.display = 'none');
-
-// ─── WEATHER MODAL JS ────────────────────────────────────────────────────────
-const weatherModal2    = document.getElementById('weather-modal-overlay');
-const weatherCityEl2   = document.getElementById('weather-city');
-const weatherResultEl2 = document.getElementById('weather-result');
-const weatherContentEl2= document.getElementById('weather-content');
-const weatherLoadingEl2= document.getElementById('weather-loading');
-const weatherErrorEl2  = document.getElementById('weather-error');
-const weatherSearchBtn2= document.getElementById('weather-search-btn');
-const weatherCloseBtn2 = document.getElementById('weather-close-btn');
-const weatherLocBtn2   = document.getElementById('weather-location-btn');
-
-function getRecentWeatherSearches() {
-  try { return JSON.parse(localStorage.getItem('mythic_recent_weather') || '[]'); } catch { return []; }
-}
-function addRecentWeatherSearch(name) {
-  let list = getRecentWeatherSearches().filter(x => x.toLowerCase() !== name.toLowerCase());
-  list.unshift(name);
-  list = list.slice(0, 6);
-  localStorage.setItem('mythic_recent_weather', JSON.stringify(list));
-}
-function renderRecentSearches() {
-  const recents = getRecentWeatherSearches();
-  const wrap = document.getElementById('weather-recents');
-  if (!recents.length) { if (wrap) wrap.remove(); return; }
-  let el = wrap;
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'weather-recents';
-    el.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;';
-    weatherCityEl2.parentNode.insertAdjacentElement('afterend', el);
-  }
-  el.innerHTML = '';
-  recents.forEach(name => {
-    const chip = document.createElement('button');
-    chip.textContent = name;
-    chip.style.cssText = 'background:var(--bg);border:1px solid var(--border);color:var(--muted);border-radius:20px;padding:5px 12px;font-size:12px;cursor:pointer;font-family:inherit;';
-    chip.addEventListener('click', () => fetchWeatherModal({ location: name }));
-    el.appendChild(chip);
-  });
+  let aiNode=null;
+  try{
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},signal:abortCtrl.signal,
+      body:JSON.stringify({message,conversation_id:activeId,attachment,user_name:getUserName(),regenerate:!!regenerate,news_context:newsCtx})});
+    if(!r.ok||!r.body){hideTyping();addMsg('error','Something went wrong. Try again.');return;}
+    hideTyping(); aiNode=addMsg('ai','');
+    const cid=r.headers.get('X-Conversation-Id'); if(cid) activeId=cid;
+    const reader=r.body.getReader(); const dec=new TextDecoder(); let full='';
+    while(true){ const{done,value}=await reader.read(); if(done) break; full+=dec.decode(value,{stream:true}); aiNode.textContent=full; scrollBottom(); }
+    speak(full); loadList();
+  }catch(err){
+    hideTyping();
+    if(err.name==='AbortError'){ if(aiNode&&!aiNode.textContent.trim()) aiNode.textContent='[Stopped]'; }
+    else addMsg('error','Network error: '+err.message);
+  }finally{ setGen(false); abortCtrl=null; }
 }
 
-function renderWeather(w) {
-  const hourly = (w.hourly || []).map(h => `
-    <div style="flex:0 0 auto;text-align:center;background:var(--bg);border-radius:10px;padding:8px 12px;min-width:64px;">
-      <div style="font-size:11px;color:var(--muted);">${h.time}</div>
-      <div style="font-size:20px;margin:4px 0;">${h.icon}</div>
-      <div style="font-size:13px;font-weight:700;">${h.temp}°</div>
-    </div>`).join('');
+form.addEventListener('submit',e=>{ e.preventDefault(); if(isGen) return; const t=inp.value.trim(); if(!t&&!pendingFile) return; const att=pendingFile; pendingFile=null; $('file-input').value=''; $('camera-input').value=''; $('selfie-input').value=''; $('pending-attach').classList.remove('show'); addMsg('user',t,att); inp.value=''; inp.style.height='auto'; streamReply({message:t,attachment:att}); });
+sendBtn.addEventListener('click',e=>{ if(isGen){ e.preventDefault(); abortCtrl&&abortCtrl.abort(); } });
+inp.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit();} });
+inp.addEventListener('input',resize);
 
-  const daily = (w.daily || []).map(d => `
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 4px;border-bottom:1px solid var(--border);">
-      <div style="flex:1;font-size:13px;">${d.day}</div>
-      <div style="font-size:18px;">${d.icon}</div>
-      <div style="flex:1;text-align:right;font-size:13px;"><span style="font-weight:700;">${d.max}°</span> <span style="color:var(--muted);">${d.min}°</span></div>
-    </div>`).join('');
+// Quick buttons
+$('hw-btn').addEventListener('click',()=>{ inp.value='Help me with my homework: '; inp.focus(); resize(); inp.setSelectionRange(inp.value.length,inp.value.length); });
+$('search-btn').addEventListener('click',()=>{ const q=prompt('What to search for?'); if(!q||!q.trim()) return; addMsg('user','Search: '+q.trim()); streamReply({message:'Search: '+q.trim()}); });
+$('news-btn').addEventListener('click',()=>{ addMsg('user','Today\'s top news'); streamReply({message:'Today\'s top news'}); });
+$('img-btn').addEventListener('click',()=>{ $('img-modal').classList.add('show'); $('img-prompt').focus(); });
+$('ghibli-btn').addEventListener('click',()=>{ $('ghibli-modal').classList.add('show'); });
+$('weather-btn').addEventListener('click',()=>{ $('weather-modal').classList.add('show'); $('weather-city').focus(); });
 
-  weatherContentEl2.innerHTML = `
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">
-      <div style="font-size:52px;">${w.icon}</div>
-      <div><div style="font-size:19px;font-weight:700;">${w.location}</div>
-      <div style="font-size:13px;color:var(--muted);">${w.condition}</div></div>
-      <div style="margin-left:auto;font-size:32px;font-weight:700;">${w.temp}°C</div>
-    </div>
-
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px;">
-      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
-        <div style="font-size:10px;color:var(--muted);">FEELS LIKE</div>
-        <div style="font-size:16px;font-weight:700;">${w.feels_like}°C</div>
-      </div>
-      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
-        <div style="font-size:10px;color:var(--muted);">HUMIDITY</div>
-        <div style="font-size:16px;font-weight:700;">${w.humidity}%</div>
-      </div>
-      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
-        <div style="font-size:10px;color:var(--muted);">WIND</div>
-        <div style="font-size:16px;font-weight:700;">${w.wind_speed} km/h</div>
-      </div>
-      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
-        <div style="font-size:10px;color:var(--muted);">UV INDEX</div>
-        <div style="font-size:16px;font-weight:700;">${w.uv ?? '–'}</div>
-      </div>
-      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
-        <div style="font-size:10px;color:var(--muted);">PRESSURE</div>
-        <div style="font-size:16px;font-weight:700;">${w.pressure ?? '–'} hPa</div>
-      </div>
-      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
-        <div style="font-size:10px;color:var(--muted);">VISIBILITY</div>
-        <div style="font-size:16px;font-weight:700;">${w.visibility ?? '–'} km</div>
-      </div>
-      ${w.aqi != null ? `
-      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
-        <div style="font-size:10px;color:var(--muted);">AIR QUALITY</div>
-        <div style="font-size:16px;font-weight:700;">${w.aqi}</div>
-      </div>` : ''}
-      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
-        <div style="font-size:10px;color:var(--muted);">SUNRISE</div>
-        <div style="font-size:14px;font-weight:700;">${w.sunrise ?? '–'}</div>
-      </div>
-      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
-        <div style="font-size:10px;color:var(--muted);">SUNSET</div>
-        <div style="font-size:14px;font-weight:700;">${w.sunset ?? '–'}</div>
-      </div>
-    </div>
-
-    ${hourly ? `<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">HOURLY FORECAST</div>
-    <div style="display:flex;gap:8px;overflow-x:auto;padding-bottom:6px;margin-bottom:12px;">${hourly}</div>` : ''}
-
-    ${daily ? `<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">7-DAY FORECAST</div>
-    <div style="margin-bottom:6px;">${daily}</div>` : ''}
-  `;
-  weatherResultEl2.style.display = 'block';
-  addRecentWeatherSearch(w.location);
-  renderRecentSearches();
-}
-
-async function fetchWeatherModal(payload) {
-  weatherResultEl2.style.display='none'; weatherErrorEl2.style.display='none';
-  weatherLoadingEl2.style.display='block'; weatherSearchBtn2.disabled=true;
-  try {
-    const r = await fetch('/api/weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    const d = await r.json(); weatherLoadingEl2.style.display='none';
-    if(d.weather) renderWeather(d.weather);
-    else { weatherErrorEl2.textContent=d.error||'Could not find that location. Try a different search.'; weatherErrorEl2.style.display='block'; }
-  } catch(e) { weatherLoadingEl2.style.display='none'; weatherErrorEl2.textContent='Network error: '+e.message; weatherErrorEl2.style.display='block'; }
-  finally { weatherSearchBtn2.disabled=false; }
-}
-if (weatherSearchBtn2) weatherSearchBtn2.addEventListener('click', () => { const loc=weatherCityEl2.value.trim(); if(loc) fetchWeatherModal({location:loc}); });
-if (weatherCityEl2) weatherCityEl2.addEventListener('keydown', e => { if(e.key==='Enter') weatherSearchBtn2.click(); });
-if (weatherCloseBtn2) weatherCloseBtn2.addEventListener('click', () => weatherModal2.style.display='none');
-if (weatherModal2) weatherModal2.addEventListener('click', e => { if(e.target===weatherModal2) weatherModal2.style.display='none'; });
-if (weatherLocBtn2) weatherLocBtn2.addEventListener('click', () => {
-  if (!navigator.geolocation) { weatherErrorEl2.textContent = 'Geolocation is not supported in this browser.'; weatherErrorEl2.style.display = 'block'; return; }
-  navigator.geolocation.getCurrentPosition(
-    pos => fetchWeatherModal({lat:pos.coords.latitude,lon:pos.coords.longitude}),
-    err => { weatherErrorEl2.textContent = 'Location error: ' + err.message; weatherErrorEl2.style.display = 'block'; }
-  );
+// Image modal
+const imgModal=$('img-modal');
+$('img-close').addEventListener('click',()=>imgModal.classList.remove('show'));
+imgModal.addEventListener('click',e=>{ if(e.target===imgModal) imgModal.classList.remove('show'); });
+$('img-prompt').addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('img-go').click();} });
+$('img-go').addEventListener('click',async()=>{
+  const prompt=$('img-prompt').value.trim(); const style=$('img-style').value;
+  if(!prompt) return;
+  $('img-result').style.display='none'; $('img-err').style.display='none'; $('img-loading').style.display='block'; $('img-go').disabled=true;
+  try{
+    const r=await fetch('/api/generate-image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,style})});
+    const d=await r.json(); $('img-loading').style.display='none';
+    if(d.image){ $('img-out').src='data:image/png;base64,'+d.image; $('img-result').style.display='block'; clearEmpty(); const row=document.createElement('div'); row.className='msg-row ai'; const b=document.createElement('div'); b.className='msg ai'; b.style.padding='8px'; const cap=document.createElement('div'); cap.textContent='🎨 '+prompt; cap.style.cssText='font-size:12px;opacity:.7;margin-bottom:8px'; const img=document.createElement('img'); img.src='data:image/png;base64,'+d.image; img.style.cssText='max-width:100%;border-radius:10px'; b.appendChild(cap); b.appendChild(img); row.appendChild(b); msgs.appendChild(row); scrollBottom(); }
+    else{ $('img-err').textContent=d.error||'Failed. Try again.'; $('img-err').style.display='block'; }
+  }catch(e){ $('img-loading').style.display='none'; $('img-err').textContent='Error: '+e.message; $('img-err').style.display='block'; }
+  finally{ $('img-go').disabled=false; }
 });
-renderRecentSearches();
+
+// Ghibli modal
+let ghibliB64=null;
+const ghibliModal=$('ghibli-modal');
+$('ghibli-close').addEventListener('click',()=>ghibliModal.classList.remove('show'));
+ghibliModal.addEventListener('click',e=>{ if(e.target===ghibliModal) ghibliModal.classList.remove('show'); });
+$('ghibli-upload').addEventListener('click',()=>$('ghibli-file').click());
+$('ghibli-file').addEventListener('change',()=>{
+  const file=$('ghibli-file').files[0]; if(!file) return;
+  const r=new FileReader(); r.onload=e=>{ ghibliB64=e.target.result.split(',')[1]; $('ghibli-preview').src=e.target.result; $('ghibli-preview-wrap').style.display='block'; $('ghibli-result-wrap').style.display='none'; }; r.readAsDataURL(file);
+});
+$('ghibli-go').addEventListener('click',async()=>{
+  if(!ghibliB64){ $('ghibli-err').textContent='Please upload your photo first!'; $('ghibli-err').style.display='block'; return; }
+  $('ghibli-err').style.display='none'; $('ghibli-result-wrap').style.display='none'; $('ghibli-loading').style.display='block'; $('ghibli-go').disabled=true;
+  const extra=$('ghibli-extra').value.trim();
+  const prompt=`Studio Ghibli anime portrait, Spirited Away style, soft watercolor art, beautiful detailed character, ${extra?extra+', ':''}masterpiece, highly detailed, dreamy atmosphere`;
+  try{
+    const r=await fetch('/api/generate-image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,style:'',image:ghibliB64})});
+    const d=await r.json(); $('ghibli-loading').style.display='none';
+    if(d.image){ $('ghibli-result').src='data:image/png;base64,'+d.image; $('ghibli-result-wrap').style.display='block'; clearEmpty(); const row=document.createElement('div'); row.className='msg-row ai'; const b=document.createElement('div'); b.className='msg ai'; b.style.padding='8px'; const cap=document.createElement('div'); cap.textContent='🌿 Your Ghibli portrait'; cap.style.cssText='font-size:12px;color:var(--muted);margin-bottom:8px'; const img=document.createElement('img'); img.src='data:image/png;base64,'+d.image; img.style.cssText='max-width:100%;border-radius:12px;cursor:pointer'; img.title='Click to download'; img.addEventListener('click',()=>dlImg(d.image,'mythic-ghibli.png')); b.appendChild(cap); b.appendChild(img); row.appendChild(b); msgs.appendChild(row); scrollBottom(); }
+    else{ $('ghibli-err').textContent=d.error||'Failed. Try again.'; $('ghibli-err').style.display='block'; }
+  }catch(e){ $('ghibli-loading').style.display='none'; $('ghibli-err').textContent='Error: '+e.message; $('ghibli-err').style.display='block'; }
+  finally{ $('ghibli-go').disabled=false; }
+});
+function dlImg(b64,name){ const a=document.createElement('a'); a.href='data:image/png;base64,'+b64; a.download=name; document.body.appendChild(a); a.click(); a.remove(); }
+$('ghibli-dl').addEventListener('click',()=>{ const src=$('ghibli-result').src; if(src) dlImg(src.split(',')[1],'mythic-ghibli.png'); });
+
+// Weather modal
+const weatherModal=$('weather-modal');
+$('weather-close').addEventListener('click',()=>weatherModal.classList.remove('show'));
+weatherModal.addEventListener('click',e=>{ if(e.target===weatherModal) weatherModal.classList.remove('show'); });
+$('weather-city').addEventListener('keydown',e=>{ if(e.key==='Enter') $('weather-go').click(); });
+async function fetchW(payload){
+  $('weather-result').style.display='none'; $('weather-err').style.display='none';
+  $('weather-loading').style.display='block'; $('weather-go').disabled=true;
+  try{
+    const r=await fetch('/api/weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json(); $('weather-loading').style.display='none';
+    if(d.weather){ const w=d.weather; $('weather-result').innerHTML=`<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div style="font-size:44px">${w.icon}</div><div><div style="font-size:17px;font-weight:700">${w.location}</div><div style="font-size:13px;color:var(--muted)">${w.condition}</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div style="background:var(--panel);border-radius:8px;padding:10px"><div style="font-size:11px;color:var(--muted)">TEMPERATURE</div><div style="font-size:22px;font-weight:700">${w.temp}°C</div><div style="font-size:11px;color:var(--muted)">Feels like ${w.feels_like}°C</div></div><div style="background:var(--panel);border-radius:8px;padding:10px"><div style="font-size:11px;color:var(--muted)">HUMIDITY</div><div style="font-size:22px;font-weight:700">${w.humidity}%</div><div style="font-size:11px;color:var(--muted)">Wind ${w.wind_speed} km/h</div></div></div>`; $('weather-result').style.display='block'; inp.value=`${w.icon} ${w.location}: ${w.temp}°C, ${w.condition}. Humidity: ${w.humidity}%, Wind: ${w.wind_speed} km/h.`; resize(); }
+    else{ $('weather-err').textContent=d.error||'Not found.'; $('weather-err').style.display='block'; }
+  }catch(e){ $('weather-loading').style.display='none'; $('weather-err').textContent='Error: '+e.message; $('weather-err').style.display='block'; }
+  finally{ $('weather-go').disabled=false; }
+}
+$('weather-go').addEventListener('click',()=>{ const loc=$('weather-city').value.trim(); if(loc) fetchW({location:loc}); });
+$('weather-loc-btn').addEventListener('click',()=>{ if(!navigator.geolocation){alert('Geolocation not supported');return;} navigator.geolocation.getCurrentPosition(p=>fetchW({lat:p.coords.latitude,lon:p.coords.longitude}),e=>alert('Location error: '+e.message)); });
+
+// Init
+(async()=>{ const convs=await loadList(); if(convs.length>0) openConv(convs[0].id); else showEmpty(); })();
+
+// Auto fullscreen on first interaction
+let autoFsDone=false;
+async function autoFs(){ if(autoFsDone) return; autoFsDone=true; try{ const el=document.documentElement; el.requestFullscreen?await el.requestFullscreen():el.webkitRequestFullscreen&&el.webkitRequestFullscreen(); }catch{} }
+['click','touchstart','keydown'].forEach(e=>document.addEventListener(e,autoFs,{once:true,capture:true}));
 </script>
 </body>
 </html>
 """
+
+@app.route("/api/models")
+def api_models():
+    return jsonify({"models":[
+        {"id":"mythic-1","name":"Mythic 1","desc":"Fast & light","vip":False},
+        {"id":"mythic-2","name":"Mythic 2","desc":"Smart & balanced","vip":False},
+        {"id":"mythic-pro","name":"Mythic Pro","desc":"Advanced reasoning","vip":False},
+        {"id":"mythic-vip","name":"Mythic VIP ✨","desc":"Most powerful","vip":True},
+    ],"default":"mythic-2"})
+
+@app.route("/api/vip-unlock", methods=["POST"])
+def api_vip_unlock():
+    d = request.get_json(force=True) or {}
+    if d.get("password") == VIP_PASSWORD:
+        session["vip"] = True
+        return jsonify({"success": True})
+    return jsonify({"success": False}), 403
+
+@app.route("/api/vip-status")
+def api_vip_status():
+    return jsonify({"vip": bool(session.get("vip"))})
 
 @app.route("/")
 @login_required
 def index():
     return Response(PAGE, mimetype="text/html; charset=utf-8")
 
-
 @app.route("/api/conversations", methods=["GET"])
 @login_required
-def api_list_conversations():
-    return jsonify({"conversations": list_conversations(current_username())})
+def api_list(): return jsonify({"conversations": list_conversations(current_username())})
 
-
-@app.route("/api/conversations/<conv_id>", methods=["GET"])
+@app.route("/api/conversations/<cid>", methods=["GET"])
 @login_required
-def api_get_conversation(conv_id):
-    data = load_conversation(current_username(), conv_id)
-    if data is None:
-        return jsonify({"error": "not found"}), 404
-    simplified = []
-    for m in data.get("messages", []):
-        role = "user" if m["role"] == "user" else "ai"
-        text_parts = [p.get("text", "") for p in m["parts"] if "text" in p]
-        entry = {"role": role, "text": "".join(text_parts)}
-        if m.get("attachment_meta"):
-            entry["attachment"] = m["attachment_meta"]
+def api_get(cid):
+    data=load_conversation(current_username(),cid)
+    if not data: return jsonify({"error":"not found"}),404
+    simplified=[]
+    for m in data.get("messages",[]):
+        role="user" if m["role"]=="user" else "ai"
+        text="".join(p.get("text","") for p in m["parts"] if "text" in p)
+        entry={"role":role,"text":text}
+        if m.get("attachment_meta"): entry["attachment"]=m["attachment_meta"]
         simplified.append(entry)
-    return jsonify({"messages": simplified, "title": data.get("title", "New chat")})
+    return jsonify({"messages":simplified,"title":data.get("title","New chat")})
 
-
-@app.route("/api/conversations/<conv_id>", methods=["DELETE"])
+@app.route("/api/conversations/<cid>", methods=["DELETE"])
 @login_required
-def api_delete_conversation(conv_id):
-    delete_conversation(current_username(), conv_id)
-    return jsonify({"status": "deleted"})
+def api_del(cid):
+    delete_conversation(current_username(),cid); return jsonify({"status":"deleted"})
 
-
-@app.route("/api/conversations/<conv_id>", methods=["PATCH"])
+@app.route("/api/conversations/<cid>", methods=["PATCH"])
 @login_required
-def api_rename_conversation(conv_id):
-    data = request.get_json(force=True) or {}
-    new_title = (data.get("title") or "").strip()[:120]
-    if not new_title:
-        return jsonify({"error": "title is required"}), 400
-    username = current_username()
-    conv = load_conversation(username, conv_id)
-    if conv is None:
-        return jsonify({"error": "not found"}), 404
-    conv["title"] = new_title
-    save_conversation(username, conv_id, conv)
-    return jsonify({"status": "renamed", "title": new_title})
+def api_rename(cid):
+    data=request.get_json(force=True) or {}
+    title=(data.get("title") or "").strip()[:120]
+    if not title: return jsonify({"error":"title required"}),400
+    u=current_username(); conv=load_conversation(u,cid)
+    if not conv: return jsonify({"error":"not found"}),404
+    conv["title"]=title; save_conversation(u,cid,conv)
+    return jsonify({"status":"renamed","title":title})
 
-
-def to_openai_messages(gemini_messages, system_prompt):
-    """Convert stored Gemini-format messages to OpenAI-compatible chat format.
-    Used by both Groq and Cerebras (both use the same OpenAI-style chat API)."""
-    msgs = [{"role": "system", "content": system_prompt}]
-    for m in gemini_messages:
-        role = "user" if m["role"] == "user" else "assistant"
-        text = "".join(p.get("text", "") for p in m["parts"] if "text" in p)
-        msgs.append({"role": role, "content": text})
+def to_openai(messages, sp):
+    msgs=[{"role":"system","content":sp}]
+    for m in messages:
+        role="user" if m["role"]=="user" else "assistant"
+        text="".join(p.get("text","") for p in m["parts"] if "text" in p)
+        msgs.append({"role":role,"content":text})
     return msgs
 
+def to_ollama(messages, sp):
+    msgs=[{"role":"system","content":sp}]
+    for m in messages:
+        role="user" if m["role"]=="user" else "assistant"
+        text="".join(p.get("text","") for p in m["parts"] if "text" in p)
+        entry={"role":role,"content":text}
+        imgs=[p["inline_data"]["data"] for p in m["parts"] if "inline_data" in p and p["inline_data"].get("mime_type","").startswith("image/")]
+        if imgs: entry["images"]=imgs
+        msgs.append(entry)
+    return msgs
 
-def _openai_style_stream(url, api_key, model, messages, provider_label):
-    """Shared streaming logic for Groq/Cerebras (both are OpenAI-compatible).
-    Yields nothing at all on ANY failure (auth, rate limit, timeout, invalid
-    model, network error, 4xx/5xx) so the caller can silently fall through to
-    the next provider without ever exposing a provider error to the user."""
-    if not api_key:
-        return
+def groq_chunks(msgs, model=None):
+    if not GROQ_API_KEY: return
+    m=model or GROQ_MODEL
     try:
-        resp = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
-            stream=True, timeout=60,
-        )
-    except requests.RequestException:
-        return  # network error / timeout — silently fall through
+        resp=requests.post("https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"},
+            json={"model":m,"messages":msgs,"stream":True,"max_tokens":2048},stream=True,timeout=60)
+        resp.encoding="utf-8"
+        if resp.status_code==200:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"): continue
+                d=line[5:].strip()
+                if d=="[DONE]": break
+                try:
+                    c=json.loads(d)["choices"][0]["delta"].get("content","")
+                    if c: yield c
+                except: continue
+        else: print(f"[Groq] {resp.status_code}: {resp.text[:200]}")
+    except Exception as e: print(f"[Groq] error: {e}")
 
-    if resp.status_code != 200:
-        # rate limit (429), server error (5xx), invalid model, auth error, etc. —
-        # all mean "silently try the next provider", never shown to the user.
-        return
+def cerebras_chunks(msgs, model=None):
+    if not CEREBRAS_API_KEY: return
+    m=model or CEREBRAS_MODEL
+    try:
+        resp=requests.post("https://api.cerebras.ai/v1/chat/completions",
+            headers={"Authorization":f"Bearer {CEREBRAS_API_KEY}","Content-Type":"application/json"},
+            json={"model":m,"messages":msgs,"stream":True,"max_tokens":2048},stream=True,timeout=60)
+        resp.encoding="utf-8"
+        if resp.status_code==200:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"): continue
+                d=line[5:].strip()
+                if d=="[DONE]": break
+                try:
+                    c=json.loads(d)["choices"][0]["delta"].get("content","")
+                    if c: yield c
+                except: continue
+        else: print(f"[Cerebras] {resp.status_code}: {resp.text[:200]}")
+    except Exception as e: print(f"[Cerebras] error: {e}")
 
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data:"):
-            continue
-        data_str = line[5:].strip()
-        if data_str == "[DONE]":
-            break
+def openrouter_chunks(msgs, model=None):
+    if not OPENROUTER_API_KEY: return
+    m=model or OPENROUTER_MODEL
+    try:
+        resp=requests.post("https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization":f"Bearer {OPENROUTER_API_KEY}","Content-Type":"application/json","HTTP-Referer":"https://aarav-ai.onrender.com","X-Title":"Mythic AI"},
+            json={"model":m,"messages":msgs,"stream":True,"max_tokens":2048},stream=True,timeout=60)
+        resp.encoding="utf-8"
+        if resp.status_code==200:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"): continue
+                d=line[5:].strip()
+                if d=="[DONE]": break
+                try:
+                    c=json.loads(d)["choices"][0]["delta"].get("content","")
+                    if c: yield c
+                except: continue
+        else: print(f"[OpenRouter] {resp.status_code}: {resp.text[:200]}")
+    except Exception as e: print(f"[OpenRouter] error: {e}")
+
+def ollama_chunks(msgs):
+    try:
+        resp=requests.post(f"{OLLAMA_URL}/api/chat",json={"model":OLLAMA_MODEL,"messages":msgs,"stream":True},stream=True,timeout=120)
+        resp.encoding="utf-8"
+        if resp.status_code!=200: yield f"[Ollama error {resp.status_code}]"; return
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line: continue
+            try:
+                obj=json.loads(line)
+                if obj.get("error"): yield f"[Ollama: {obj['error']}]"; return
+                c=obj.get("message",{}).get("content","")
+                if c: yield c
+                if obj.get("done"): break
+            except: continue
+    except Exception as e: yield f"[Ollama error: {e}]"
+
+def gemini_chunks(payload):
+    if not GEMINI_API_KEY: return
+    try:
+        resp=requests.post(GEMINI_STREAM_URL,params={"key":GEMINI_API_KEY,"alt":"sse"},json=payload,stream=True,timeout=60)
+        resp.encoding="utf-8"
+        if resp.status_code!=200: return
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"): continue
+            d=line[len("data:"):].strip()
+            if not d or d=="[DONE]": continue
+            try:
+                obj=json.loads(d)
+                for p in obj["candidates"][0]["content"]["parts"]:
+                    if "text" in p: yield p["text"]
+            except: continue
+    except: return
+
+_pi=[0]
+def auto_chunks(payload, messages, sp):
+    oms=to_openai(messages,sp)
+    providers=[]
+    if PROVIDER in("auto","cerebras") and CEREBRAS_API_KEY: providers.append(("Cerebras",lambda:cerebras_chunks(oms)))
+    if PROVIDER in("auto","groq") and GROQ_API_KEY: providers.append(("Groq",lambda:groq_chunks(oms)))
+    if PROVIDER in("auto","openrouter") and OPENROUTER_API_KEY: providers.append(("OpenRouter",lambda:openrouter_chunks(oms)))
+    if PROVIDER in("auto","gemini") and GEMINI_API_KEY: providers.append(("Gemini",lambda:gemini_chunks(payload)))
+    if PROVIDER=="ollama": providers.append(("Ollama",lambda:ollama_chunks(to_ollama(messages,sp))))
+    if not providers: yield "[No AI provider configured. Set at least one API key.]"; return
+    n=len(providers); start=_pi[0]%n
+    for i in range(n):
+        idx=(start+i)%n; name,fn=providers[idx]; collected=[]
         try:
-            obj = json.loads(data_str)
-            content = obj["choices"][0]["delta"].get("content", "")
-            if content:
-                yield content
-        except (json.JSONDecodeError, KeyError, IndexError):
-            continue
+            for chunk in fn(): collected.append(chunk); yield chunk
+            if collected: _pi[0]=(idx+1)%n; return
+        except: pass
+    yield "[All providers failed. Check logs.]"
 
+def fetch_news(query=None, category=None):
+    if not NEWS_API_KEY: return None
+    params={"apiKey":NEWS_API_KEY,"country":"in","pageSize":8}
+    if query: params["q"]=query; url="https://newsapi.org/v2/everything"; params.pop("country",None); params["sortBy"]="publishedAt"; params["language"]="en"
+    else: url="https://newsapi.org/v2/top-headlines"
+    if category: params["category"]=category
+    try:
+        r=requests.get(url,params=params,timeout=8)
+        if r.status_code==200:
+            arts=r.json().get("articles",[])
+            return [{"title":a["title"],"source":a["source"]["name"],"url":a["url"]} for a in arts if a.get("title") and "[Removed]" not in a["title"]]
+    except: pass
+    return None
 
-def groq_stream_chunks(messages):
-    """Stream from Groq (primary chat provider — fast, generous free tier)."""
-    yield from _openai_style_stream(
-        "https://api.groq.com/openai/v1/chat/completions",
-        GROQ_API_KEY, GROQ_MODEL, messages, "Groq",
-    )
-
-
-def cerebras_stream_chunks(messages):
-    """Stream from Cerebras (automatic fallback if Groq is unavailable)."""
-    yield from _openai_style_stream(
-        "https://api.cerebras.ai/v1/chat/completions",
-        CEREBRAS_API_KEY, CEREBRAS_MODEL, messages, "Cerebras",
-    )
-
-
-def auto_stream_chunks(gemini_payload, gemini_messages, system_prompt=None):
-    """Groq first, Cerebras as a silent automatic fallback.
-    Never asks the user to pick a provider and never exposes provider errors —
-    if Groq yields nothing (rate limit, timeout, invalid model, network error,
-    4xx/5xx), we just move on to Cerebras with no visible interruption."""
-    sp = system_prompt or SYSTEM_PROMPT
-    openai_msgs = to_openai_messages(gemini_messages, sp)
-
-    order = []
-    if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
-        order.append(("Groq", lambda: groq_stream_chunks(openai_msgs)))
-    if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
-        order.append(("Cerebras", lambda: cerebras_stream_chunks(openai_msgs)))
-
-    if not order:
-        yield "I'm not able to respond right now — no AI provider is configured on the server."
-        return
-
-    for _name, fn in order:
-        collected = False
-        try:
-            for chunk in fn():
-                collected = True
-                yield chunk
-            if collected:
-                return
-        except Exception:
-            pass
-        # silently move on to the next provider
-
-    yield "I'm having trouble reaching the AI service right now — please try again in a moment."
-
-
-# --- Model selector (cosmetic tiers over the same underlying providers) -----
-# "VIP" is gated by a password so it isn't just a free option in the dropdown.
-# Set VIP_PASSWORD as an environment variable — if it's never set, the VIP
-# tier simply can't be unlocked (safe default, no hardcoded password).
-VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "")
-
-MODEL_CATALOG = [
-    {"id": "mythic-1", "name": "Mythic 1", "vip": False},
-    {"id": "mythic-2", "name": "Mythic 2", "vip": False},
-    {"id": "mythic-3", "name": "Mythic 3", "vip": False},
-    {"id": "mythic-vip", "name": "Mythic VIP 🔒", "vip": True},
-]
-DEFAULT_MODEL_ID = "mythic-2"
-
-
-@app.route("/api/models", methods=["GET"])
+@app.route("/api/news", methods=["POST"])
 @login_required
-def api_models():
-    return jsonify({"models": MODEL_CATALOG, "default": DEFAULT_MODEL_ID})
+def get_news():
+    d=request.get_json(force=True) or {}
+    arts=fetch_news(query=d.get("query"),category=d.get("category"))
+    if arts is None: return jsonify({"error":"News unavailable"}),503
+    return jsonify({"articles":arts})
 
-
-@app.route("/api/vip-status", methods=["GET"])
+@app.route("/api/search", methods=["POST"])
 @login_required
-def api_vip_status():
-    return jsonify({"vip": bool(session.get("vip_unlocked"))})
-
-
-@app.route("/api/vip-unlock", methods=["POST"])
-@login_required
-def api_vip_unlock():
-    data = request.get_json(force=True) or {}
-    password = data.get("password") or ""
-    if VIP_PASSWORD and password == VIP_PASSWORD:
-        session["vip_unlocked"] = True
-        session.permanent = True
-        return jsonify({"success": True})
-    return jsonify({"success": False})
-
-
-# --- Weather (Open-Meteo — free, no API key needed, works for any country/city) ---
-_WMO_ICON = {
-    0: ("☀️", "Clear sky"), 1: ("🌤", "Mainly clear"), 2: ("⛅", "Partly cloudy"), 3: ("☁️", "Overcast"),
-    45: ("🌫", "Fog"), 48: ("🌫", "Freezing fog"),
-    51: ("🌦", "Light drizzle"), 53: ("🌦", "Drizzle"), 55: ("🌧", "Dense drizzle"),
-    56: ("🌧", "Freezing drizzle"), 57: ("🌧", "Freezing drizzle"),
-    61: ("🌧", "Light rain"), 63: ("🌧", "Rain"), 65: ("🌧", "Heavy rain"),
-    66: ("🌧", "Freezing rain"), 67: ("🌧", "Freezing rain"),
-    71: ("🌨", "Light snow"), 73: ("🌨", "Snow"), 75: ("❄️", "Heavy snow"), 77: ("❄️", "Snow grains"),
-    80: ("🌦", "Rain showers"), 81: ("🌧", "Rain showers"), 82: ("⛈", "Violent rain showers"),
-    85: ("🌨", "Snow showers"), 86: ("❄️", "Snow showers"),
-    95: ("⛈", "Thunderstorm"), 96: ("⛈", "Thunderstorm with hail"), 99: ("⛈", "Thunderstorm with hail"),
-}
-
-
-def _wmo(code):
-    return _WMO_ICON.get(code, ("🌡", "Unknown"))
-
-
-def _aqi_label(us_aqi):
-    if us_aqi is None:
-        return None
-    if us_aqi <= 50: return f"{us_aqi} (Good)"
-    if us_aqi <= 100: return f"{us_aqi} (Moderate)"
-    if us_aqi <= 150: return f"{us_aqi} (Unhealthy for sensitive groups)"
-    if us_aqi <= 200: return f"{us_aqi} (Unhealthy)"
-    if us_aqi <= 300: return f"{us_aqi} (Very unhealthy)"
-    return f"{us_aqi} (Hazardous)"
-
+def web_search():
+    d=request.get_json(force=True) or {}
+    query=(d.get("query") or "").strip()
+    if not query: return jsonify({"error":"query required"}),400
+    try:
+        r=requests.get("https://api.duckduckgo.com/",params={"q":query,"format":"json","no_html":1,"skip_disambig":1},headers={"User-Agent":"MythicAI/1.0"},timeout=8)
+        if r.status_code!=200: return jsonify({"results":[],"query":query})
+        data=r.json(); results=[]
+        if data.get("Answer"): results.append({"title":"Answer","snippet":data["Answer"],"url":"","source":data.get("AnswerType","")})
+        if data.get("AbstractText"): results.append({"title":data.get("Heading",query),"snippet":data["AbstractText"],"url":data.get("AbstractURL",""),"source":data.get("AbstractSource","")})
+        for t in data.get("RelatedTopics",[])[:5]:
+            if isinstance(t,dict) and t.get("Text"): results.append({"title":t["Text"][:80],"snippet":t["Text"],"url":t.get("FirstURL",""),"source":"DuckDuckGo"})
+        return jsonify({"results":results[:6],"query":query})
+    except Exception as e: return jsonify({"error":str(e)}),502
 
 @app.route("/api/weather", methods=["POST"])
 @login_required
-def api_weather():
-    data = request.get_json(force=True) or {}
-    location_name = (data.get("location") or "").strip()
-    lat = data.get("lat")
-    lon = data.get("lon")
-    display_name = location_name
-
+def get_weather():
+    d=request.get_json(force=True) or {}
+    location=(d.get("location") or "").strip(); lat=d.get("lat"); lon=d.get("lon")
+    if not location and (lat is None or lon is None): return jsonify({"error":"location or coordinates required"}),400
     try:
-        if lat is None or lon is None:
-            if not location_name:
-                return jsonify({"error": "Enter a city or use your location."}), 400
-            geo = requests.get(
-                "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": location_name, "count": 1, "language": "en", "format": "json"},
-                timeout=10,
-            ).json()
-            results = geo.get("results") or []
-            if not results:
-                return jsonify({"error": f'Could not find "{location_name}".'}), 404
-            top = results[0]
-            lat, lon = top["latitude"], top["longitude"]
-            parts = [top.get("name")]
-            if top.get("admin1") and top.get("admin1") != top.get("name"):
-                parts.append(top["admin1"])
-            if top.get("country"):
-                parts.append(top["country"])
-            display_name = ", ".join(p for p in parts if p)
+        if lat is not None and lon is not None:
+            geo=requests.get("https://nominatim.openstreetmap.org/reverse",params={"lat":lat,"lon":lon,"format":"json"},headers={"User-Agent":"MythicAI/1.0"},timeout=8)
+            addr=geo.json().get("address",{}) if geo.status_code==200 else {}
+            location_name=addr.get("city") or addr.get("town") or addr.get("village") or "Your Location"
+        else:
+            geo=requests.get("https://geocoding-api.open-meteo.com/v1/search",params={"name":location,"count":1,"language":"en","format":"json"},timeout=8)
+            if geo.status_code!=200 or not geo.json().get("results"): return jsonify({"error":f"City '{location}' not found"}),404
+            res=geo.json()["results"][0]; lat=res["latitude"]; lon=res["longitude"]; location_name=res["name"]+", "+res.get("country","")
+        wr=requests.get("https://api.open-meteo.com/v1/forecast",params={"latitude":lat,"longitude":lon,"current":"temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m","wind_speed_unit":"kmh","timezone":"auto"},timeout=8)
+        if wr.status_code!=200: return jsonify({"error":"Weather unavailable"}),502
+        cur=wr.json()["current"]; code=cur.get("weather_code",0)
+        wmo={0:"Clear sky",1:"Mainly clear",2:"Partly cloudy",3:"Overcast",45:"Foggy",48:"Icy fog",51:"Light drizzle",53:"Drizzle",55:"Heavy drizzle",61:"Light rain",63:"Rain",65:"Heavy rain",71:"Light snow",73:"Snow",75:"Heavy snow",80:"Rain showers",81:"Heavy showers",82:"Violent showers",95:"Thunderstorm",96:"Thunderstorm with hail",99:"Heavy thunderstorm"}
+        icons={0:"☀️",1:"🌤",2:"⛅",3:"☁️",45:"🌫",48:"🌫",51:"🌦",53:"🌧",55:"🌧",61:"🌦",63:"🌧",65:"🌧",71:"🌨",73:"❄️",75:"❄️",80:"🌧",81:"🌧",82:"⛈",95:"⛈",96:"⛈",99:"⛈"}
+        return jsonify({"weather":{"location":location_name,"temp":round(cur["temperature_2m"]),"feels_like":round(cur["apparent_temperature"]),"condition":wmo.get(code,"Unknown"),"humidity":cur["relative_humidity_2m"],"wind_speed":round(cur["wind_speed_10m"]),"icon":icons.get(code,"🌡")}})
+    except Exception as e: return jsonify({"error":str(e)}),502
 
-        fr = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat, "longitude": lon,
-                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,"
-                           "wind_speed_10m,pressure_msl,visibility",
-                "hourly": "temperature_2m,weather_code",
-                "daily": "weather_code,temperature_2m_max,temperature_2m_min,uv_index_max,"
-                         "sunrise,sunset",
-                "timezone": "auto",
-                "forecast_days": 7,
-            },
-            timeout=10,
-        ).json()
+def pollinations_image(prompt, style=""):
+    import urllib.parse, random
+    quality="masterpiece, best quality, ultra detailed, sharp focus"
+    full=f"{prompt}, {style} style, {quality}" if style else f"{prompt}, {quality}"
+    encoded=urllib.parse.quote(full)
+    seed=random.randint(1,999999)
+    url=f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&model=flux&nologo=true&enhance=true&seed={seed}"
+    try:
+        resp=requests.get(url,timeout=90,headers={"User-Agent":"MythicAI/1.0"})
+        if resp.status_code==200 and resp.headers.get("content-type","").startswith("image/") and len(resp.content)>20000:
+            return base64.b64encode(resp.content).decode()
+    except: pass
+    return None
 
-        current = fr.get("current", {})
-        hourly_raw = fr.get("hourly", {})
-        daily_raw = fr.get("daily", {})
-
-        # If reverse-geolocated (lat/lon only, no location_name given), try to label it nicely.
-        if not display_name:
-            try:
-                rev = requests.get(
-                    "https://geocoding-api.open-meteo.com/v1/reverse",
-                    params={"latitude": lat, "longitude": lon, "language": "en", "format": "json"},
-                    timeout=8,
-                ).json()
-                rr = (rev.get("results") or [None])[0]
-                if rr:
-                    display_name = ", ".join(p for p in [rr.get("name"), rr.get("country")] if p)
-            except Exception:
-                pass
-            display_name = display_name or f"{lat:.2f}, {lon:.2f}"
-
-        icon, condition = _wmo(current.get("weather_code"))
-
-        # Air quality (best-effort — not fatal if it fails)
-        aqi = None
-        try:
-            aq = requests.get(
-                "https://air-quality-api.open-meteo.com/v1/air-quality",
-                params={"latitude": lat, "longitude": lon, "current": "us_aqi"},
-                timeout=8,
-            ).json()
-            aqi = _aqi_label((aq.get("current") or {}).get("us_aqi"))
-        except Exception:
-            pass
-
-        # Next 8 hours, from "now" onward
-        hourly = []
-        times = hourly_raw.get("time", [])
-        temps = hourly_raw.get("temperature_2m", [])
-        codes = hourly_raw.get("weather_code", [])
-        now_iso = current.get("time", "")
-        start_idx = 0
-        for i, t in enumerate(times):
-            if t >= now_iso:
-                start_idx = i
-                break
-        for i in range(start_idx, min(start_idx + 8, len(times))):
-            hi, _ = _wmo(codes[i] if i < len(codes) else None)
-            hour_label = times[i][11:16] if len(times[i]) >= 16 else times[i]
-            hourly.append({"time": hour_label, "icon": hi, "temp": round(temps[i]) if i < len(temps) else None})
-
-        daily = []
-        d_times = daily_raw.get("time", [])
-        d_max = daily_raw.get("temperature_2m_max", [])
-        d_min = daily_raw.get("temperature_2m_min", [])
-        d_codes = daily_raw.get("weather_code", [])
-        weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        for i, t in enumerate(d_times):
-            try:
-                y, m, dd = [int(x) for x in t.split("-")]
-                import datetime as _dt
-                wd = weekday_names[_dt.date(y, m, dd).weekday()]
-            except Exception:
-                wd = t
-            di, _ = _wmo(d_codes[i] if i < len(d_codes) else None)
-            daily.append({
-                "day": "Today" if i == 0 else wd,
-                "icon": di,
-                "max": round(d_max[i]) if i < len(d_max) else None,
-                "min": round(d_min[i]) if i < len(d_min) else None,
-            })
-
-        weather = {
-            "location": display_name,
-            "icon": icon,
-            "condition": condition,
-            "temp": round(current.get("temperature_2m", 0)),
-            "feels_like": round(current.get("apparent_temperature", 0)),
-            "humidity": current.get("relative_humidity_2m"),
-            "wind_speed": round(current.get("wind_speed_10m", 0)),
-            "pressure": round(current.get("pressure_msl")) if current.get("pressure_msl") is not None else None,
-            "visibility": round((current.get("visibility") or 0) / 1000, 1) if current.get("visibility") is not None else None,
-            "uv": (daily_raw.get("uv_index_max") or [None])[0],
-            "sunrise": (daily_raw.get("sunrise") or [None])[0][11:16] if (daily_raw.get("sunrise") or [None])[0] else None,
-            "sunset": (daily_raw.get("sunset") or [None])[0][11:16] if (daily_raw.get("sunset") or [None])[0] else None,
-            "aqi": aqi,
-            "hourly": hourly,
-            "daily": daily,
-        }
-        return jsonify({"weather": weather})
-    except requests.RequestException as e:
-        return jsonify({"error": f"Weather service unavailable: {e}"}), 502
-    except Exception as e:
-        return jsonify({"error": f"Could not process weather data: {e}"}), 500
-
-
-@app.route("/api/chat", methods=["POST"])
-@login_required
-def chat():
-    data = request.get_json(force=True) or {}
-    user_message = (data.get("message") or "").strip()
-    conv_id = data.get("conversation_id")
-    attachment = data.get("attachment")  # {name, mimeType, dataBase64} or None
-    user_name = (data.get("user_name") or "").strip()[:60]  # what Ꮇʏᴛʜɪᴄ ᴀɪ should call the user
-    requested_model = (data.get("model") or DEFAULT_MODEL_ID).strip()
-    regenerate = bool(data.get("regenerate"))
-
-    if regenerate:
-        if not conv_id:
-            return jsonify({"error": "conversation_id is required to regenerate"}), 400
-    elif not user_message and not attachment:
-        return jsonify({"error": "message or attachment is required"}), 400
-
-    if attachment:
-        try:
-            raw = base64.b64decode(attachment.get("dataBase64", ""), validate=True)
-        except Exception:
-            return jsonify({"error": "invalid attachment data"}), 400
-        if len(raw) > MAX_UPLOAD_BYTES:
-            return jsonify({"error": "attachment too large (max 8MB)"}), 400
-
-    username = current_username()
-    conv = load_conversation(username, conv_id) if conv_id else None
-    if conv is None:
-        if regenerate:
-            return jsonify({"error": "conversation not found"}), 404
-        conv_id = str(uuid.uuid4())
-        conv = {"title": make_title(user_message), "messages": []}
-
-    messages = conv.setdefault("messages", [])
-
-    if regenerate:
-        # Drop the most recent assistant reply (if any) so a fresh one replaces it.
-        # Leaves the preceding user message in place to regenerate against.
-        if messages and messages[-1]["role"] == "model":
-            messages.pop()
-        if not messages or messages[-1]["role"] != "user":
-            return jsonify({"error": "nothing to regenerate"}), 400
-    else:
-        user_parts = []
-        if user_message:
-            user_parts.append({"text": user_message})
-        attachment_meta = None
-        if attachment:
-            mime_type = attachment.get("mimeType", "application/octet-stream")
-            user_parts.append({
-                "inline_data": {"mime_type": mime_type, "data": attachment["dataBase64"]}
-            })
-            attachment_meta = {"name": attachment.get("name", "file"), "mimeType": mime_type}
-
-        user_entry = {"role": "user", "parts": user_parts}
-        if attachment_meta:
-            user_entry["attachment_meta"] = attachment_meta
-        messages.append(user_entry)
-
-    effective_system_prompt = SYSTEM_PROMPT
-    if user_name:
-        effective_system_prompt += (
-            f" The user has told you their preferred name is \"{user_name}\". "
-            f"Address them as {user_name} naturally where it fits (e.g. greetings, "
-            f"acknowledgements) — don't force it into every single reply."
-        )
-    if requested_model == "mythic-vip" and session.get("vip_unlocked"):
-        effective_system_prompt += (
-            " The user is on the VIP tier — feel free to go deeper and be more "
-            "thorough than usual when it's helpful, without padding for its own sake."
-        )
-
-    def generate():
-        full_reply = []
-        chunk_source = auto_stream_chunks(None, messages, effective_system_prompt)
-
-        for chunk in chunk_source:
-            full_reply.append(chunk)
-            yield chunk
-        messages.append({"role": "model", "parts": [{"text": "".join(full_reply)}]})
-        save_conversation(username, conv_id, conv)
-
-    resp = Response(stream_with_context(generate()), mimetype="text/plain; charset=utf-8")
-    resp.headers["X-Conversation-Id"] = conv_id
-    return resp
-
-
-@app.route("/api/temp-image/<img_id>", methods=["GET"])
-def serve_temp_image(img_id):
-    """Serves a temporarily-stashed upload so NanoBanana's servers can fetch it
-    by URL for image-to-image editing. See _store_temp_image() above."""
-    entry = _TEMP_IMAGES.get(img_id)
-    if not entry:
-        return jsonify({"error": "not found or expired"}), 404
-    return Response(entry["data"], mimetype=entry["mime_type"])
-
+def nano_banana_image(prompt, style="", input_image_b64=None):
+    if not NANO_BANANA_API_KEY: return None, "No Nano Banana key"
+    full=f"{prompt}, {style} style" if style else prompt
+    parts=[{"text":full}]
+    if input_image_b64: parts.append({"inline_data":{"mime_type":"image/jpeg","data":input_image_b64}})
+    payload={"contents":[{"role":"user","parts":parts}],"generationConfig":{"responseModalities":["IMAGE"]}}
+    try:
+        resp=requests.post(NANO_BANANA_URL,params={"key":NANO_BANANA_API_KEY},json=payload,timeout=60)
+        if resp.status_code==200:
+            for part in resp.json()["candidates"][0]["content"]["parts"]:
+                inline=part.get("inline_data") or part.get("inlineData")
+                if inline and inline.get("data"): return inline["data"], None
+            return None, "No image in response"
+        return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as e: return None, str(e)
 
 @app.route("/api/generate-image", methods=["POST"])
 @login_required
 def generate_image():
-    try:
-        data = request.get_json(force=True) or {}
-        prompt = data.get("prompt", "").strip()
-        image_b64 = data.get("imageBase64")
-        mime_type = data.get("mimeType", "image/jpeg")
-        style = data.get("style", "").strip()
-        if not prompt:
-            return jsonify({"error": "prompt required"}), 400
+    data=request.get_json(force=True) or {}
+    prompt=(data.get("prompt") or "").strip()
+    style=(data.get("style") or "").strip()
+    input_image_b64=data.get("image")
+    if not prompt: return jsonify({"error":"prompt required"}),400
+    img, err = nano_banana_image(prompt, style, input_image_b64)
+    if img: return jsonify({"image":img,"provider":"nano-banana"})
+    print(f"[NanoBanana] failed: {err}, trying Pollinations...")
+    img=pollinations_image(prompt,style)
+    if img:
+        result={"image":img,"provider":"pollinations"}
+        if input_image_b64: result["note"]="Your photo could not be used with the fallback generator."
+        return jsonify(result)
+    return jsonify({"error":f"Image generation failed. NanoBanana: {err}"}),502
 
-        full_prompt = f"{prompt}, {style}" if style else prompt
+@app.route("/api/chat", methods=["POST"])
+@login_required
+def chat():
+    data=request.get_json(force=True) or {}
+    user_msg=(data.get("message") or "").strip()
+    news_ctx=(data.get("news_context") or "").strip()
+    conv_id=data.get("conversation_id")
+    attachment=data.get("attachment")
+    user_name=(data.get("user_name") or "").strip()[:60]
+    regenerate=bool(data.get("regenerate"))
+    model_id=(data.get("model") or DEFAULT_MODEL_ID).strip()
 
-        # ── Auto-enhance prompt for better output quality ────────────────────
-        prompt_lower = full_prompt.lower()
-        is_book      = any(w in prompt_lower for w in ["book cover", "book", "novel cover", "textbook"])
-        is_portrait  = any(w in prompt_lower for w in ["portrait", "person", "face", "selfie", "photo of"])
-        is_logo      = any(w in prompt_lower for w in ["logo", "icon", "emblem", "badge"])
-        is_anime     = any(w in prompt_lower for w in ["anime", "ghibli", "manga", "cartoon", "illustration"])
-        is_landscape = any(w in prompt_lower for w in ["landscape", "scenery", "nature", "city", "skyline", "aerial"])
+    # VIP gate
+    if model_id in VIP_MODELS and not session.get("vip"):
+        return jsonify({"error":"vip_required"}),403
 
-        quality_tail = ", masterpiece, best quality, highly detailed, sharp focus, professional"
+    # Get provider and model name
+    model_cfg = MYTHIC_MODELS.get(model_id, MYTHIC_MODELS[DEFAULT_MODEL_ID])
+    sel_provider, sel_model = model_cfg[0], model_cfg[1]
+    if regenerate and not conv_id: return jsonify({"error":"conversation_id required"}),400
+    if not regenerate and not user_msg and not attachment: return jsonify({"error":"message or attachment required"}),400
+    if attachment:
+        try:
+            raw=base64.b64decode(attachment.get("dataBase64",""),validate=True)
+            if len(raw)>MAX_UPLOAD_BYTES: return jsonify({"error":"File too large (max 8MB)"}),400
+        except: return jsonify({"error":"Invalid attachment"}),400
+    username=current_username()
+    conv=load_conversation(username,conv_id) if conv_id else None
+    if conv is None:
+        if regenerate: return jsonify({"error":"conversation not found"}),404
+        conv_id=str(uuid.uuid4()); conv={"title":make_title(user_msg),"messages":[]}
+    messages=conv.setdefault("messages",[])
+    if regenerate:
+        if messages and messages[-1]["role"]=="model": messages.pop()
+        if not messages or messages[-1]["role"]!="user": return jsonify({"error":"nothing to regenerate"}),400
+    else:
+        parts=[]
+        if news_ctx and user_msg: parts.append({"text":f"[Context:]\n{news_ctx}\n\n[Question:] {user_msg}"})
+        elif user_msg: parts.append({"text":user_msg})
+        att_meta=None
+        if attachment:
+            mime=attachment.get("mimeType","application/octet-stream")
+            parts.append({"inline_data":{"mime_type":mime,"data":attachment["dataBase64"]}})
+            att_meta={"name":attachment.get("name","file"),"mimeType":mime}
+        entry={"role":"user","parts":parts}
+        if att_meta: entry["attachment_meta"]=att_meta
+        messages.append(entry)
+    sp=SYSTEM_PROMPT
+    if user_name: sp+=f' The user\'s name is "{user_name}". Use it naturally.'
+    gemini_contents=[{"role":m["role"],"parts":m["parts"]} for m in messages]
+    payload={"contents":gemini_contents,"systemInstruction":{"parts":[{"text":sp+GEMINI_SEARCH_ADDENDUM}]},"tools":[{"google_search":{}}]}
+    def generate():
+        full=[]
+        oms=to_openai(messages,sp)
+        if PROVIDER=="ollama": src=ollama_chunks(to_ollama(messages,sp))
+        elif sel_provider=="groq": src=groq_chunks(oms, sel_model)
+        elif sel_provider=="cerebras": src=cerebras_chunks(oms, sel_model)
+        elif sel_provider=="openrouter": src=openrouter_chunks(oms, sel_model)
+        else: src=auto_chunks(payload,messages,sp)
+        for chunk in src: full.append(chunk); yield chunk
+        messages.append({"role":"model","parts":[{"text":"".join(full)}]})
+        save_conversation(username,conv_id,conv)
+    resp=Response(stream_with_context(generate()),mimetype="text/plain; charset=utf-8")
+    resp.headers["X-Conversation-Id"]=conv_id
+    return resp
 
-        if is_book:
-            enhanced = (
-                f"{full_prompt}, professional book cover design, elegant typography layout, "
-                f"dramatic lighting, rich colors, visually striking, award-winning cover art, "
-                f"publishing industry standard{quality_tail}"
-            )
-            width, height = 512, 768
-        elif is_portrait:
-            enhanced = (
-                f"{full_prompt}, cinematic portrait photography, soft studio lighting, "
-                f"8K ultra-detailed, DSLR quality, photorealistic{quality_tail}"
-            )
-            width, height = 512, 768
-        elif is_logo:
-            enhanced = (
-                f"{full_prompt}, clean vector style, minimalist, professional brand design, "
-                f"flat design, scalable, high contrast{quality_tail}"
-            )
-            width, height = 768, 768
-        elif is_anime:
-            enhanced = (
-                f"{full_prompt}, vibrant anime art, clean linework, beautiful coloring, "
-                f"Studio Ghibli quality, cel shading{quality_tail}"
-            )
-            width, height = 768, 768
-        elif is_landscape:
-            enhanced = (
-                f"{full_prompt}, epic wide shot, golden hour lighting, ultra-wide, "
-                f"breathtaking scenery, National Geographic quality{quality_tail}"
-            )
-            width, height = 896, 512
-        else:
-            enhanced = f"{full_prompt}{quality_tail}"
-            width, height = 768, 768
-
-        negative = (
-            "blurry, low quality, pixelated, distorted, deformed, ugly, bad anatomy, "
-            "watermark, signature, text errors, garbled text, poorly drawn, disfigured, "
-            "oversaturated, washed out, extra limbs, duplicate, clone, artifact, noise"
-        )
-
-        # ── 1. NanoBanana (real image-to-image, best for Ghibli Me) ──────────
-        if NANO_BANANA_API_KEY:
-            image_urls = None
-            if image_b64:
-                try:
-                    raw = base64.b64decode(image_b64, validate=True)
-                    if len(raw) > MAX_UPLOAD_BYTES:
-                        return jsonify({"error": "image too large (max 8MB)"}), 400
-                    img_id = _store_temp_image(raw, mime_type)
-                    base_url = request.host_url.rstrip('/')
-                    image_urls = [f"{base_url}/api/temp-image/{img_id}"]
-                except Exception:
-                    pass  # bad base64 — fall through without the image
-            try:
-                task_id, err = nano_banana_submit(enhanced, image_urls=image_urls)
-                if not err:
-                    result_url, err = nano_banana_poll(task_id)
-                    if not err:
-                        img_resp = requests.get(result_url, timeout=30)
-                        img_resp.raise_for_status()
-                        return jsonify({"image": base64.b64encode(img_resp.content).decode("utf-8")})
-            except Exception:
-                pass  # fall through to next provider
-
-        # ── 2. HuggingFace FLUX.1-schnell ─────────────────────────────────────
-        if HF_API_KEY:
-            try:
-                resp = requests.post(
-                    "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
-                    headers={"Authorization": f"Bearer {HF_API_KEY}"},
-                    json={"inputs": enhanced},
-                    timeout=90,
-                )
-                if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
-                    return jsonify({"image": base64.b64encode(resp.content).decode("utf-8")})
-            except Exception:
-                pass  # fall through
-
-        # ── 3. Pollinations.AI — zero-config, always available ────────────────
-        seed = int(time.time()) % 99999
-        encoded_prompt   = urllib.parse.quote(enhanced)
-        encoded_negative = urllib.parse.quote(negative)
-        poll_url = (
-            f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-            f"?width={width}&height={height}&seed={seed}"
-            f"&negative={encoded_negative}"
-            f"&model=flux&enhance=true&nologo=true"
-        )
-        img_resp = requests.get(poll_url, timeout=120)
-        if img_resp.status_code == 200 and img_resp.headers.get("content-type", "").startswith("image/"):
-            return jsonify({"image": base64.b64encode(img_resp.content).decode("utf-8")})
-        return jsonify({"error": f"Image generation failed (status {img_resp.status_code}). Please try again."}), 502
-
-    except Exception as e:
-        # Catch-all: always return JSON, never an HTML error page
-        return jsonify({"error": f"Image generation error: {str(e)}"}), 500
-
-
-if __name__ == "__main__":
-    active = []
-    if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
-        active.append(f"Groq({GROQ_MODEL})")
-    if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
-        active.append(f"Cerebras({CEREBRAS_MODEL})")
-    providers_str = " → ".join(active) if active else "none configured!"
-    image_provider = "NanoBanana (image-to-image supported)" if NANO_BANANA_API_KEY else (
-        "HuggingFace FLUX (text-to-image only)" if HF_API_KEY else "none configured!"
-    )
-    print(f"Starting Ꮇʏᴛʜɪᴄ ᴀɪ at http://localhost:5000")
-    print(f"Providers (Groq primary, Cerebras fallback): {providers_str}")
-    print(f"Image generation: {image_provider}")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+if __name__=="__main__":
+    print("Starting Mythic AI at http://localhost:5000")
+    app.run(host="0.0.0.0",port=5000,debug=False)
