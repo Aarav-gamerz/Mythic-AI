@@ -143,11 +143,17 @@ def _persistent_secret_key():
     """
     env_key = os.environ.get("FLASK_SECRET_KEY")
     if env_key:
+    return env_key   
+    import os
+import secrets
+
+def _persistent_secret_key():
+    env_key = os.environ.get("FLASK_SECRET_KEY")
+    if env_key:
         return env_key
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(base_dir, "chat_data")
-    os.makedirs(data_dir, exist_ok=True)
-    key_path = os.path.join(data_dir, "flask_secret.key")
+
+    # Local development only
+    return secrets.token_hex(32)
     if os.path.exists(key_path):
         with open(key_path, "r") as f:
             existing = f.read().strip()
