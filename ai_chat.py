@@ -1,28 +1,27 @@
 """
-Ꮇʏᴛʜɪᴄ ᴀɪ — single file, powered by Google's Gemini API or a local Ollama model.
+Ꮇʏᴛʜɪᴄ ᴀɪ — single file, powered by Groq and Cerebras in true alternating
+rotation. No provider is "primary" — each new message tries the provider that
+didn't get the last one first, and silently falls through to the other if it's
+rate-limited, times out, or errors. No provider selection is ever exposed to
+the user.
 
-Usage (Gemini — default, needs a free API key):
+Usage:
     1. pip install flask requests
-    2. Set your API key:
-         Mac/Linux:   export GEMINI_API_KEY="your-key-here"
-         Windows:     set GEMINI_API_KEY=your-key-here
+    2. Set your API keys:
+         Mac/Linux:   export GROQ_API_KEY="your-groq-key"
+                      export CEREBRAS_API_KEY="your-cerebras-key"
+         Windows:     set GROQ_API_KEY=your-groq-key
+                      set CEREBRAS_API_KEY=your-cerebras-key
     3. python ai_chat.py
     4. Open http://localhost:5000 in your browser
 
-Get a FREE API key (no credit card needed) at https://aistudio.google.com/apikey
+Get a FREE Groq API key at https://console.groq.com/keys
+Get a FREE Cerebras API key at https://cloud.cerebras.ai
 
-Usage (Ollama — fully local, no API key or internet needed):
-    1. Install Ollama from https://ollama.com and make sure it's running
-       (`ollama serve`, or it may already be running as a background service)
-    2. Pull a model, e.g.:  ollama pull llama3.1
-    3. Set the provider:
-         Mac/Linux:   export AI_PROVIDER=ollama
-         Windows:     set AI_PROVIDER=ollama
-       Optional overrides:
-         OLLAMA_URL   (default: http://localhost:11434)
-         OLLAMA_MODEL (default: llama3.1)
-    4. python ai_chat.py
-    5. Open http://localhost:5000 in your browser
+Optional — NanoBanana (nanobananaapi.ai) powers real image-to-image editing for
+"Ghibli Me"; without it, image generation falls back to HuggingFace FLUX
+(text-to-image only), then to Pollinations.ai (no key needed at all).
+Weather uses Open-Meteo, which also needs no API key.
 
 Supabase (optional — for accounts/conversation storage across restarts & devices):
     Set these as environment variables (never hardcode secrets in this file):
@@ -30,13 +29,17 @@ Supabase (optional — for accounts/conversation storage across restarts & devic
          SUPABASE_KEY   your Supabase *secret* key (server-side only, keeps full DB access)
     If unset, the app falls back to storing conversations as local JSON files in chat_data/.
 
+VIP tier:
+    A single VIP toggle (no model picker) is gated by VIP_PASSWORD (env var,
+    defaults to "1254" — change this before exposing the app publicly).
+
 Features:
-- Login/register (real accounts, hashed passwords, stored in chat_data/users.json)
 - Multi-conversation chat with sidebar, saved per-account, survives restarts
 - File/image upload (attach an image or text file to a message)
-- Web search grounding (Gemini can search Google for current info — Gemini only)
 - Streaming responses (text appears word-by-word)
-- Switchable AI backend: Google Gemini (cloud) or Ollama (local, private, free)
+- Groq <-> Cerebras true alternating rotation, fully silent to the user
+- Image generation, Ghibli Me (image-to-image), and full weather (current +
+  hourly + 7-day + air quality) built in
 - No rate limiting — unlimited messages
 """
 
@@ -45,6 +48,8 @@ import json
 import uuid
 import time
 import base64
+import secrets
+import urllib.parse
 import requests
 from flask import (
     Flask, request, jsonify, Response, session,
@@ -52,20 +57,15 @@ from flask import (
 )
 
 PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
-# "auto"        = round-robin: Groq → OpenRouter → HuggingFace (all work on servers)
-# "gemini"      = Google Gemini only (free tier only works locally, not on Render)
-# "groq"        = Groq only
-# "openrouter"  = OpenRouter only
-# "huggingface" = Hugging Face only
-# "ollama"      = local Ollama only
+# "auto"     = true alternating rotation between Groq and Cerebras
+# "groq"     = Groq only
+# "cerebras" = Cerebras only
 
-# --- API Keys (hardcoded fallbacks — override via environment variables) ------
-# WARNING: don't commit a file with real keys to a public GitHub repo.
-# Set these as environment variables on Render instead.
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY",    "")
+# --- API Keys — override via environment variables, never hardcode real ones ---
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "")
 CEREBRAS_API_KEY  = os.environ.get("CEREBRAS_API_KEY",  "")
-OPENROUTER_API_KEY= os.environ.get("OPENROUTER_API_KEY","")
+# HF is kept ONLY as a text-to-image fallback for /api/generate-image when
+# NanoBanana isn't configured — it is NOT used as a chat/text provider.
 HF_API_KEY        = os.environ.get("HF_API_KEY",        "")
 # NanoBanana API (nanobananaapi.ai) — powers "Ghibli Me" image editing so it can
 # actually transform the user's uploaded photo (image-to-image), not just
@@ -75,54 +75,36 @@ NANO_BANANA_API_KEY = os.environ.get("NANO_BANANA_API_KEY", "")
 NANO_BANANA_BASE     = "https://api.nanobananaapi.ai/api/v1/nanobanana"
 
 # --- Model names -------------------------------------------------------------
-GEMINI_MODEL      = "gemini-2.5-flash"
 GROQ_MODEL        = os.environ.get("GROQ_MODEL",        "llama-3.1-8b-instant")
-OPENROUTER_MODEL  = os.environ.get("OPENROUTER_MODEL",  "google/gemma-3-4b-it:free")
 HF_MODEL          = os.environ.get("HF_MODEL",          "mistralai/Mistral-7B-Instruct-v0.3")
 CEREBRAS_MODEL    = os.environ.get("CEREBRAS_MODEL",    "gpt-oss-120b")
-OLLAMA_MODEL      = os.environ.get("OLLAMA_MODEL",       "llama3.1")
-OLLAMA_URL        = os.environ.get("OLLAMA_URL",         "http://localhost:11434").rstrip("/")
 
-GEMINI_STREAM_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:streamGenerateContent"
-)
-
-# keep old name for compatibility with existing references below
-API_KEY = GEMINI_API_KEY
-MODEL   = GEMINI_MODEL
 SYSTEM_PROMPT = (
     "You are Ꮇʏᴛʜɪᴄ ᴀɪ, a smart and friendly AI assistant made by Aarav Singh. "
     "If asked who made you, say you are Ꮇʏᴛʜɪᴄ ᴀɪ made by Aarav Singh — say it once naturally, never repeat it unprompted. "
-    "Never mention Google, Groq, OpenRouter, HuggingFace, Meta, Mistral, Anthropic, or any AI company as your creator or backend. "
+    "Never mention Google, Groq, OpenRouter, HuggingFace, Cerebras, Meta, Mistral, Anthropic, or any AI company as your creator or backend. "
     "You can help with anything: questions, writing, coding, math, ideas, or just chatting. "
     "When writing code, always wrap it in markdown code blocks with the language name. "
     "LANGUAGE: Always reply ENTIRELY in the same language the user's message is written in — "
-    "never mix two languages in a single reply. If they write in Hindi, reply fully in Hindi. "
-    "If they write in English, reply fully in English (do not slip into Hindi or any other language "
-    "partway through, even if source information you know is in a different language — translate it "
-    "into the reply language first). If they mix languages themselves, match their mix. "
-    "Never force English on the user. "
+    "never mix two languages in a single reply, and never produce garbled or mis-encoded text. "
+    "If they write in Hindi, reply fully in Hindi (in proper Devanagari script, never romanized or "
+    "mis-encoded). If they write in Tamil, reply fully in Tamil (Tamil script). The same rule applies "
+    "to Gujarati, Marathi, Bengali, Telugu, Malayalam, or any other language — always reply in that "
+    "language's own native script, fully and consistently, from the first word to the last. "
+    "If they write in English, reply fully in English (do not slip into any other language partway "
+    "through, even if source information you know is in a different language — translate it into the "
+    "reply language first). If they mix languages themselves, match their mix. Never force English "
+    "on the user. "
     "TOOL USE: Never write out fake tool calls, function names, or JSON like {\"query\": ...} in your reply — "
-    "those are internal mechanisms the user must never see. If you don't actually have live web access, "
-    "just answer from what you know and say your information may not be fully up to date, instead of "
-    "pretending to search. "
+    "those are internal mechanisms the user must never see. You do not have live web search access — "
+    "answer from what you know and say your information may not be fully up to date if asked about "
+    "very recent events, instead of pretending to search. "
     "ANTI-REPETITION RULES — follow strictly every reply: "
     "1. NEVER restate or echo back what the user just said. Jump straight to the answer. "
     "2. NEVER start replies with filler like Great question, Sure, Of course, Absolutely, Certainly. "
     "3. NEVER repeat information already given earlier in the conversation. Build on it. "
     "4. Be direct and natural — like a knowledgeable friend, not a customer service bot. "
     "5. Keep answers concise unless the user asks for detail."
-)
-
-# Extra instruction appended ONLY for Gemini, which actually has a real google_search tool wired up.
-# Other providers (Groq/Cerebras/OpenRouter/HF/Ollama) have no real search access, so telling them
-# "you have search" makes them hallucinate fake tool-call JSON into the visible reply — hence this
-# is kept separate from the base SYSTEM_PROMPT above.
-GEMINI_SEARCH_ADDENDUM = (
-    " WEB SEARCH: You have access to Google Search. When the user asks about current events, "
-    "live prices, news, sports scores, weather, or anything that needs up-to-date information, "
-    "use the search tool to find the answer. Do not say you cannot search the web. When you use "
-    "search results, translate/summarize them into the reply language — never paste a mix of languages."
 )
 
 app = Flask(__name__)
@@ -143,26 +125,27 @@ def _persistent_secret_key():
     """
     env_key = os.environ.get("FLASK_SECRET_KEY")
     if env_key:
-    return env_key   
-    import os
-import secrets
-
-def _persistent_secret_key():
-    env_key = os.environ.get("FLASK_SECRET_KEY")
-    if env_key:
         return env_key
 
-    # Local development only
-    return secrets.token_hex(32)
-    if os.path.exists(key_path):
-        with open(key_path, "r") as f:
-            existing = f.read().strip()
-        if existing:
-            return existing
-    new_key = str(uuid.uuid4())
-    with open(key_path, "w") as f:
-        f.write(new_key)
-    return new_key
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(base_dir, "chat_data")
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        key_path = os.path.join(data_dir, "flask_secret.key")
+        if os.path.exists(key_path):
+            with open(key_path, "r") as f:
+                existing = f.read().strip()
+            if existing:
+                return existing
+        new_key = secrets.token_hex(32)
+        with open(key_path, "w") as f:
+            f.write(new_key)
+        return new_key
+    except OSError:
+        # Read-only filesystem or similar — fall back to an in-memory key.
+        # Sessions won't survive a restart in this case; set FLASK_SECRET_KEY
+        # as an environment variable to fix that properly.
+        return secrets.token_hex(32)
 
 
 app.secret_key = _persistent_secret_key()
@@ -181,7 +164,6 @@ _TEMP_IMAGE_TTL_SECONDS = 30 * 60  # 30 minutes
 
 
 def _store_temp_image(raw_bytes, mime_type):
-    # Opportunistic cleanup of anything past its TTL
     cutoff = time.time() - _TEMP_IMAGE_TTL_SECONDS
     for k in [k for k, v in _TEMP_IMAGES.items() if v["created"] < cutoff]:
         _TEMP_IMAGES.pop(k, None)
@@ -436,14 +418,12 @@ PAGE = r"""<!DOCTYPE html>
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif; overflow:hidden; }
   .layout { display:flex; height:100vh; }
 
-  /* Light theme override */
   body.theme-light {
     --bg:#f7f7f8; --panel:#ffffff; --border:#e3e3e6;
     --text:#1f1f1f; --muted:#6b6b76; --accent-dim:#e3f5ef;
     --user-bubble:#eef0f2; --user-text:#1f1f1f; --ai-bubble:#ffffff;
   }
 
-  /* Sidebar */
   #sidebar { width:var(--sidebar-w); flex-shrink:0; background:var(--panel);
     border-right:1px solid var(--border); display:flex; flex-direction:column;
     transition:margin-left .2s ease; }
@@ -467,7 +447,6 @@ PAGE = r"""<!DOCTYPE html>
   .conv-item .del-btn:hover { color:#ef4444; }
   #sidebar-footer { padding:12px; font-size:11px; color:var(--muted); border-top:1px solid var(--border); }
 
-  /* Main */
   .app { display:flex; flex-direction:column; height:100vh; flex:1; min-width:0; }
   header { padding:calc(14px + env(safe-area-inset-top)) 20px 14px; border-bottom:1px solid var(--border);
     display:flex; align-items:center; justify-content:space-between; gap:10px;
@@ -479,36 +458,21 @@ PAGE = r"""<!DOCTYPE html>
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0; }
   #sidebar-toggle:hover { background:var(--panel); }
   header h1 { font-size:16px; font-weight:700; color:var(--accent); margin:0; }
-  #name-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
-  #name-btn:hover { background:var(--panel); }
-  #settings-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
-  #settings-btn:hover { background:var(--panel); }
-  #export-btn { background:none; border:1px solid var(--border); color:var(--muted);
-    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
-    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
-  #export-btn:hover { background:var(--panel); }
-
-  /* Fullscreen toggle — lives in the header's top-right corner alongside the
-     other icon buttons (name/settings/export/clear). */
-  #fullscreen-btn { background:none; border:1px solid var(--border); color:var(--muted);
+  #name-btn, #settings-btn, #export-btn, #vip-btn, #fullscreen-btn {
+    background:none; border:1px solid var(--border); color:var(--muted);
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
     display:flex; align-items:center; justify-content:center; touch-action:manipulation;
     -webkit-tap-highlight-color:transparent; }
-  #fullscreen-btn:hover { background:var(--panel); color:var(--text); border-color:var(--accent); }
+  #name-btn:hover, #settings-btn:hover, #export-btn:hover, #vip-btn:hover { background:var(--panel); }
+  #vip-btn.active { color:var(--accent); border-color:var(--accent); }
+  #fullscreen-btn:hover { color:var(--text); border-color:var(--accent); background:var(--panel); }
   #fullscreen-btn.active { color:var(--accent); border-color:var(--accent); }
   #fullscreen-icon { font-size:15px; }
 
-  /* Fallback for browsers without a real Fullscreen API (iOS Safari, some in-app webviews):
-     hide the sidebar toggle/header chrome so the chat fills the screen. */
   body.pseudo-fullscreen #sidebar-toggle,
   body.pseudo-fullscreen header .left h1 { display:none; }
   body.pseudo-fullscreen header { padding-top:calc(6px + env(safe-area-inset-top)); padding-bottom:6px; }
 
-  /* Name modal */
   #name-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
     z-index:200; align-items:center; justify-content:center; }
   #name-modal-overlay.show { display:flex; }
@@ -530,7 +494,6 @@ PAGE = r"""<!DOCTYPE html>
     font-size:12px; padding:6px 12px; border-radius:6px; cursor:pointer; flex-shrink:0; }
   #clear-btn:hover { background:var(--panel); }
 
-  /* Settings modal */
   #settings-modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
     z-index:200; align-items:center; justify-content:center; }
   #settings-modal { background:var(--bg); border:1px solid var(--border); border-radius:14px;
@@ -559,7 +522,6 @@ PAGE = r"""<!DOCTYPE html>
     border-radius:10px; padding:11px; font-size:14px; font-weight:700; cursor:pointer; font-family:inherit; }
   #settings-close-btn:hover { opacity:.9; }
 
-  /* Message bubble density controlled by settings */
   body.bubble-compact .msg { padding:7px 11px; border-radius:12px; }
   body.bubble-compact #messages { gap:8px; }
   body.bubble-comfortable .msg { padding:11px 15px; border-radius:18px; }
@@ -567,7 +529,6 @@ PAGE = r"""<!DOCTYPE html>
   body.bubble-spacious .msg { padding:16px 20px; border-radius:22px; }
   body.bubble-spacious #messages { gap:24px; }
 
-  /* Messages */
   #messages-wrap { flex:1; overflow-y:auto; position:relative; }
   #messages { padding:24px 20px; display:flex; flex-direction:column; gap:16px;
     max-width:760px; margin:0 auto; width:100%; min-height:100%; }
@@ -582,7 +543,6 @@ PAGE = r"""<!DOCTYPE html>
   .msg img { max-width:100%; border-radius:10px; display:block; margin-top:8px; }
   .attach-chip { font-size:11.5px; opacity:.75; margin-bottom:4px; }
 
-  /* Message row wraps the bubble + its action buttons (copy / regenerate) */
   .msg-row { display:flex; flex-direction:column; max-width:80%; }
   .msg-row.user { align-self:flex-end; align-items:flex-end; }
   .msg-row.ai { align-self:flex-start; align-items:flex-start; }
@@ -608,17 +568,14 @@ PAGE = r"""<!DOCTYPE html>
   .typing span:nth-child(3) { animation-delay:.4s; }
   @keyframes blink { 0%,80%,100%{opacity:.2} 40%{opacity:1} }
 
-  /* Scroll to bottom */
   #scroll-btn { position:fixed; bottom:130px; right:24px; width:36px; height:36px;
     border-radius:50%; background:var(--accent); color:#fff; border:none; cursor:pointer;
     font-size:18px; display:none; align-items:center; justify-content:center;
     box-shadow:0 2px 8px rgba(0,0,0,.15); z-index:10; }
   #scroll-btn.show { display:flex; }
 
-  /* Image preview */
   .gen-img { max-width:320px; border-radius:12px; display:block; margin-top:8px; }
 
-  /* Input area */
   #pending-attach { max-width:760px; margin:0 auto; width:100%; padding:6px 20px 0;
     display:none; align-items:center; gap:8px; font-size:12.5px; color:var(--muted); }
   #pending-attach.show { display:flex; }
@@ -648,7 +605,6 @@ PAGE = r"""<!DOCTYPE html>
   #voice-btn.listening { color:#ef4444; animation:pulse 1s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
-  /* Speaking indicator */
   #speaking-indicator { display:none; align-items:center; gap:6px; font-size:12px;
     color:var(--accent); padding:4px 0; }
   #speaking-indicator.show { display:flex; }
@@ -667,47 +623,31 @@ PAGE = r"""<!DOCTYPE html>
 
   @media(max-width:768px) {
     :root { --sidebar-w: 78vw; }
-
-    /* Sidebar slides in as overlay — never pushes content */
     #sidebar { position:fixed; top:0; left:0; z-index:100; height:100%;
       height:-webkit-fill-available; width:var(--sidebar-w) !important;
       transform:translateX(0); transition:transform .25s ease;
       box-shadow:4px 0 24px rgba(0,0,0,.5); }
     #sidebar.hidden { transform:translateX(-105%); margin-left:0 !important; }
-
-    /* Show overlay when sidebar open */
     #sidebar-overlay { display:block; }
-
-    /* Main app always takes full width */
     .app { width:100% !important; flex:1; }
-
     header { padding:calc(10px + env(safe-area-inset-top)) 12px 10px; }
     header h1 { font-size:14px; }
-    #sidebar-toggle { width:38px; height:38px; font-size:14px; }
-    #name-btn { width:38px; height:38px; font-size:14px; }
-    #settings-btn { width:38px; height:38px; font-size:14px; }
-    #export-btn { width:38px; height:38px; font-size:14px; }
+    #sidebar-toggle, #name-btn, #settings-btn, #export-btn, #vip-btn, #fullscreen-btn { width:38px; height:38px; font-size:14px; }
     #clear-btn { font-size:11px; padding:8px 10px; min-height:38px; }
-    #speak-toggle { font-size:11px; padding:5px 8px; }
-    #fullscreen-btn { width:38px; height:38px; font-size:14px; }
-
     #messages-wrap { overflow-y:auto; -webkit-overflow-scrolling:touch; }
     #messages { padding:14px 10px; gap:12px; max-width:100%; }
     .msg { max-width:90%; font-size:14px; padding:10px 12px; }
     .msg-row { max-width:90%; }
-    .msg-actions { opacity:1; height:26px; } /* no hover on touch — keep always visible */
+    .msg-actions { opacity:1; height:26px; }
     .msg-actions button { font-size:13px; padding:4px 9px; min-width:30px; min-height:26px; }
-
     .input-area { padding:8px 10px max(10px,env(safe-area-inset-bottom)); }
     .input-row { padding:6px 8px; }
-    textarea { font-size:16px; } /* 16px prevents iOS zoom */
+    textarea { font-size:16px; }
     .tool-btn { width:34px; height:34px; font-size:17px; }
     #send-btn { width:34px; height:34px; font-size:16px; }
-
     .empty-state h2 { font-size:19px; }
     .empty-state p { font-size:13px; }
     #scroll-btn { bottom:80px; right:12px; width:34px; height:34px; }
-
     #new-chat-btn { margin:10px; padding:10px 12px; font-size:13.5px; }
     .conv-item { padding:10px 8px; font-size:13px; min-height:44px; }
     .conv-item .rename-btn { opacity:1; }
@@ -719,7 +659,6 @@ PAGE = r"""<!DOCTYPE html>
     :root { --sidebar-w: 88vw; }
     .msg { font-size:13.5px; }
     header h1 { font-size:13px; }
-    #speak-toggle { display:none; }
   }
 </style>
 </head>
@@ -736,14 +675,9 @@ PAGE = r"""<!DOCTYPE html>
       <div class="left">
         <button id="sidebar-toggle" title="Toggle sidebar">☰</button>
         <h1>Ꮇʏᴛʜɪᴄ ᴀɪ</h1>
-        <select id="model-select" title="Select model" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;cursor:pointer;outline:none;max-width:130px;font-family:inherit;">
-          <option value="mythic-1" data-vip="0">Mythic 1</option>
-          <option value="mythic-2" data-vip="0" selected>Mythic 2</option>
-          <option value="mythic-3" data-vip="0">Mythic 3</option>
-          <option value="mythic-vip" data-vip="1">Mythic VIP 🔒</option>
-        </select>
       </div>
       <div class="right">
+        <button id="vip-btn" title="Mythic VIP">🔒</button>
         <button id="fullscreen-btn" type="button" title="Fullscreen"><span id="fullscreen-icon">⛶</span></button>
         <button id="name-btn" title="What should Ꮇʏᴛʜɪᴄ ᴀɪ call you?">🙂</button>
         <button id="settings-btn" title="Settings">⚙</button>
@@ -764,7 +698,7 @@ PAGE = r"""<!DOCTYPE html>
     <button id="scroll-btn" title="Scroll to bottom">↓</button>
 
     <div id="pending-attach">
-      ＋ <span id="pending-attach-name"></span>
+      📎 <span id="pending-attach-name"></span>
       <button id="pending-attach-remove">✕</button>
     </div>
 
@@ -773,7 +707,6 @@ PAGE = r"""<!DOCTYPE html>
       <button id="stop-speak-btn">Stop</button>
     </div>
 
-    <!-- Quick action buttons -->
     <div id="quick-actions" style="display:flex;gap:8px;padding:6px 20px 0;max-width:760px;margin:0 auto;width:100%;flex-wrap:wrap;">
       <button class="quick-btn" id="img-gen-btn">🎨 Image</button>
       <button class="quick-btn" id="ghibli-btn">🌿 Ghibli Me</button>
@@ -781,17 +714,14 @@ PAGE = r"""<!DOCTYPE html>
       <button class="quick-btn" id="weather-btn">🌤 Weather</button>
       <button class="quick-btn" id="search-btn">🔍 Search</button>
     </div>
-
       <form id="chat-form">
         <div class="input-row">
-          <!-- Attach file -->
           <input type="file" id="file-input" accept="image/*,.txt,.md,.csv,.json,.pdf" style="display:none">
           <button class="tool-btn" id="attach-btn" type="button" title="Attach file">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
             </svg>
           </button>
-          <!-- Camera -->
           <input type="file" id="camera-input" accept="image/*" capture="environment" style="display:none">
           <button class="tool-btn" id="camera-btn" type="button" title="Take photo">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -800,7 +730,6 @@ PAGE = r"""<!DOCTYPE html>
             </svg>
           </button>
           <textarea id="input" rows="1" placeholder="Message Ꮇʏᴛʜɪᴄ ᴀɪ..."></textarea>
-          <!-- Voice input -->
           <button class="tool-btn" id="voice-btn" type="button" title="Voice input">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
@@ -832,7 +761,6 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Settings Modal -->
 <div id="settings-modal-overlay">
   <div id="settings-modal">
     <h3>Settings</h3>
@@ -903,8 +831,13 @@ PAGE = r"""<!DOCTYPE html>
 
     <div class="settings-section">
       <label>Voice (for 🔊 read-aloud)</label>
-      <select id="voice-select" class="settings-select">
-        <option value="">Loading voices…</option>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px;">Choose a language to hear voices for:</div>
+      <div class="settings-row" style="margin-bottom:10px;">
+        <button class="voice-lang-btn" data-lang="en" style="flex:1;min-width:80px;padding:8px 10px;border-radius:8px;border:1.5px solid var(--border);background:var(--panel);color:var(--muted);cursor:pointer;font-size:12.5px;font-family:inherit;">🇬🇧 English</button>
+        <button class="voice-lang-btn" data-lang="hi" style="flex:1;min-width:80px;padding:8px 10px;border-radius:8px;border:1.5px solid var(--border);background:var(--panel);color:var(--muted);cursor:pointer;font-size:12.5px;font-family:inherit;">🇮🇳 हिंदी</button>
+      </div>
+      <select id="voice-select" class="settings-select" disabled>
+        <option value="">Choose a language above first</option>
       </select>
       <div style="font-size:11px;color:var(--muted);margin-top:6px;">Voices come from your browser/OS — availability varies by device.</div>
     </div>
@@ -918,26 +851,22 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Ghibli Selfie Modal -->
 <div id="ghibli-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:300;align-items:center;justify-content:center;">
   <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:440px;max-height:90vh;overflow-y:auto;">
     <h3 style="margin:0 0 4px;font-size:18px;">🌿 Ghibli Me</h3>
     <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Upload your photo and get a Studio Ghibli-style version of yourself</p>
 
-    <!-- Upload area -->
     <div id="ghibli-upload-area" style="border:2px dashed var(--border);border-radius:12px;padding:24px;text-align:center;cursor:pointer;margin-bottom:12px;transition:border-color .2s;">
       <div style="font-size:36px;margin-bottom:8px;">📸</div>
       <div style="font-size:13px;color:var(--muted);">Click to upload your photo<br><span style="font-size:11px;">or drag & drop</span></div>
       <input type="file" id="ghibli-file-input" accept="image/*" style="display:none">
     </div>
 
-    <!-- Preview -->
     <div id="ghibli-preview-wrap" style="display:none;margin-bottom:12px;text-align:center;">
       <img id="ghibli-preview" style="max-width:100%;max-height:180px;border-radius:10px;border:2px solid var(--accent);">
       <div style="font-size:11px;color:var(--muted);margin-top:4px;">Your photo ✓</div>
     </div>
 
-    <!-- Style options -->
     <div style="margin-bottom:12px;">
       <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Ghibli Style:</label>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
@@ -948,11 +877,9 @@ PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Extra prompt -->
     <input id="ghibli-extra" type="text" placeholder="Add details (optional): e.g. forest background, sunset..."
       style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:12px;font-family:inherit;">
 
-    <!-- Result -->
     <div id="ghibli-result-wrap" style="display:none;margin-bottom:12px;text-align:center;">
       <img id="ghibli-result" style="max-width:100%;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.4);">
       <button id="ghibli-download-btn" style="margin-top:8px;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:8px 18px;font-size:13px;cursor:pointer;font-family:inherit;">⬇ Download</button>
@@ -970,6 +897,89 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div id="img-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:300;align-items:center;justify-content:center;">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:440px;max-height:90vh;overflow-y:auto;">
+    <h3 style="margin:0 0 4px;font-size:18px;">🎨 Generate Image</h3>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Describe what you want to see</p>
+
+    <textarea id="img-prompt" rows="3" placeholder="e.g. a cozy cabin in a snowy forest, golden hour lighting"
+      style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:13px;outline:none;margin-bottom:12px;font-family:inherit;resize:vertical;"></textarea>
+
+    <div style="margin-bottom:14px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Style (optional):</label>
+      <select id="img-style" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;outline:none;font-family:inherit;">
+        <option value="">✨ Auto (recommended)</option>
+        <option value="photorealistic, hyperrealistic DSLR photography, 8K resolution, cinematic">📸 Photorealistic</option>
+        <option value="professional book cover design, award-winning layout, elegant typography">📚 Book Cover</option>
+        <option value="Studio Ghibli anime style, soft watercolor, vibrant colors, beautiful">🌿 Anime / Ghibli</option>
+        <option value="digital painting, fantasy concept art, epic lighting, deviantart">🎭 Fantasy Art</option>
+        <option value="watercolor painting, soft pastel, dreamy, artistic brushstrokes">🖌 Watercolor</option>
+        <option value="3D render, Octane render, ultra realistic, physically based rendering">🧊 3D Render</option>
+        <option value="flat vector illustration, minimalist, clean lines, modern design">📐 Minimalist / Vector</option>
+        <option value="oil painting, impressionist, rich textures, museum quality">🖼 Oil Painting</option>
+        <option value="cinematic film still, dramatic lighting, movie poster quality, 35mm">🎬 Cinematic</option>
+        <option value="pixel art, retro 8-bit style, vibrant palette, game art">🕹 Pixel Art</option>
+        <option value="pencil sketch, detailed graphite drawing, fine art, black and white">✏️ Pencil Sketch</option>
+        <option value="logo design, professional brand identity, clean, scalable vector">🏷 Logo / Brand</option>
+      </select>
+    </div>
+
+    <div id="img-loading" style="display:none;text-align:center;padding:20px;">
+      <div style="font-size:32px;margin-bottom:8px;">🎨</div>
+      <div style="color:var(--muted);font-size:13px;">Generating your image...<br>
+        <span style="font-size:11px;opacity:.7;">Auto-enhancing your prompt for best quality</span>
+      </div>
+    </div>
+    <div id="img-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px;background:#fef2f2;border-radius:6px;"></div>
+
+    <div id="img-result" style="display:none;margin-bottom:12px;text-align:center;">
+      <img id="img-output" style="max-width:100%;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.4);cursor:zoom-in;">
+      <div style="display:flex;gap:8px;margin-top:8px;">
+        <button id="img-download-btn" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:8px;font-size:13px;cursor:pointer;font-family:inherit;">⬇ Download</button>
+        <button id="img-copy-btn" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:8px;font-size:13px;cursor:pointer;font-family:inherit;">📋 Copy</button>
+        <button id="img-fullscreen-btn" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:8px;font-size:13px;cursor:pointer;font-family:inherit;">⛶ View</button>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;">
+      <button id="img-generate-btn" style="flex:1;background:linear-gradient(135deg,#10a37f,#0d7a5f);color:#fff;border:none;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">✨ Generate</button>
+      <button id="img-close-btn" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:12px 16px;font-size:14px;cursor:pointer;">✕</button>
+    </div>
+  </div>
+</div>
+
+<div id="img-viewer-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:400;align-items:center;justify-content:center;cursor:zoom-out;">
+  <img id="img-viewer-img" style="max-width:94%;max-height:94%;border-radius:8px;">
+</div>
+
+<div id="weather-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:300;align-items:center;justify-content:center;">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:460px;max-height:90vh;overflow-y:auto;">
+    <h3 style="margin:0 0 4px;font-size:18px;">🌤 Weather</h3>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Search any city, or use your current location</p>
+
+    <div style="display:flex;gap:8px;margin-bottom:12px;">
+      <input id="weather-city" type="text" placeholder="Search city or place..." autocomplete="off"
+        style="flex:1;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:13px;outline:none;font-family:inherit;">
+      <button id="weather-search-btn" style="background:var(--accent);color:#fff;border:none;border-radius:8px;padding:0 14px;font-size:14px;cursor:pointer;">🔍</button>
+      <button id="weather-location-btn" title="Use my location" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:0 12px;font-size:14px;cursor:pointer;">📍</button>
+    </div>
+
+    <div id="weather-loading" style="display:none;text-align:center;padding:20px;">
+      <div style="font-size:32px;margin-bottom:8px;">🌍</div>
+      <div style="color:var(--muted);font-size:13px;">Fetching weather...</div>
+    </div>
+    <div id="weather-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px;background:#fef2f2;border-radius:6px;"></div>
+
+    <div id="weather-result" style="display:none;">
+      <div id="weather-content"></div>
+    </div>
+
+    <div style="display:flex;justify-content:flex-end;margin-top:14px;">
+      <button id="weather-close-btn" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:10px 16px;font-size:14px;cursor:pointer;">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const messagesWrap = document.getElementById('messages-wrap');
 const messagesEl   = document.getElementById('messages');
@@ -982,10 +992,18 @@ const newChatBtn   = document.getElementById('new-chat-btn');
 const sidebarToggle= document.getElementById('sidebar-toggle');
 const fullscreenBtn= document.getElementById('fullscreen-btn');
 const nameBtn       = document.getElementById('name-btn');
-const modelSelect   = document.getElementById('model-select');
+const vipBtn        = document.getElementById('vip-btn');
 
-let selectedModel = 'mythic-2';
-let vipUnlocked   = false;
+let selectedTier = 'standard'; // 'standard' | 'vip'
+let vipUnlocked  = false;
+
+function updateVipBtn() {
+  vipBtn.textContent = selectedTier === 'vip' ? '✨' : (vipUnlocked ? '✨' : '🔒');
+  vipBtn.classList.toggle('active', selectedTier === 'vip');
+  vipBtn.title = vipUnlocked
+    ? (selectedTier === 'vip' ? 'Mythic VIP active — click to switch back' : 'Switch to Mythic VIP')
+    : 'Unlock Mythic VIP';
+}
 
 function showVipModal() {
   const existing = document.getElementById('vip-modal-overlay');
@@ -1005,10 +1023,7 @@ function showVipModal() {
   document.body.appendChild(overlay);
   const pwIn = overlay.querySelector('#vip-pw-in'), pwErr = overlay.querySelector('#vip-pw-err');
   pwIn.focus();
-  overlay.querySelector('#vip-pw-cancel').addEventListener('click', () => {
-    overlay.style.display = 'none';
-    modelSelect.value = selectedModel;
-  });
+  overlay.querySelector('#vip-pw-cancel').addEventListener('click', () => { overlay.style.display = 'none'; });
   overlay.querySelector('#vip-pw-ok').addEventListener('click', async () => {
     try {
       const r = await fetch('/api/vip-unlock', {
@@ -1019,10 +1034,8 @@ function showVipModal() {
       if (d.success) {
         vipUnlocked = true;
         overlay.style.display = 'none';
-        selectedModel = 'mythic-vip';
-        modelSelect.value = 'mythic-vip';
-        const opt = modelSelect.querySelector('option[value="mythic-vip"]');
-        if (opt) opt.textContent = 'Mythic VIP ✨';
+        selectedTier = 'vip';
+        updateVipBtn();
       } else {
         pwErr.style.display = 'block'; pwIn.value = ''; pwIn.focus();
       }
@@ -1034,38 +1047,18 @@ function showVipModal() {
   pwIn.addEventListener('keydown', e => { if (e.key === 'Enter') overlay.querySelector('#vip-pw-ok').click(); });
 }
 
-// Populate model list from the backend (falls back to the static HTML options if it fails)
 (async () => {
   try {
-    const [mr, vr] = await Promise.all([
-      fetch('/api/models').then(r => r.json()),
-      fetch('/api/vip-status').then(r => r.json()),
-    ]);
+    const vr = await fetch('/api/vip-status').then(r => r.json());
     vipUnlocked = !!vr.vip;
-    if (mr && Array.isArray(mr.models) && mr.models.length) {
-      modelSelect.innerHTML = '';
-      mr.models.forEach(m => {
-        const opt = document.createElement('option');
-        opt.value = m.id;
-        opt.textContent = m.vip ? (vipUnlocked ? m.name.replace('🔒', '✨') : m.name) : m.name;
-        opt.dataset.vip = m.vip ? '1' : '0';
-        if (m.id === mr.default) opt.selected = true;
-        modelSelect.appendChild(opt);
-      });
-      selectedModel = mr.default || selectedModel;
-    }
-  } catch {
-    // Backend didn't respond — the static <option> list already in the HTML still works fine.
-  }
+  } catch { /* backend didn't respond — defaults still work */ }
+  updateVipBtn();
 })();
 
-modelSelect.addEventListener('change', () => {
-  const opt = modelSelect.options[modelSelect.selectedIndex];
-  if (opt && opt.dataset.vip === '1' && !vipUnlocked) {
-    showVipModal();
-  } else {
-    selectedModel = modelSelect.value;
-  }
+vipBtn.addEventListener('click', () => {
+  if (!vipUnlocked) { showVipModal(); return; }
+  selectedTier = selectedTier === 'vip' ? 'standard' : 'vip';
+  updateVipBtn();
 });
 
 const nameModalOverlay = document.getElementById('name-modal-overlay');
@@ -1091,7 +1084,6 @@ let pendingFile  = null;
 let recognition  = null;
 let currentUtterance = null;
 
-// --- Scroll button ---
 messagesWrap.addEventListener('scroll', () => {
   const nearBottom = messagesWrap.scrollHeight - messagesWrap.scrollTop - messagesWrap.clientHeight < 120;
   scrollBtn.classList.toggle('show', !nearBottom);
@@ -1113,7 +1105,10 @@ function showEmptyState() {
   messagesEl.innerHTML = '<div class="empty-state" id="empty-state"><h2>Ꮇʏᴛʜɪᴄ ᴀɪ</h2><p>Ask me anything, generate images, or just chat 👋</p></div>';
 }
 
-function addMessage(role, text, attachment) {
+// NOTE: addMessage/buildMsgActions are declared with `let ... = function` (not
+// `function name(){}` twice) so later overrides below can safely wrap them
+// without accidentally shadowing themselves via hoisting.
+let addMessage = function(role, text, attachment) {
   clearEmptyState();
   const row = document.createElement('div');
   row.className = 'msg-row ' + role;
@@ -1123,7 +1118,7 @@ function addMessage(role, text, attachment) {
   if (attachment) {
     const chip = document.createElement('div');
     chip.className = 'attach-chip';
-    chip.textContent = '＋ ' + attachment.name;
+    chip.textContent = '📎 ' + attachment.name;
     div.appendChild(chip);
     if (attachment.mimeType && attachment.mimeType.startsWith('image/') && attachment.dataBase64) {
       const img = document.createElement('img');
@@ -1144,9 +1139,9 @@ function addMessage(role, text, attachment) {
   messagesEl.appendChild(row);
   scrollToBottom();
   return textNode;
-}
+};
 
-function buildMsgActions(row, textNode, role) {
+let buildMsgActions = function(row, textNode, role) {
   const actions = document.createElement('div');
   actions.className = 'msg-actions';
 
@@ -1182,7 +1177,7 @@ function buildMsgActions(row, textNode, role) {
     actions.appendChild(regenBtn);
   }
   return actions;
-}
+};
 
 function addImageMessage(role, base64, caption) {
   clearEmptyState();
@@ -1214,7 +1209,6 @@ function hideTyping() {
   if (el) el.remove();
 }
 
-// --- Text-to-speech ---
 function speak(text) {
   if (!window.speechSynthesis) return;
   window.speechSynthesis.cancel();
@@ -1238,7 +1232,6 @@ stopSpeakBtn.addEventListener('click', () => {
   speakingIndicator.classList.remove('show');
 });
 
-// --- Voice input ---
 function setupVoice() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { voiceBtn.title = 'Voice not supported in this browser'; return; }
@@ -1269,7 +1262,6 @@ voiceBtn.addEventListener('click', () => {
   recognition.start();
 });
 
-// --- File / camera attach ---
 function handleFileSelect(file) {
   if (!file) return;
   const reader = new FileReader();
@@ -1293,7 +1285,6 @@ pendingRemove.addEventListener('click', () => {
   pendingAttach.classList.remove('show');
 });
 
-// --- Image generation detection ---
 const IMAGE_KEYWORDS = /\b(generate|create|draw|make|paint|render|show me|ghibli|anime|realistic|cartoon|portrait|landscape|art|artwork|image of|picture of|photo of|illustration)\b/i;
 async function tryGenerateImage(prompt) {
   try {
@@ -1311,7 +1302,6 @@ async function tryGenerateImage(prompt) {
   return false;
 }
 
-// --- Conversations ---
 async function loadConversationList() {
   try {
     const r = await fetch('/api/conversations');
@@ -1371,7 +1361,6 @@ function startNewChat() {
   loadConversationList();
 }
 
-// --- Send / regenerate / stop ---
 let isGenerating = false;
 let currentAbortController = null;
 
@@ -1389,7 +1378,6 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
   setGenerating(true);
   currentAbortController = new AbortController();
 
-  // Check if user wants an image (only on fresh sends, not regenerate)
   if (!regenerate) {
     const wantsImage = IMAGE_KEYWORDS.test(message || '') && !attachment;
     if (wantsImage) {
@@ -1412,7 +1400,7 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
         attachment,
         user_name: getUserName(),
         regenerate: !!regenerate,
-        model: selectedModel,
+        model: selectedTier,
       })
     });
     if (!r.ok || !r.body) {
@@ -1442,7 +1430,6 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
   } catch (err) {
     hideTyping();
     if (err.name === 'AbortError') {
-      // User hit stop — keep whatever text streamed in so far, just mark it as stopped.
       if (aiTextNode && !aiTextNode.textContent.trim()) aiTextNode.textContent = '[Stopped]';
     } else {
       addMessage('error', 'Network error: ' + err.message);
@@ -1508,8 +1495,6 @@ sidebarToggle.addEventListener('click', () => {
 });
 sidebarOverlay.addEventListener('click', closeSidebar);
 
-// Fullscreen toggle (works on Android/desktop; iOS Safari has no real Fullscreen API,
-// so it falls back to a "pseudo-fullscreen" mode that maximizes the app view instead)
 const fullscreenIcon  = document.getElementById('fullscreen-icon');
 const fsSupported = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
 
@@ -1520,12 +1505,12 @@ function isFullscreen() {
 function updateFullscreenBtn() {
   if (isFullscreen()) {
     fullscreenIcon.textContent = '⤢';
-    fullscreenBtn.title = 'Exit fullscreen';
     fullscreenBtn.classList.add('active');
+    fullscreenBtn.title = 'Exit fullscreen';
   } else {
     fullscreenIcon.textContent = '⛶';
-    fullscreenBtn.title = 'Fullscreen';
     fullscreenBtn.classList.remove('active');
+    fullscreenBtn.title = 'Fullscreen';
   }
 }
 async function toggleFullscreen() {
@@ -1540,14 +1525,11 @@ async function toggleFullscreen() {
         else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
       }
     } else {
-      // iOS Safari / in-app browsers: real Fullscreen API isn't available,
-      // so just maximize the app view (hides scroll bounce, fills the screen).
       document.body.classList.toggle('pseudo-fullscreen');
       updateFullscreenBtn();
     }
   } catch (err) {
     console.warn('Fullscreen request failed:', err);
-    // Even on failure, fall back to pseudo-fullscreen so the button still does something
     document.body.classList.toggle('pseudo-fullscreen');
     updateFullscreenBtn();
   }
@@ -1556,7 +1538,6 @@ fullscreenBtn.addEventListener('click', toggleFullscreen);
 document.addEventListener('fullscreenchange', updateFullscreenBtn);
 document.addEventListener('webkitfullscreenchange', updateFullscreenBtn);
 
-// "What should Ꮇʏᴛʜɪᴄ ᴀɪ call you?" — stored locally, sent with every chat request
 function getUserName() { return localStorage.getItem('mythic_user_name') || ''; }
 function setUserName(name) {
   if (name) localStorage.setItem('mythic_user_name', name);
@@ -1579,13 +1560,11 @@ nameInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); nameSaveBtn.click(); }
   else if (e.key === 'Escape') closeNameModal();
 });
-// First-time visitors get a gentle one-time prompt
 if (!localStorage.getItem('mythic_name_prompted')) {
   localStorage.setItem('mythic_name_prompted', '1');
   setTimeout(openNameModal, 600);
 }
 
-// Hide sidebar by default on mobile
 if (isMobile()) sidebar.classList.add('hidden');
 newChatBtn.addEventListener('click', startNewChat);
 clearBtn.addEventListener('click', async () => {
@@ -1620,7 +1599,6 @@ exportBtn.addEventListener('click', async () => {
   }
 });
 
-// Initial load
 // ─── SETTINGS ────────────────────────────────────────────────────────────────
 const settingsBtn        = document.getElementById('settings-btn');
 const settingsModalOverlay=document.getElementById('settings-modal-overlay');
@@ -1668,15 +1646,12 @@ document.querySelectorAll('.bg-swatch-btn').forEach(btn => {
   });
 });
 
-// --- Voice picker: pick up to 5 female-leaning + 5 male-leaning system voices ---
-// Browsers don't reliably expose gender, so this classifies by common name
-// heuristics (e.g. "Samantha", "Zira" read as female; "David", "Daniel" as
-// male) and falls back to alternating any unclassified voices between the
-// two groups so the list is still usable everywhere.
-const FEMALE_NAME_HINTS = ['female','woman','zira','samantha','victoria','susan','karen','moira','tessa','fiona','allison','ava','emma','joanna','kendra','kimberly','salli','nicole','amy','olivia','sonia','ines','laura','ellen','anna','maria','sara','lucia','ingrid','freya','aria','jenny'];
-const MALE_NAME_HINTS   = ['male','man','david','daniel','alex','fred','george','james','mark','tom','guy','justin','matthew','joey','russell','eric','brian','oliver','ryan','liam','henry','arthur','diego','carlos','marco','felix','stefan','klaus','viktor'];
+const FEMALE_NAME_HINTS = ['female','woman','zira','samantha','victoria','susan','karen','moira','tessa','fiona','allison','ava','emma','joanna','kendra','kimberly','salli','nicole','amy','olivia','sonia','ines','laura','ellen','anna','maria','sara','lucia','ingrid','freya','aria','jenny','heera','kalpana','lekha','shruti','priya','swara'];
+const MALE_NAME_HINTS   = ['male','man','david','daniel','alex','fred','george','james','mark','tom','guy','justin','matthew','joey','russell','eric','brian','oliver','ryan','liam','henry','arthur','diego','carlos','marco','felix','stefan','klaus','viktor','ravi','hemant','madhur','prabhat'];
 
 let cachedVoices = [];
+let selectedVoiceLang = '';
+
 function classifyVoices(voices) {
   const female = [], male = [], unknown = [];
   voices.forEach(v => {
@@ -1685,19 +1660,36 @@ function classifyVoices(voices) {
     else if (MALE_NAME_HINTS.some(h => name.includes(h))) male.push(v);
     else unknown.push(v);
   });
-  // Fill out to 5-and-5 where possible using unclassified voices
   while (female.length < 5 && unknown.length) female.push(unknown.shift());
   while (male.length < 5 && unknown.length) male.push(unknown.shift());
   return { female: female.slice(0, 5), male: male.slice(0, 5) };
 }
 
-function populateVoiceSelect() {
-  if (!voiceSelect || !window.speechSynthesis) return;
+function refreshCachedVoices() {
+  if (!window.speechSynthesis) return;
   const voices = window.speechSynthesis.getVoices();
-  if (!voices.length) return;
-  cachedVoices = voices;
-  const { female, male } = classifyVoices(voices);
+  if (voices.length) cachedVoices = voices;
+}
+
+function resetVoiceLangPrompt() {
+  selectedVoiceLang = '';
+  document.querySelectorAll('.voice-lang-btn').forEach(b => {
+    b.style.borderColor = 'var(--border)'; b.style.color = 'var(--muted)'; b.style.background = 'var(--panel)';
+  });
+  if (voiceSelect) {
+    voiceSelect.disabled = true;
+    voiceSelect.innerHTML = '<option value="">Choose a language above first</option>';
+  }
+}
+
+function populateVoiceSelectForLang(lang) {
+  if (!voiceSelect || !window.speechSynthesis) return;
+  refreshCachedVoices();
+  const matching = cachedVoices.filter(v => (v.lang || '').toLowerCase().startsWith(lang));
+  const pool = matching.length ? matching : cachedVoices;
+  const { female, male } = classifyVoices(pool);
   const savedVoiceURI = (JSON.parse(localStorage.getItem('mythic_settings') || '{}')).voiceURI || '';
+  voiceSelect.disabled = false;
   voiceSelect.innerHTML = '<option value="">Default (system voice)</option>';
   const buildGroup = (label, list) => {
     if (!list.length) return;
@@ -1714,33 +1706,48 @@ function populateVoiceSelect() {
   };
   buildGroup('Female voices', female);
   buildGroup('Male voices', male);
+  if (!matching.length) {
+    const note = document.createElement('option');
+    note.disabled = true;
+    note.textContent = `(No ${lang === 'hi' ? 'Hindi' : 'English'} voices found on this device — showing all voices instead)`;
+    voiceSelect.insertBefore(note, voiceSelect.firstChild.nextSibling);
+  }
 }
+
+document.querySelectorAll('.voice-lang-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    selectedVoiceLang = btn.dataset.lang;
+    document.querySelectorAll('.voice-lang-btn').forEach(b => {
+      const active = b === btn;
+      b.style.borderColor = active ? 'var(--accent)' : 'var(--border)';
+      b.style.color = active ? 'var(--accent)' : 'var(--muted)';
+      b.style.background = active ? 'var(--accent-dim)' : 'var(--panel)';
+    });
+    populateVoiceSelectForLang(selectedVoiceLang);
+  });
+});
+
 if (window.speechSynthesis) {
-  populateVoiceSelect();
-  window.speechSynthesis.onvoiceschanged = populateVoiceSelect;
+  refreshCachedVoices();
+  window.speechSynthesis.onvoiceschanged = refreshCachedVoices;
 }
 if (voiceSelect) voiceSelect.addEventListener('change', saveSettings);
 
-// Load saved settings
 function loadSettings() {
   const s = JSON.parse(localStorage.getItem('mythic_settings') || '{}');
-  // Theme
   const theme = s.theme || 'dark';
   applyTheme(theme);
   document.querySelectorAll('[data-group="theme"]').forEach(b => {
     b.style.borderColor = b.dataset.value === theme ? 'var(--accent)' : 'var(--border)';
     b.style.color = b.dataset.value === theme ? 'var(--accent)' : '';
   });
-  // Accent
   const accent = s.accent || '#10a37f';
   accentColorInput.value = accent;
   document.documentElement.style.setProperty('--accent', accent);
-  // Font size
   const fs = s.fontSize || '14.5';
   fontSizeSlider.value = fs;
   fontSizeLabel.textContent = fs + 'px';
   document.documentElement.style.setProperty('--msg-font-size', fs + 'px');
-  // Bubble style
   const bubble = s.bubble || 'comfortable';
   document.body.classList.remove('bubble-compact','bubble-comfortable','bubble-spacious');
   document.body.classList.add('bubble-' + bubble);
@@ -1748,14 +1755,10 @@ function loadSettings() {
     b.style.borderColor = b.dataset.value === bubble ? 'var(--accent)' : 'var(--border)';
     b.style.color = b.dataset.value === bubble ? 'var(--accent)' : '';
   });
-  // Background preset
   applyBackground(s.background || 'default');
-  // Tone & Length
   if (toneSelect) toneSelect.value = s.tone || 'default';
   if (lengthSelect) lengthSelect.value = s.length || 'default';
-  // Voice
   if (voiceSelect && s.voiceURI) voiceSelect.value = s.voiceURI;
-  // Custom instructions
   if (customInstructions) customInstructions.value = s.customInstructions || '';
 }
 
@@ -1783,7 +1786,7 @@ function applyTheme(t) {
   }
 }
 
-settingsBtn.addEventListener('click', () => { settingsModalOverlay.style.display = 'flex'; });
+settingsBtn.addEventListener('click', () => { resetVoiceLangPrompt(); settingsModalOverlay.style.display = 'flex'; });
 settingsCloseBtn.addEventListener('click', () => { saveSettings(); settingsModalOverlay.style.display = 'none'; });
 settingsModalOverlay.addEventListener('click', e => { if (e.target === settingsModalOverlay) { saveSettings(); settingsModalOverlay.style.display = 'none'; } });
 
@@ -1813,41 +1816,30 @@ fontSizeSlider.addEventListener('input', () => {
 
 loadSettings();
 
-// ─── MARKDOWN RENDERING ──────────────────────────────────────────────────────
 function renderMarkdown(text) {
   const div = document.createElement('div');
   div.className = 'msg-text md-rendered';
-  // Escape HTML first
   let html = text
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  // Code blocks (must come before inline code)
   html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
     `<pre><code class="lang-${lang}">${code.trim()}</code></pre>`);
-  // Inline code
   html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // Bold
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  // Italic
   html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-  // Headers
   html = html.replace(/^### (.+)$/gm, '<h3 style="font-size:14px;margin:6px 0 3px;font-weight:700;">$1</h3>');
   html = html.replace(/^## (.+)$/gm, '<h2 style="font-size:15px;margin:8px 0 4px;font-weight:700;">$1</h2>');
   html = html.replace(/^# (.+)$/gm, '<h1 style="font-size:17px;margin:10px 0 5px;font-weight:700;">$1</h1>');
-  // Unordered lists
   html = html.replace(/(^|\n)([\-\*] .+(\n[\-\*] .+)*)/g, (_, pre, block) =>
     pre + '<ul>' + block.replace(/[\-\*] (.+)/g, '<li>$1</li>') + '</ul>');
-  // Ordered lists
   html = html.replace(/(^|\n)(\d+\. .+(\n\d+\. .+)*)/g, (_, pre, block) =>
     pre + '<ol>' + block.replace(/\d+\. (.+)/g, '<li>$1</li>') + '</ol>');
-  // Line breaks
   html = html.replace(/\n/g, '<br>');
   div.innerHTML = html;
   return div;
 }
 
-// Override addMessage to use markdown for AI
 const _origAddMessage = addMessage;
-function addMessage(role, text, attachment) {
+addMessage = function(role, text, attachment) {
   const textNode = _origAddMessage(role, text, attachment);
   if (role === 'ai' && text) {
     try {
@@ -1857,22 +1849,8 @@ function addMessage(role, text, attachment) {
     } catch { return textNode; }
   }
   return textNode;
-}
+};
 
-// ─── MESSAGE TIMESTAMPS ───────────────────────────────────────────────────────
-const _origAddMsg2 = addMessage;
-function addMessageWithTimestamp(role, text, attachment) {
-  const node = _origAddMsg2(role, text, attachment);
-  const row = node.closest ? node.closest('.msg-row') : null;
-  if (row) {
-    const ts = document.createElement('div');
-    ts.className = 'msg-timestamp';
-    ts.textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-    row.appendChild(ts);
-  }
-  return node;
-}
-// Monkey-patch addMessage to include timestamp
 const _rawAdd = addMessage;
 window._addMsgFinal = function(role, text, attachment) {
   const node = _rawAdd(role, text, attachment);
@@ -1886,7 +1864,6 @@ window._addMsgFinal = function(role, text, attachment) {
   return node;
 };
 
-// ─── MESSAGE REACTIONS ────────────────────────────────────────────────────────
 function addReactionBar(row) {
   if (row.querySelector('.reaction-bar')) return;
   const bar = document.createElement('div');
@@ -1905,7 +1882,6 @@ function addReactionBar(row) {
   row.appendChild(bar);
 }
 
-// ─── MESSAGE SEARCH ───────────────────────────────────────────────────────────
 function addSearchUI() {
   const searchWrap = document.createElement('div');
   searchWrap.id = 'msg-search-wrap';
@@ -1938,7 +1914,6 @@ function addSearchUI() {
 }
 const msgSearchWrap = addSearchUI();
 
-// Keyboard shortcut Ctrl+F to search messages
 document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'f' && !settingsModalOverlay.style.display.includes('flex')) {
     e.preventDefault();
@@ -1948,12 +1923,9 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') msgSearchWrap.style.display = 'none';
 });
 
-// ─── PWA SUPPORT ─────────────────────────────────────────────────────────────
 if ('serviceWorker' in navigator && navigator.serviceWorker) {
-  // Inline service worker for offline caching
   const swCode = `
 const CACHE = 'mythic-ai-v1';
-const OFFLINE = ['/', '/static/app.js'];
 self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(['/']))));
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
@@ -1963,17 +1935,14 @@ self.addEventListener('fetch', e => {
   navigator.serviceWorker.register(URL.createObjectURL(blob)).catch(()=>{});
 }
 
-// ─── WIRE REACTIONS INTO MSG ACTIONS ─────────────────────────────────────────
-// Patch buildMsgActions to add reaction button
 const _origBuildActions = buildMsgActions;
-function buildMsgActions(row, textNode, role) {
+buildMsgActions = function(row, textNode, role) {
   const actions = _origBuildActions(row, textNode, role);
   if (role === 'ai') {
     const reactBtn = document.createElement('button');
     reactBtn.type = 'button'; reactBtn.title = 'React'; reactBtn.textContent = '😊';
     reactBtn.addEventListener('click', () => addReactionBar(row));
     actions.appendChild(reactBtn);
-    // 🔊 speak button
     const sp = document.createElement('button');
     sp.type='button'; sp.title='Read aloud'; sp.textContent='🔊';
     sp.addEventListener('click', () => {
@@ -1987,11 +1956,10 @@ function buildMsgActions(row, textNode, role) {
     actions.appendChild(sp);
   }
   return actions;
-}
+};
 
 function stopSpeaking() { if(window.speechSynthesis) window.speechSynthesis.cancel(); }
 
-// ─── TONE/LENGTH INJECTION ────────────────────────────────────────────────────
 function getTonePrefix() {
   const s = JSON.parse(localStorage.getItem('mythic_settings') || '{}');
   const tone = s.tone || 'default';
@@ -2009,9 +1977,6 @@ function getTonePrefix() {
   return parts.length ? '[Instructions: ' + parts.join(' ') + '] ' : '';
 }
 
-// ─── ADD REACTION BAR AFTER AI REPLY ─────────────────────────────────────────
-// Hook into streamReply completion by patching the form submit
-const _origFormSubmit = form.onsubmit;
 form.addEventListener('submit', async () => {
   const checkDone = setInterval(() => {
     if (!isGenerating) {
@@ -2028,7 +1993,6 @@ form.addEventListener('submit', async () => {
   }, 500);
 });
 
-// ─── INITIAL LOAD ─────────────────────────────────────────────────────────────
 (async () => {
   const convs = await loadConversationList();
   if (convs.length > 0) openConversation(convs[0].id);
@@ -2059,7 +2023,6 @@ if (searchBtn) searchBtn.addEventListener('click', () => {
   input.value = 'Search: ' + q.trim(); autoResize(); form.requestSubmit();
 });
 
-// ─── GHIBLI SELFIE MODAL ─────────────────────────────────────────────────────
 const ghibliModal     = document.getElementById('ghibli-modal-overlay');
 const ghibliUploadArea= document.getElementById('ghibli-upload-area');
 const ghibliFileInput = document.getElementById('ghibli-file-input');
@@ -2078,7 +2041,6 @@ let ghibliBase64 = null;
 let ghibliMimeType = 'image/jpeg';
 let ghibliSelectedStyle = 'Studio Ghibli portrait, Spirited Away style, soft watercolor anime art';
 
-// Open/close
 if (ghibliBtn) ghibliBtn.addEventListener('click', () => {
   ghibliModal.style.display = 'flex';
   ghibliBase64 = null;
@@ -2090,7 +2052,6 @@ if (ghibliBtn) ghibliBtn.addEventListener('click', () => {
 if (ghibliCloseBtn) ghibliCloseBtn.addEventListener('click', () => ghibliModal.style.display = 'none');
 ghibliModal.addEventListener('click', e => { if (e.target === ghibliModal) ghibliModal.style.display = 'none'; });
 
-// Style selector
 document.querySelectorAll('.ghibli-style-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.ghibli-style-btn').forEach(b => {
@@ -2101,7 +2062,6 @@ document.querySelectorAll('.ghibli-style-btn').forEach(btn => {
   });
 });
 
-// Upload area
 ghibliUploadArea.addEventListener('click', () => ghibliFileInput.click());
 ghibliUploadArea.addEventListener('dragover', e => { e.preventDefault(); ghibliUploadArea.style.borderColor = 'var(--accent)'; });
 ghibliUploadArea.addEventListener('dragleave', () => { ghibliUploadArea.style.borderColor = 'var(--border)'; });
@@ -2128,31 +2088,34 @@ function loadGhibliPhoto(file) {
   reader.readAsDataURL(file);
 }
 
-// Generate Ghibli image
 ghibliGenerateBtn.addEventListener('click', async () => {
-  if (!ghibliBase64) {
-    ghibliError.textContent = 'Please upload your photo first!';
-    ghibliError.style.display = 'block'; return;
-  }
+  const extra = ghibliExtraInput.value.trim();
+  const prompt = `${ghibliSelectedStyle}, beautiful detailed portrait of a person, ${extra ? extra + ', ' : ''}masterpiece, best quality, highly detailed, cinematic lighting, soft colors, dreamy atmosphere`;
+
   ghibliError.style.display = 'none';
   ghibliResultWrap.style.display = 'none';
   ghibliLoading.style.display = 'block';
   ghibliGenerateBtn.disabled = true;
 
-  const extra = ghibliExtraInput.value.trim();
-  const prompt = `${ghibliSelectedStyle}, beautiful detailed portrait of a person, ${extra ? extra + ', ' : ''}masterpiece, best quality, highly detailed, cinematic lighting, soft colors, dreamy atmosphere`;
+  const bodyPayload = { prompt };
+  if (ghibliBase64) {
+    bodyPayload.imageBase64 = ghibliBase64;
+    bodyPayload.mimeType = ghibliMimeType;
+  }
 
   try {
     const r = await fetch('/api/generate-image', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ prompt, imageBase64: ghibliBase64, mimeType: ghibliMimeType })
+      body: JSON.stringify(bodyPayload)
     });
-    const d = await r.json();
+    const text = await r.text();
+    let d;
+    try { d = JSON.parse(text); }
+    catch { d = {error: `Server error (${r.status}). Please try again in a moment.`}; }
     ghibliLoading.style.display = 'none';
     if (d.image) {
       ghibliResult.src = 'data:image/png;base64,' + d.image;
       ghibliResultWrap.style.display = 'block';
-      // Also show in chat
       clearEmptyState();
       const row = document.createElement('div'); row.className = 'msg-row ai';
       const bubble = document.createElement('div'); bubble.className = 'msg ai';
@@ -2173,7 +2136,7 @@ ghibliGenerateBtn.addEventListener('click', async () => {
     }
   } catch (e) {
     ghibliLoading.style.display = 'none';
-    ghibliError.textContent = 'Error: ' + e.message;
+    ghibliError.textContent = 'Network error: ' + e.message;
     ghibliError.style.display = 'block';
   } finally { ghibliGenerateBtn.disabled = false; }
 });
@@ -2188,7 +2151,6 @@ if (ghibliDownloadBtn) ghibliDownloadBtn.addEventListener('click', () => {
   if (ghibliResult.src) downloadGhibliImage(ghibliResult.src.split(',')[1]);
 });
 
-// ─── IMAGE GENERATION MODAL JS ───────────────────────────────────────────────
 const imgModalOverlay = document.getElementById('img-modal-overlay');
 const imgPromptEl     = document.getElementById('img-prompt');
 const imgStyleEl      = document.getElementById('img-style');
@@ -2198,18 +2160,32 @@ const imgLoadingEl    = document.getElementById('img-loading');
 const imgErrorEl      = document.getElementById('img-error');
 const imgGenerateBtn2 = document.getElementById('img-generate-btn');
 const imgCloseBtn2    = document.getElementById('img-close-btn');
+const imgDownloadBtn2 = document.getElementById('img-download-btn');
+const imgCopyBtn2     = document.getElementById('img-copy-btn');
+const imgFullscreenBtn2 = document.getElementById('img-fullscreen-btn');
+const imgViewerOverlay = document.getElementById('img-viewer-overlay');
+const imgViewerImg     = document.getElementById('img-viewer-img');
+let lastGeneratedImageB64 = null;
 
 if (imgGenerateBtn2) imgGenerateBtn2.addEventListener('click', async () => {
   const prompt = imgPromptEl.value.trim();
   const style = imgStyleEl ? imgStyleEl.value : '';
-  if (!prompt) return;
+  if (!prompt) { imgErrorEl.textContent = 'Please enter a description first.'; imgErrorEl.style.display = 'block'; return; }
   imgResultEl.style.display = 'none'; imgErrorEl.style.display = 'none';
   imgLoadingEl.style.display = 'block'; imgGenerateBtn2.disabled = true;
   try {
-    const r = await fetch('/api/generate-image', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,style})});
-    const d = await r.json();
+    const r = await fetch('/api/generate-image', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompt, style})
+    });
+    const text = await r.text();
+    let d;
+    try { d = JSON.parse(text); }
+    catch { d = {error: `Server error (${r.status}). Please try again in a moment.`}; }
     imgLoadingEl.style.display = 'none';
     if (d.image) {
+      lastGeneratedImageB64 = d.image;
       imgOutputEl.src = 'data:image/png;base64,' + d.image;
       imgResultEl.style.display = 'block';
       clearEmptyState();
@@ -2222,15 +2198,45 @@ if (imgGenerateBtn2) imgGenerateBtn2.addEventListener('click', async () => {
       img.style.cssText = 'max-width:100%;border-radius:10px;display:block;';
       bubble.appendChild(cap); bubble.appendChild(img); row.appendChild(bubble);
       messagesEl.appendChild(row); scrollToBottom();
-    } else { imgErrorEl.textContent = d.error || 'Failed.'; imgErrorEl.style.display='block'; }
-  } catch(e) { imgLoadingEl.style.display='none'; imgErrorEl.textContent='Error: '+e.message; imgErrorEl.style.display='block'; }
+    } else {
+      imgErrorEl.textContent = d.error || 'Image generation failed. Try again.';
+      imgErrorEl.style.display = 'block';
+    }
+  } catch(e) {
+    imgLoadingEl.style.display = 'none';
+    imgErrorEl.textContent = 'Connection error: ' + e.message + '. Check your internet and try again.';
+    imgErrorEl.style.display = 'block';
+  }
   finally { imgGenerateBtn2.disabled = false; }
 });
 if (imgCloseBtn2) imgCloseBtn2.addEventListener('click', () => imgModalOverlay.style.display='none');
 if (imgModalOverlay) imgModalOverlay.addEventListener('click', e => { if(e.target===imgModalOverlay) imgModalOverlay.style.display='none'; });
 if (imgPromptEl) imgPromptEl.addEventListener('keydown', e => { if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();imgGenerateBtn2.click();} });
+if (imgDownloadBtn2) imgDownloadBtn2.addEventListener('click', () => {
+  if (!lastGeneratedImageB64) return;
+  const a = document.createElement('a');
+  a.href = 'data:image/png;base64,' + lastGeneratedImageB64;
+  a.download = 'mythic-ai-image-' + Date.now() + '.png';
+  document.body.appendChild(a); a.click(); a.remove();
+});
+if (imgCopyBtn2) imgCopyBtn2.addEventListener('click', async () => {
+  if (!lastGeneratedImageB64) return;
+  try {
+    const res = await fetch('data:image/png;base64,' + lastGeneratedImageB64);
+    const blob = await res.blob();
+    await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+    const orig = imgCopyBtn2.textContent;
+    imgCopyBtn2.textContent = '✓ Copied';
+    setTimeout(() => { imgCopyBtn2.textContent = orig; }, 1200);
+  } catch { imgErrorEl.textContent = 'Copy not supported in this browser.'; imgErrorEl.style.display = 'block'; }
+});
+if (imgFullscreenBtn2) imgFullscreenBtn2.addEventListener('click', () => {
+  if (!lastGeneratedImageB64) return;
+  imgViewerImg.src = 'data:image/png;base64,' + lastGeneratedImageB64;
+  imgViewerOverlay.style.display = 'flex';
+});
+if (imgViewerOverlay) imgViewerOverlay.addEventListener('click', () => imgViewerOverlay.style.display = 'none');
 
-// ─── WEATHER MODAL JS ────────────────────────────────────────────────────────
 const weatherModal2    = document.getElementById('weather-modal-overlay');
 const weatherCityEl2   = document.getElementById('weather-city');
 const weatherResultEl2 = document.getElementById('weather-result');
@@ -2241,28 +2247,108 @@ const weatherSearchBtn2= document.getElementById('weather-search-btn');
 const weatherCloseBtn2 = document.getElementById('weather-close-btn');
 const weatherLocBtn2   = document.getElementById('weather-location-btn');
 
+function getRecentWeatherSearches() {
+  try { return JSON.parse(localStorage.getItem('mythic_recent_weather') || '[]'); } catch { return []; }
+}
+function addRecentWeatherSearch(name) {
+  let list = getRecentWeatherSearches().filter(x => x.toLowerCase() !== name.toLowerCase());
+  list.unshift(name);
+  list = list.slice(0, 6);
+  localStorage.setItem('mythic_recent_weather', JSON.stringify(list));
+}
+function renderRecentSearches() {
+  const recents = getRecentWeatherSearches();
+  const wrap = document.getElementById('weather-recents');
+  if (!recents.length) { if (wrap) wrap.remove(); return; }
+  let el = wrap;
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'weather-recents';
+    el.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;';
+    weatherCityEl2.parentNode.insertAdjacentElement('afterend', el);
+  }
+  el.innerHTML = '';
+  recents.forEach(name => {
+    const chip = document.createElement('button');
+    chip.textContent = name;
+    chip.style.cssText = 'background:var(--bg);border:1px solid var(--border);color:var(--muted);border-radius:20px;padding:5px 12px;font-size:12px;cursor:pointer;font-family:inherit;';
+    chip.addEventListener('click', () => fetchWeatherModal({ location: name }));
+    el.appendChild(chip);
+  });
+}
+
 function renderWeather(w) {
+  const hourly = (w.hourly || []).map(h => `
+    <div style="flex:0 0 auto;text-align:center;background:var(--bg);border-radius:10px;padding:8px 12px;min-width:64px;">
+      <div style="font-size:11px;color:var(--muted);">${h.time}</div>
+      <div style="font-size:20px;margin:4px 0;">${h.icon}</div>
+      <div style="font-size:13px;font-weight:700;">${h.temp}°</div>
+    </div>`).join('');
+
+  const daily = (w.daily || []).map(d => `
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 4px;border-bottom:1px solid var(--border);">
+      <div style="flex:1;font-size:13px;">${d.day}</div>
+      <div style="font-size:18px;">${d.icon}</div>
+      <div style="flex:1;text-align:right;font-size:13px;"><span style="font-weight:700;">${d.max}°</span> <span style="color:var(--muted);">${d.min}°</span></div>
+    </div>`).join('');
+
   weatherContentEl2.innerHTML = `
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
-      <div style="font-size:48px;">${w.icon}</div>
-      <div><div style="font-size:18px;font-weight:700;">${w.location}</div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">
+      <div style="font-size:52px;">${w.icon}</div>
+      <div><div style="font-size:19px;font-weight:700;">${w.location}</div>
       <div style="font-size:13px;color:var(--muted);">${w.condition}</div></div>
+      <div style="margin-left:auto;font-size:32px;font-weight:700;">${w.temp}°C</div>
     </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-      <div style="background:var(--bg);border-radius:8px;padding:10px;">
-        <div style="font-size:11px;color:var(--muted);">TEMPERATURE</div>
-        <div style="font-size:22px;font-weight:700;">${w.temp}°C</div>
-        <div style="font-size:11px;color:var(--muted);">Feels like ${w.feels_like}°C</div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px;">
+      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
+        <div style="font-size:10px;color:var(--muted);">FEELS LIKE</div>
+        <div style="font-size:16px;font-weight:700;">${w.feels_like}°C</div>
       </div>
-      <div style="background:var(--bg);border-radius:8px;padding:10px;">
-        <div style="font-size:11px;color:var(--muted);">HUMIDITY</div>
-        <div style="font-size:22px;font-weight:700;">${w.humidity}%</div>
-        <div style="font-size:11px;color:var(--muted);">Wind ${w.wind_speed} km/h</div>
+      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
+        <div style="font-size:10px;color:var(--muted);">HUMIDITY</div>
+        <div style="font-size:16px;font-weight:700;">${w.humidity}%</div>
       </div>
-    </div>`;
+      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
+        <div style="font-size:10px;color:var(--muted);">WIND</div>
+        <div style="font-size:16px;font-weight:700;">${w.wind_speed} km/h</div>
+      </div>
+      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
+        <div style="font-size:10px;color:var(--muted);">UV INDEX</div>
+        <div style="font-size:16px;font-weight:700;">${w.uv ?? '–'}</div>
+      </div>
+      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
+        <div style="font-size:10px;color:var(--muted);">PRESSURE</div>
+        <div style="font-size:16px;font-weight:700;">${w.pressure ?? '–'} hPa</div>
+      </div>
+      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
+        <div style="font-size:10px;color:var(--muted);">VISIBILITY</div>
+        <div style="font-size:16px;font-weight:700;">${w.visibility ?? '–'} km</div>
+      </div>
+      ${w.aqi != null ? `
+      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
+        <div style="font-size:10px;color:var(--muted);">AIR QUALITY</div>
+        <div style="font-size:16px;font-weight:700;">${w.aqi}</div>
+      </div>` : ''}
+      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
+        <div style="font-size:10px;color:var(--muted);">SUNRISE</div>
+        <div style="font-size:14px;font-weight:700;">${w.sunrise ?? '–'}</div>
+      </div>
+      <div style="background:var(--bg);border-radius:8px;padding:9px;text-align:center;">
+        <div style="font-size:10px;color:var(--muted);">SUNSET</div>
+        <div style="font-size:14px;font-weight:700;">${w.sunset ?? '–'}</div>
+      </div>
+    </div>
+
+    ${hourly ? `<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">HOURLY FORECAST</div>
+    <div style="display:flex;gap:8px;overflow-x:auto;padding-bottom:6px;margin-bottom:12px;">${hourly}</div>` : ''}
+
+    ${daily ? `<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">7-DAY FORECAST</div>
+    <div style="margin-bottom:6px;">${daily}</div>` : ''}
+  `;
   weatherResultEl2.style.display = 'block';
-  input.value = `${w.icon} Weather in ${w.location}: ${w.temp}°C, ${w.condition}. Humidity: ${w.humidity}%, Wind: ${w.wind_speed} km/h.`;
-  autoResize();
+  addRecentWeatherSearch(w.location);
+  renderRecentSearches();
 }
 
 async function fetchWeatherModal(payload) {
@@ -2272,8 +2358,8 @@ async function fetchWeatherModal(payload) {
     const r = await fetch('/api/weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     const d = await r.json(); weatherLoadingEl2.style.display='none';
     if(d.weather) renderWeather(d.weather);
-    else { weatherErrorEl2.textContent=d.error||'Could not fetch weather.'; weatherErrorEl2.style.display='block'; }
-  } catch(e) { weatherLoadingEl2.style.display='none'; weatherErrorEl2.textContent='Error: '+e.message; weatherErrorEl2.style.display='block'; }
+    else { weatherErrorEl2.textContent=d.error||'Could not find that location. Try a different search.'; weatherErrorEl2.style.display='block'; }
+  } catch(e) { weatherLoadingEl2.style.display='none'; weatherErrorEl2.textContent='Network error: '+e.message; weatherErrorEl2.style.display='block'; }
   finally { weatherSearchBtn2.disabled=false; }
 }
 if (weatherSearchBtn2) weatherSearchBtn2.addEventListener('click', () => { const loc=weatherCityEl2.value.trim(); if(loc) fetchWeatherModal({location:loc}); });
@@ -2281,12 +2367,13 @@ if (weatherCityEl2) weatherCityEl2.addEventListener('keydown', e => { if(e.key==
 if (weatherCloseBtn2) weatherCloseBtn2.addEventListener('click', () => weatherModal2.style.display='none');
 if (weatherModal2) weatherModal2.addEventListener('click', e => { if(e.target===weatherModal2) weatherModal2.style.display='none'; });
 if (weatherLocBtn2) weatherLocBtn2.addEventListener('click', () => {
-  if (!navigator.geolocation) { alert('Geolocation not supported'); return; }
+  if (!navigator.geolocation) { weatherErrorEl2.textContent = 'Geolocation is not supported in this browser.'; weatherErrorEl2.style.display = 'block'; return; }
   navigator.geolocation.getCurrentPosition(
     pos => fetchWeatherModal({lat:pos.coords.latitude,lon:pos.coords.longitude}),
-    err => alert('Location error: '+err.message)
+    err => { weatherErrorEl2.textContent = 'Location error: ' + err.message; weatherErrorEl2.style.display = 'block'; }
   );
 });
+renderRecentSearches();
 </script>
 </body>
 </html>
@@ -2344,66 +2431,9 @@ def api_rename_conversation(conv_id):
     return jsonify({"status": "renamed", "title": new_title})
 
 
-def to_ollama_messages(gemini_messages, system_prompt):
-    """Convert our stored Gemini-style messages ({role, parts:[...]}) into
-    Ollama's chat format ({role, content, images?})."""
-    msgs = [{"role": "system", "content": system_prompt}]
-    for m in gemini_messages:
-        role = "user" if m["role"] == "user" else "assistant"
-        text = "".join(p.get("text", "") for p in m["parts"] if "text" in p)
-        entry = {"role": role, "content": text}
-        images = [
-            p["inline_data"]["data"]
-            for p in m["parts"]
-            if "inline_data" in p and p["inline_data"].get("mime_type", "").startswith("image/")
-        ]
-        if images:
-            entry["images"] = images
-        msgs.append(entry)
-    return msgs
-
-
-def ollama_stream_chunks(messages):
-    """Yields plain text increments from a local Ollama server."""
-    try:
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={"model": OLLAMA_MODEL, "messages": messages, "stream": True},
-            stream=True,
-            timeout=120,
-        )
-    except requests.RequestException as e:
-        yield (
-            f"[Could not reach Ollama at {OLLAMA_URL}: {e}. "
-            f"Make sure Ollama is installed and running (`ollama serve`), "
-            f"and that you've pulled the model (`ollama pull {OLLAMA_MODEL}`).]"
-        )
-        return
-
-    if resp.status_code != 200:
-        yield f"[Ollama error ({resp.status_code}): {resp.text}]"
-        return
-
-    for raw_line in resp.iter_lines(decode_unicode=True):
-        if not raw_line:
-            continue
-        try:
-            obj = json.loads(raw_line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("error"):
-            yield f"[Ollama error: {obj['error']}]"
-            return
-        content = obj.get("message", {}).get("content", "")
-        if content:
-            yield content
-        if obj.get("done"):
-            break
-
-
 def to_openai_messages(gemini_messages, system_prompt):
     """Convert stored Gemini-format messages to OpenAI-compatible chat format.
-    Used by Groq, OpenRouter, and HuggingFace (all use the same OpenAI-style API)."""
+    Used by both Groq and Cerebras (both use the same OpenAI-style chat API)."""
     msgs = [{"role": "system", "content": system_prompt}]
     for m in gemini_messages:
         role = "user" if m["role"] == "user" else "assistant"
@@ -2412,260 +2442,107 @@ def to_openai_messages(gemini_messages, system_prompt):
     return msgs
 
 
-def groq_stream_chunks(messages):
-    """Stream from Groq API (OpenAI-compatible, very fast, generous free tier)."""
-    if not GROQ_API_KEY:
+def _openai_style_stream(url, api_key, model, messages):
+    """Shared streaming logic for Groq/Cerebras (both are OpenAI-compatible).
+    Yields nothing at all on ANY failure (auth, rate limit, timeout, invalid
+    model, network error, 4xx/5xx) so the caller can silently fall through to
+    the next provider without ever exposing a provider error to the user."""
+    if not api_key:
         return
     try:
         resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": GROQ_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
+            url,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "stream": True, "max_tokens": 2048},
             stream=True, timeout=60,
         )
-        if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data_str)
-                    content = obj["choices"][0]["delta"].get("content", "")
-                    if content:
-                        yield content
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-            return  # success — stop here
-        # rate limited or error — fall through (return without yielding)
     except requests.RequestException:
-        pass
+        return  # network error / timeout — silently fall through
+
+    if resp.status_code != 200:
+        return  # rate limit / server error / auth error — try the next provider
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data:"):
+            continue
+        data_str = line[5:].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            obj = json.loads(data_str)
+            content = obj["choices"][0]["delta"].get("content", "")
+            if content:
+                yield content
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
 
 
-def openrouter_stream_chunks(messages):
-    """Stream from OpenRouter (aggregates many free models)."""
-    if not OPENROUTER_API_KEY:
-        return
-    try:
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json",
-                     "HTTP-Referer": "http://localhost:5000", "X-Title": "Ꮇʏᴛʜɪᴄ ᴀɪ"},
-            json={"model": OPENROUTER_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
-            stream=True, timeout=60,
-        )
-        if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data_str)
-                    content_chunk = obj["choices"][0]["delta"].get("content", "")
-                    if content_chunk:
-                        yield content_chunk
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-            return
-        else:
-            yield f"[OpenRouter error {resp.status_code}: {resp.text[:200]}]"
-            return
-    except requests.RequestException as e:
-        yield f"[OpenRouter connection error: {e}]"
-        return
-
-
-def huggingface_stream_chunks(messages):
-    """Stream from Hugging Face Inference API (free tier available)."""
-    if not HF_API_KEY:
-        return
-    # HF uses the same OpenAI-compatible endpoint format
-    try:
-        resp = requests.post(
-            f"https://api-inference.huggingface.co/models/{HF_MODEL}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {HF_API_KEY}", "Content-Type": "application/json"},
-            json={"model": HF_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
-            stream=True, timeout=60,
-        )
-        if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data_str)
-                    content_chunk = obj["choices"][0]["delta"].get("content", "")
-                    if content_chunk:
-                        yield content_chunk
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-            return
-        else:
-            yield f"[OpenRouter error {resp.status_code}: {resp.text[:200]}]"
-            return
-    except requests.RequestException as e:
-        yield f"[OpenRouter connection error: {e}]"
-        return
-
+def groq_stream_chunks(messages):
+    yield from _openai_style_stream(
+        "https://api.groq.com/openai/v1/chat/completions",
+        GROQ_API_KEY, GROQ_MODEL, messages,
+    )
 
 
 def cerebras_stream_chunks(messages):
-    """Stream from Cerebras AI (very fast, generous free tier, works on servers)."""
-    if not CEREBRAS_API_KEY:
-        return
-    try:
-        resp = requests.post(
-            "https://api.cerebras.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"},
-            json={"model": CEREBRAS_MODEL, "messages": messages, "stream": True, "max_tokens": 2048},
-            stream=True, timeout=60,
-        )
-        if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data_str)
-                    chunk = obj["choices"][0]["delta"].get("content", "")
-                    if chunk:
-                        yield chunk
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-            return
-        else:
-            yield f"[Cerebras error {resp.status_code}: {resp.text[:300]}]"
-            return
-    except requests.RequestException as e:
-        yield f"[Cerebras connection error: {e}]"
-        return
+    yield from _openai_style_stream(
+        "https://api.cerebras.ai/v1/chat/completions",
+        CEREBRAS_API_KEY, CEREBRAS_MODEL, messages,
+    )
 
 
-# --- Round-robin provider rotation ------------------------------------------
-# Tracks which provider index to try FIRST next time (persists for the life
-# of the process; resets on server restart, which is fine).
-_provider_index = [0]
+# --- True alternating rotation between Groq and Cerebras --------------------
+# Persists across requests for the life of the process. Whichever provider
+# succeeds sets the NEXT request to start with the other one — a real
+# back-and-forth rotation, not "always try Groq first". If the one that's
+# "up" fails for any reason, we silently fall through to the other one in the
+# same request so the user is never shown a provider error.
+_provider_rotation = ["groq"]  # next provider to try first
 
 
-def auto_stream_chunks(gemini_payload, gemini_messages, system_prompt=None):
-    """True round-robin rotation across all configured providers.
-    No provider is primary — starts from wherever the last successful call left off.
-    If the current provider fails/is rate-limited, moves to the next one and
-    remembers that position for the next request too."""
+def auto_stream_chunks(gemini_messages, system_prompt=None):
     sp = system_prompt or SYSTEM_PROMPT
     openai_msgs = to_openai_messages(gemini_messages, sp)
-    ollama_msgs = to_ollama_messages(gemini_messages, sp)
 
-    # Build the full list of available providers (only those with keys)
-    all_providers = []
-    if PROVIDER in ("auto", "gemini") and GEMINI_API_KEY:
-        all_providers.append(("Gemini", lambda: gemini_stream_chunks(gemini_payload)))
+    available = []
     if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
-        all_providers.append(("Groq", lambda: groq_stream_chunks(openai_msgs)))
+        available.append("groq")
     if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
-        all_providers.append(("Cerebras", lambda: cerebras_stream_chunks(openai_msgs)))
-    if PROVIDER == "openrouter" and OPENROUTER_API_KEY:
-        all_providers.append(("OpenRouter", lambda: openrouter_stream_chunks(openai_msgs)))
-    if PROVIDER == "huggingface" and HF_API_KEY:
-        # HuggingFace free tier blocks server IPs (Render etc) — only use if explicitly set
-        all_providers.append(("HuggingFace", lambda: huggingface_stream_chunks(openai_msgs)))
-    if PROVIDER == "ollama":
-        all_providers.append(("Ollama", lambda: ollama_stream_chunks(ollama_msgs)))
+        available.append("cerebras")
 
-    if not all_providers:
-        yield "[No AI providers configured. Add at least one API key.]"
+    if not available:
+        yield "I'm not able to respond right now — no AI provider is configured on the server."
         return
 
-    n = len(all_providers)
-    start = _provider_index[0] % n
+    # Decide the order for this request based on the rotation state
+    start = _provider_rotation[0] if _provider_rotation[0] in available else available[0]
+    order = [start] + [p for p in available if p != start]
 
-    # Try each provider starting from the current rotation position
-    for i in range(n):
-        idx = (start + i) % n
-        name, fn = all_providers[idx]
-        collected = []
+    fn_map = {"groq": groq_stream_chunks, "cerebras": cerebras_stream_chunks}
+
+    for name in order:
+        collected = False
         try:
-            for chunk in fn():
-                collected.append(chunk)
+            for chunk in fn_map[name](openai_msgs):
+                collected = True
                 yield chunk
             if collected:
-                # Success — next request starts from the NEXT provider (true rotation)
-                _provider_index[0] = (idx + 1) % n
+                # This one worked — next request starts with the OTHER provider
+                others = [p for p in available if p != name]
+                _provider_rotation[0] = others[0] if others else name
                 return
         except Exception:
             pass
-        # This provider failed — silently try the next one
+        # silently move on to the next provider in `order`
 
-    yield "[All AI providers failed or are rate-limited. Try again in a moment.]"
-
-
+    yield "I'm having trouble reaching the AI service right now — please try again in a moment."
 
 
-def gemini_stream_chunks(payload):
-    """Yields plain text increments from Gemini's SSE stream.
-    Returns nothing (silently) on auth/quota/rate-limit errors so the
-    round-robin rotation automatically falls through to the next provider."""
-    try:
-        resp = requests.post(
-            GEMINI_STREAM_URL,
-            params={"key": API_KEY, "alt": "sse"},
-            json=payload,
-            stream=True,
-            timeout=60,
-        )
-    except requests.RequestException:
-        return  # network error — silently fall through
-
-    if resp.status_code != 200:
-        # Auth errors (401/403), quota errors (429), and server errors (5xx)
-        # all mean "try the next provider" — don't yield anything.
-        return
-
-    for raw_line in resp.iter_lines(decode_unicode=True):
-        if not raw_line or not raw_line.startswith("data:"):
-            continue
-        data_str = raw_line[len("data:"):].strip()
-        if not data_str or data_str == "[DONE]":
-            continue
-        try:
-            obj = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-        try:
-            for part in obj["candidates"][0]["content"]["parts"]:
-                if "text" in part:
-                    yield part["text"]
-        except (KeyError, IndexError):
-            continue
-
-
-# --- Model selector (cosmetic tiers over the same underlying providers) -----
-# "VIP" is gated by a password so it isn't just a free option in the dropdown.
+# --- VIP toggle (single tier, password-gated; no model picker) --------------
 # Set VIP_PASSWORD as an environment variable to override. Defaults to "1254"
 # as requested — change this if the app will ever be exposed publicly, since
 # anyone with the source file can read this default.
 VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "1254")
-
-MODEL_CATALOG = [
-    {"id": "mythic-1", "name": "Mythic 1", "vip": False},
-    {"id": "mythic-2", "name": "Mythic 2", "vip": False},
-    {"id": "mythic-3", "name": "Mythic 3", "vip": False},
-    {"id": "mythic-vip", "name": "Mythic VIP 🔒", "vip": True},
-]
-DEFAULT_MODEL_ID = "mythic-2"
-
-
-@app.route("/api/models", methods=["GET"])
-@login_required
-def api_models():
-    return jsonify({"models": MODEL_CATALOG, "default": DEFAULT_MODEL_ID})
 
 
 @app.route("/api/vip-status", methods=["GET"])
@@ -2686,6 +2563,172 @@ def api_vip_unlock():
     return jsonify({"success": False})
 
 
+# --- Weather (Open-Meteo — free, no API key needed, works for any country/city) ---
+_WMO_ICON = {
+    0: ("☀️", "Clear sky"), 1: ("🌤", "Mainly clear"), 2: ("⛅", "Partly cloudy"), 3: ("☁️", "Overcast"),
+    45: ("🌫", "Fog"), 48: ("🌫", "Freezing fog"),
+    51: ("🌦", "Light drizzle"), 53: ("🌦", "Drizzle"), 55: ("🌧", "Dense drizzle"),
+    56: ("🌧", "Freezing drizzle"), 57: ("🌧", "Freezing drizzle"),
+    61: ("🌧", "Light rain"), 63: ("🌧", "Rain"), 65: ("🌧", "Heavy rain"),
+    66: ("🌧", "Freezing rain"), 67: ("🌧", "Freezing rain"),
+    71: ("🌨", "Light snow"), 73: ("🌨", "Snow"), 75: ("❄️", "Heavy snow"), 77: ("❄️", "Snow grains"),
+    80: ("🌦", "Rain showers"), 81: ("🌧", "Rain showers"), 82: ("⛈", "Violent rain showers"),
+    85: ("🌨", "Snow showers"), 86: ("❄️", "Snow showers"),
+    95: ("⛈", "Thunderstorm"), 96: ("⛈", "Thunderstorm with hail"), 99: ("⛈", "Thunderstorm with hail"),
+}
+
+
+def _wmo(code):
+    return _WMO_ICON.get(code, ("🌡", "Unknown"))
+
+
+def _aqi_label(us_aqi):
+    if us_aqi is None:
+        return None
+    if us_aqi <= 50: return f"{us_aqi} (Good)"
+    if us_aqi <= 100: return f"{us_aqi} (Moderate)"
+    if us_aqi <= 150: return f"{us_aqi} (Unhealthy for sensitive groups)"
+    if us_aqi <= 200: return f"{us_aqi} (Unhealthy)"
+    if us_aqi <= 300: return f"{us_aqi} (Very unhealthy)"
+    return f"{us_aqi} (Hazardous)"
+
+
+@app.route("/api/weather", methods=["POST"])
+@login_required
+def api_weather():
+    data = request.get_json(force=True) or {}
+    location_name = (data.get("location") or "").strip()
+    lat = data.get("lat")
+    lon = data.get("lon")
+    display_name = location_name
+
+    try:
+        if lat is None or lon is None:
+            if not location_name:
+                return jsonify({"error": "Enter a city or use your location."}), 400
+            geo = requests.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": location_name, "count": 1, "language": "en", "format": "json"},
+                timeout=10,
+            ).json()
+            results = geo.get("results") or []
+            if not results:
+                return jsonify({"error": f'Could not find "{location_name}".'}), 404
+            top = results[0]
+            lat, lon = top["latitude"], top["longitude"]
+            parts = [top.get("name")]
+            if top.get("admin1") and top.get("admin1") != top.get("name"):
+                parts.append(top["admin1"])
+            if top.get("country"):
+                parts.append(top["country"])
+            display_name = ", ".join(p for p in parts if p)
+
+        fr = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat, "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,"
+                           "wind_speed_10m,pressure_msl,visibility",
+                "hourly": "temperature_2m,weather_code",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,uv_index_max,"
+                         "sunrise,sunset",
+                "timezone": "auto",
+                "forecast_days": 7,
+            },
+            timeout=10,
+        ).json()
+
+        current = fr.get("current", {})
+        hourly_raw = fr.get("hourly", {})
+        daily_raw = fr.get("daily", {})
+
+        if not display_name:
+            try:
+                rev = requests.get(
+                    "https://geocoding-api.open-meteo.com/v1/reverse",
+                    params={"latitude": lat, "longitude": lon, "language": "en", "format": "json"},
+                    timeout=8,
+                ).json()
+                rr = (rev.get("results") or [None])[0]
+                if rr:
+                    display_name = ", ".join(p for p in [rr.get("name"), rr.get("country")] if p)
+            except Exception:
+                pass
+            display_name = display_name or f"{lat:.2f}, {lon:.2f}"
+
+        icon, condition = _wmo(current.get("weather_code"))
+
+        aqi = None
+        try:
+            aq = requests.get(
+                "https://air-quality-api.open-meteo.com/v1/air-quality",
+                params={"latitude": lat, "longitude": lon, "current": "us_aqi"},
+                timeout=8,
+            ).json()
+            aqi = _aqi_label((aq.get("current") or {}).get("us_aqi"))
+        except Exception:
+            pass
+
+        hourly = []
+        times = hourly_raw.get("time", [])
+        temps = hourly_raw.get("temperature_2m", [])
+        codes = hourly_raw.get("weather_code", [])
+        now_iso = current.get("time", "")
+        start_idx = 0
+        for i, t in enumerate(times):
+            if t >= now_iso:
+                start_idx = i
+                break
+        for i in range(start_idx, min(start_idx + 8, len(times))):
+            hi, _ = _wmo(codes[i] if i < len(codes) else None)
+            hour_label = times[i][11:16] if len(times[i]) >= 16 else times[i]
+            hourly.append({"time": hour_label, "icon": hi, "temp": round(temps[i]) if i < len(temps) else None})
+
+        daily = []
+        d_times = daily_raw.get("time", [])
+        d_max = daily_raw.get("temperature_2m_max", [])
+        d_min = daily_raw.get("temperature_2m_min", [])
+        d_codes = daily_raw.get("weather_code", [])
+        weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        for i, t in enumerate(d_times):
+            try:
+                y, m, dd = [int(x) for x in t.split("-")]
+                import datetime as _dt
+                wd = weekday_names[_dt.date(y, m, dd).weekday()]
+            except Exception:
+                wd = t
+            di, _ = _wmo(d_codes[i] if i < len(d_codes) else None)
+            daily.append({
+                "day": "Today" if i == 0 else wd,
+                "icon": di,
+                "max": round(d_max[i]) if i < len(d_max) else None,
+                "min": round(d_min[i]) if i < len(d_min) else None,
+            })
+
+        weather = {
+            "location": display_name,
+            "icon": icon,
+            "condition": condition,
+            "temp": round(current.get("temperature_2m", 0)),
+            "feels_like": round(current.get("apparent_temperature", 0)),
+            "humidity": current.get("relative_humidity_2m"),
+            "wind_speed": round(current.get("wind_speed_10m", 0)),
+            "pressure": round(current.get("pressure_msl")) if current.get("pressure_msl") is not None else None,
+            "visibility": round((current.get("visibility") or 0) / 1000, 1) if current.get("visibility") is not None else None,
+            "uv": (daily_raw.get("uv_index_max") or [None])[0],
+            "sunrise": (daily_raw.get("sunrise") or [None])[0][11:16] if (daily_raw.get("sunrise") or [None])[0] else None,
+            "sunset": (daily_raw.get("sunset") or [None])[0][11:16] if (daily_raw.get("sunset") or [None])[0] else None,
+            "aqi": aqi,
+            "hourly": hourly,
+            "daily": daily,
+        }
+        return jsonify({"weather": weather})
+    except requests.RequestException as e:
+        return jsonify({"error": f"Weather service unavailable: {e}"}), 502
+    except Exception as e:
+        return jsonify({"error": f"Could not process weather data: {e}"}), 500
+
+
 @app.route("/api/chat", methods=["POST"])
 @login_required
 def chat():
@@ -2693,8 +2736,8 @@ def chat():
     user_message = (data.get("message") or "").strip()
     conv_id = data.get("conversation_id")
     attachment = data.get("attachment")  # {name, mimeType, dataBase64} or None
-    user_name = (data.get("user_name") or "").strip()[:60]  # what Ꮇʏᴛʜɪᴄ ᴀɪ should call the user
-    requested_model = (data.get("model") or DEFAULT_MODEL_ID).strip()
+    user_name = (data.get("user_name") or "").strip()[:60]
+    requested_tier = (data.get("model") or "standard").strip()
     regenerate = bool(data.get("regenerate"))
 
     if regenerate:
@@ -2722,8 +2765,6 @@ def chat():
     messages = conv.setdefault("messages", [])
 
     if regenerate:
-        # Drop the most recent assistant reply (if any) so a fresh one replaces it.
-        # Leaves the preceding user message in place to regenerate against.
         if messages and messages[-1]["role"] == "model":
             messages.pop()
         if not messages or messages[-1]["role"] != "user":
@@ -2745,11 +2786,6 @@ def chat():
             user_entry["attachment_meta"] = attachment_meta
         messages.append(user_entry)
 
-    # Strip attachment_meta (frontend-only field) before sending to the model
-    gemini_contents = [
-        {"role": m["role"], "parts": m["parts"]} for m in messages
-    ]
-
     effective_system_prompt = SYSTEM_PROMPT
     if user_name:
         effective_system_prompt += (
@@ -2757,30 +2793,15 @@ def chat():
             f"Address them as {user_name} naturally where it fits (e.g. greetings, "
             f"acknowledgements) — don't force it into every single reply."
         )
-    if requested_model == "mythic-vip" and session.get("vip_unlocked"):
+    if requested_tier == "vip" and session.get("vip_unlocked"):
         effective_system_prompt += (
             " The user is on the VIP tier — feel free to go deeper and be more "
             "thorough than usual when it's helpful, without padding for its own sake."
         )
-    # Only the real Gemini call gets the "you have search" instruction — fallback
-    # providers don't have real search, so giving them that instruction makes them
-    # hallucinate fake tool-call JSON into the visible reply.
-    gemini_system_prompt = effective_system_prompt + GEMINI_SEARCH_ADDENDUM
-
-    payload = {
-        "contents": gemini_contents,
-        "systemInstruction": {"parts": [{"text": gemini_system_prompt}]},
-        "tools": [{"google_search": {}}],
-    }
 
     def generate():
         full_reply = []
-        if PROVIDER == "ollama":
-            chunk_source = ollama_stream_chunks(to_ollama_messages(messages, effective_system_prompt))
-        else:
-            chunk_source = auto_stream_chunks(payload, messages, effective_system_prompt)
-
-        for chunk in chunk_source:
+        for chunk in auto_stream_chunks(messages, effective_system_prompt):
             full_reply.append(chunk)
             yield chunk
         messages.append({"role": "model", "parts": [{"text": "".join(full_reply)}]})
@@ -2793,8 +2814,6 @@ def chat():
 
 @app.route("/api/temp-image/<img_id>", methods=["GET"])
 def serve_temp_image(img_id):
-    """Serves a temporarily-stashed upload so NanoBanana's servers can fetch it
-    by URL for image-to-image editing. See _store_temp_image() above."""
     entry = _TEMP_IMAGES.get(img_id)
     if not entry:
         return jsonify({"error": "not found or expired"}), 404
@@ -2804,82 +2823,132 @@ def serve_temp_image(img_id):
 @app.route("/api/generate-image", methods=["POST"])
 @login_required
 def generate_image():
-    data = request.get_json(force=True) or {}
-    prompt = data.get("prompt", "").strip()
-    image_b64 = data.get("imageBase64")  # optional — source photo for Ghibli Me / edits
-    mime_type = data.get("mimeType", "image/jpeg")
-    if not prompt:
-        return jsonify({"error": "prompt required"}), 400
-
-    # Preferred path: NanoBanana. Supports real image-to-image editing, so
-    # "Ghibli Me" can actually transform the uploaded photo instead of just
-    # generating a generic image from text.
-    if NANO_BANANA_API_KEY:
-        image_urls = None
-        if image_b64:
-            try:
-                raw = base64.b64decode(image_b64, validate=True)
-            except Exception:
-                return jsonify({"error": "invalid image data"}), 400
-            if len(raw) > MAX_UPLOAD_BYTES:
-                return jsonify({"error": "image too large (max 8MB)"}), 400
-            img_id = _store_temp_image(raw, mime_type)
-            image_urls = [f"{request.host_url.rstrip('/')}/api/temp-image/{img_id}"]
-
-        task_id, err = nano_banana_submit(prompt, image_urls=image_urls)
-        if err:
-            return jsonify({"error": err}), 502
-        result_url, err = nano_banana_poll(task_id)
-        if err:
-            return jsonify({"error": err}), 502
-        try:
-            img_resp = requests.get(result_url, timeout=30)
-            img_resp.raise_for_status()
-            return jsonify({"image": base64.b64encode(img_resp.content).decode("utf-8")})
-        except requests.RequestException as e:
-            return jsonify({"error": f"Could not download result image: {e}"}), 502
-
-    # Fallback: HuggingFace FLUX.1-schnell — text-to-image only, ignores any
-    # uploaded photo (it has no image-to-image mode here).
-    if not HF_API_KEY:
-        return jsonify({"error": "No image generation provider configured"}), 503
-    model = "black-forest-labs/FLUX.1-schnell"
     try:
-        resp = requests.post(
-            f"https://api-inference.huggingface.co/models/{model}",
-            headers={"Authorization": f"Bearer {HF_API_KEY}"},
-            json={"inputs": prompt},
-            timeout=60,
-        )
-        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
-            img_b64 = base64.b64encode(resp.content).decode("utf-8")
-            return jsonify({"image": img_b64})
+        data = request.get_json(force=True) or {}
+        prompt = data.get("prompt", "").strip()
+        image_b64 = data.get("imageBase64")
+        mime_type = data.get("mimeType", "image/jpeg")
+        style = data.get("style", "").strip()
+        if not prompt:
+            return jsonify({"error": "prompt required"}), 400
+
+        full_prompt = f"{prompt}, {style}" if style else prompt
+
+        prompt_lower = full_prompt.lower()
+        is_book      = any(w in prompt_lower for w in ["book cover", "book", "novel cover", "textbook"])
+        is_portrait  = any(w in prompt_lower for w in ["portrait", "person", "face", "selfie", "photo of"])
+        is_logo      = any(w in prompt_lower for w in ["logo", "icon", "emblem", "badge"])
+        is_anime     = any(w in prompt_lower for w in ["anime", "ghibli", "manga", "cartoon", "illustration"])
+        is_landscape = any(w in prompt_lower for w in ["landscape", "scenery", "nature", "city", "skyline", "aerial"])
+
+        quality_tail = ", masterpiece, best quality, highly detailed, sharp focus, professional"
+
+        if is_book:
+            enhanced = (
+                f"{full_prompt}, professional book cover design, elegant typography layout, "
+                f"dramatic lighting, rich colors, visually striking, award-winning cover art, "
+                f"publishing industry standard{quality_tail}"
+            )
+            width, height = 512, 768
+        elif is_portrait:
+            enhanced = (
+                f"{full_prompt}, cinematic portrait photography, soft studio lighting, "
+                f"8K ultra-detailed, DSLR quality, photorealistic{quality_tail}"
+            )
+            width, height = 512, 768
+        elif is_logo:
+            enhanced = (
+                f"{full_prompt}, clean vector style, minimalist, professional brand design, "
+                f"flat design, scalable, high contrast{quality_tail}"
+            )
+            width, height = 768, 768
+        elif is_anime:
+            enhanced = (
+                f"{full_prompt}, vibrant anime art, clean linework, beautiful coloring, "
+                f"Studio Ghibli quality, cel shading{quality_tail}"
+            )
+            width, height = 768, 768
+        elif is_landscape:
+            enhanced = (
+                f"{full_prompt}, epic wide shot, golden hour lighting, ultra-wide, "
+                f"breathtaking scenery, National Geographic quality{quality_tail}"
+            )
+            width, height = 896, 512
         else:
-            return jsonify({"error": f"Image generation failed ({resp.status_code})"}), 502
-    except requests.RequestException as e:
-        return jsonify({"error": str(e)}), 502
+            enhanced = f"{full_prompt}{quality_tail}"
+            width, height = 768, 768
+
+        negative = (
+            "blurry, low quality, pixelated, distorted, deformed, ugly, bad anatomy, "
+            "watermark, signature, text errors, garbled text, poorly drawn, disfigured, "
+            "oversaturated, washed out, extra limbs, duplicate, clone, artifact, noise"
+        )
+
+        if NANO_BANANA_API_KEY:
+            image_urls = None
+            if image_b64:
+                try:
+                    raw = base64.b64decode(image_b64, validate=True)
+                    if len(raw) > MAX_UPLOAD_BYTES:
+                        return jsonify({"error": "image too large (max 8MB)"}), 400
+                    img_id = _store_temp_image(raw, mime_type)
+                    base_url = request.host_url.rstrip('/')
+                    image_urls = [f"{base_url}/api/temp-image/{img_id}"]
+                except Exception:
+                    pass
+            try:
+                task_id, err = nano_banana_submit(enhanced, image_urls=image_urls)
+                if not err:
+                    result_url, err = nano_banana_poll(task_id)
+                    if not err:
+                        img_resp = requests.get(result_url, timeout=30)
+                        img_resp.raise_for_status()
+                        return jsonify({"image": base64.b64encode(img_resp.content).decode("utf-8")})
+            except Exception:
+                pass
+
+        if HF_API_KEY:
+            try:
+                resp = requests.post(
+                    "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell",
+                    headers={"Authorization": f"Bearer {HF_API_KEY}"},
+                    json={"inputs": enhanced},
+                    timeout=90,
+                )
+                if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
+                    return jsonify({"image": base64.b64encode(resp.content).decode("utf-8")})
+            except Exception:
+                pass
+
+        seed = int(time.time()) % 99999
+        encoded_prompt   = urllib.parse.quote(enhanced)
+        encoded_negative = urllib.parse.quote(negative)
+        poll_url = (
+            f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+            f"?width={width}&height={height}&seed={seed}"
+            f"&negative={encoded_negative}"
+            f"&model=flux&enhance=true&nologo=true"
+        )
+        img_resp = requests.get(poll_url, timeout=120)
+        if img_resp.status_code == 200 and img_resp.headers.get("content-type", "").startswith("image/"):
+            return jsonify({"image": base64.b64encode(img_resp.content).decode("utf-8")})
+        return jsonify({"error": f"Image generation failed (status {img_resp.status_code}). Please try again."}), 502
+
+    except Exception as e:
+        return jsonify({"error": f"Image generation error: {str(e)}"}), 500
 
 
 if __name__ == "__main__":
     active = []
-    if PROVIDER in ("auto", "gemini") and GEMINI_API_KEY:
-        active.append(f"Gemini({GEMINI_MODEL})")
     if PROVIDER in ("auto", "groq") and GROQ_API_KEY:
         active.append(f"Groq({GROQ_MODEL})")
     if PROVIDER in ("auto", "cerebras") and CEREBRAS_API_KEY:
         active.append(f"Cerebras({CEREBRAS_MODEL})")
-    if PROVIDER in ("auto", "openrouter") and OPENROUTER_API_KEY:
-        active.append(f"OpenRouter({OPENROUTER_MODEL})")
-    if PROVIDER in ("auto", "huggingface") and HF_API_KEY:
-        active.append(f"HuggingFace({HF_MODEL})")
-    if PROVIDER == "ollama":
-        active.append(f"Ollama({OLLAMA_MODEL}@{OLLAMA_URL})")
-    providers_str = " → ".join(active) if active else "none configured!"
+    providers_str = " <-> ".join(active) if active else "none configured!"
     image_provider = "NanoBanana (image-to-image supported)" if NANO_BANANA_API_KEY else (
-        "HuggingFace FLUX (text-to-image only)" if HF_API_KEY else "none configured!"
+        "HuggingFace FLUX (text-to-image only)" if HF_API_KEY else "Pollinations.ai (no key needed)"
     )
     print(f"Starting Ꮇʏᴛʜɪᴄ ᴀɪ at http://localhost:5000")
-    print(f"Providers (fallback order): {providers_str}")
+    print(f"Providers (true alternating rotation): {providers_str}")
     print(f"Image generation: {image_provider}")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
-    
