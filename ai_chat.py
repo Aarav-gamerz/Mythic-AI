@@ -2257,8 +2257,9 @@ def pwa_icon():
 
 
 @app.route("/")
-@login_required
 def index():
+    if not current_username():
+        return redirect("/login")
     return Response(PAGE, mimetype="text/html; charset=utf-8")
 
 
