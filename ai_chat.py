@@ -351,6 +351,10 @@ PAGE = r"""<!DOCTYPE html>
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
     display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
   #settings-btn:hover { background:var(--panel); color:var(--accent); }
+  #vip-btn { background:none; border:1px solid var(--border); color:var(--muted);
+    width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
+  #vip-btn:hover { background:var(--panel); border-color:#e0a800; }
   #fullscreen-btn { background:none; border:1px solid var(--border); color:var(--muted);
     width:36px; height:36px; border-radius:6px; cursor:pointer; font-size:15px; flex-shrink:0;
     display:flex; align-items:center; justify-content:center; touch-action:manipulation; }
@@ -536,7 +540,14 @@ PAGE = r"""<!DOCTYPE html>
       </div>
       <div class="right">
         <button id="install-btn" title="Install Mythic AI" style="display:none;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap;touch-action:manipulation;">⬇ Install</button>
-        <button id="vip-btn" title="VIP Access">👑</button>
+        <button id="vip-btn" title="VIP Access">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
+            <path d="M3 8l4 3 5-6 5 6 4-3-2 10H5L3 8z" fill="#f5c542" stroke="#e0a800" stroke-width="1" stroke-linejoin="round"/>
+            <circle cx="3" cy="7" r="1.4" fill="#f5c542"/>
+            <circle cx="21" cy="7" r="1.4" fill="#f5c542"/>
+            <circle cx="12" cy="4.5" r="1.4" fill="#f5c542"/>
+          </svg>
+        </button>
         <button id="settings-btn" title="Settings">⚙</button>
         <button id="fullscreen-btn" type="button" title="Fullscreen">
           <span id="fullscreen-icon">⛶</span>
@@ -816,7 +827,15 @@ function showVipModal() {
   overlay.id = 'vip-modal-overlay';
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;display:flex;align-items:center;justify-content:center;';
   overlay.innerHTML=`<div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:340px;">
-    <div style="font-size:22px;margin-bottom:6px;">👑 VIP Access</div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+        <path d="M3 8l4 3 5-6 5 6 4-3-2 10H5L3 8z" fill="#f5c542" stroke="#e0a800" stroke-width="1" stroke-linejoin="round"/>
+        <circle cx="3" cy="7" r="1.4" fill="#f5c542"/>
+        <circle cx="21" cy="7" r="1.4" fill="#f5c542"/>
+        <circle cx="12" cy="4.5" r="1.4" fill="#f5c542"/>
+      </svg>
+      <span style="font-size:19px;font-weight:700;">VIP Access</span>
+    </div>
     <div style="color:var(--muted);font-size:13px;margin-bottom:16px;">${vipUnlocked ? 'You already have VIP access.' : 'Enter the VIP password to unlock.'}</div>
     ${vipUnlocked ? '' : `
     <input id="vip-pw-in" type="password" placeholder="VIP password" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;margin-bottom:8px;font-family:inherit;">
@@ -2491,7 +2510,7 @@ NANOBANANA_API_KEY = os.environ.get("NANOBANANA_API_KEY", "")
 @app.route("/api/vip-unlock", methods=["POST"])
 def vip_unlock():
     d = request.get_json(force=True) or {}
-    VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "changeme123")
+    VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "1254")
     if d.get("password") == VIP_PASSWORD:
         session["vip"] = True
         return jsonify({"success": True})
