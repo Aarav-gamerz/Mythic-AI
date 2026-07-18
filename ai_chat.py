@@ -515,23 +515,28 @@ PAGE = r"""<!DOCTYPE html>
   <div id="sidebar">
     <button id="new-chat-btn">+ New chat</button>
     <div id="conv-list"></div>
-    <div id="sidebar-footer">Mythic AI &middot; by Aarav Singh</div>
+    <div id="sidebar-footer">
+      <svg width="16" height="16" viewBox="0 0 40 40" style="vertical-align:-3px;margin-right:4px;">
+        <rect width="40" height="40" rx="10" fill="#10a37f"/>
+        <path d="M10 28 L10 12 L20 22 L30 12 L30 28" stroke="#fff" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      Mythic AI &middot; by Aarav Singh
+    </div>
   </div>
   <div class="app">
     <header>
       <div class="left">
         <button id="sidebar-toggle" title="Toggle sidebar">&#9776;</button>
+        <svg id="app-logo" width="26" height="26" viewBox="0 0 40 40" style="flex-shrink:0;">
+          <rect width="40" height="40" rx="10" fill="#10a37f"/>
+          <path d="M10 28 L10 12 L20 22 L30 12 L30 28" stroke="#fff" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
         <h1>Mythic AI</h1>
-        <select id="model-select" title="Select model" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;cursor:pointer;outline:none;max-width:130px;font-family:inherit;">
-          <option value="aarav-1.0">Mythic 1</option>
-          <option value="aarav-2.0">Mythic 2</option>
-          <option value="aarav-2.5" selected>Mythic 2.5</option>
-          <option value="aarav-3.5">Mythic 3</option>
-          <option value="aarav-ultra">Mythic Ultra 🔒</option>
-        </select>
+        <span id="vip-badge" style="display:none;background:linear-gradient(135deg,#f5c542,#e0a800);color:#1a1a1a;font-size:10.5px;font-weight:800;padding:3px 8px;border-radius:10px;letter-spacing:.3px;">VIP</span>
       </div>
       <div class="right">
         <button id="install-btn" title="Install Mythic AI" style="display:none;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;white-space:nowrap;touch-action:manipulation;">⬇ Install</button>
+        <button id="vip-btn" title="VIP Access">👑</button>
         <button id="settings-btn" title="Settings">⚙</button>
         <button id="fullscreen-btn" type="button" title="Fullscreen">
           <span id="fullscreen-icon">⛶</span>
@@ -657,6 +662,129 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Settings Modal -->
+<div id="settings-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:300;align-items:center;justify-content:center;">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:420px;max-height:85vh;overflow-y:auto;">
+    <h3 style="margin:0 0 16px;font-size:18px;">⚙ Settings</h3>
+
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Theme</label>
+      <div style="display:flex;gap:6px;">
+        <button class="settings-choice" data-group="theme" data-value="dark" style="flex:1;padding:8px;border-radius:8px;border:1.5px solid var(--accent);background:var(--bg);color:var(--accent);cursor:pointer;font-size:12px;font-family:inherit;">Dark</button>
+        <button class="settings-choice" data-group="theme" data-value="light" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--muted);cursor:pointer;font-size:12px;font-family:inherit;">Light</button>
+        <button class="settings-choice" data-group="theme" data-value="system" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--muted);cursor:pointer;font-size:12px;font-family:inherit;">System</button>
+      </div>
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Accent color</label>
+      <input type="color" id="accent-color-input" value="#10a37f" style="width:100%;height:36px;border:1px solid var(--border);border-radius:8px;background:var(--bg);cursor:pointer;">
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Message font size: <span id="font-size-label">14.5px</span></label>
+      <input type="range" id="font-size-slider" min="12" max="18" step="0.5" value="14.5" style="width:100%;">
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Bubble spacing</label>
+      <div style="display:flex;gap:6px;">
+        <button class="settings-choice" data-group="bubble" data-value="compact" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--muted);cursor:pointer;font-size:12px;font-family:inherit;">Compact</button>
+        <button class="settings-choice" data-group="bubble" data-value="comfortable" style="flex:1;padding:8px;border-radius:8px;border:1.5px solid var(--accent);background:var(--bg);color:var(--accent);cursor:pointer;font-size:12px;font-family:inherit;">Comfortable</button>
+        <button class="settings-choice" data-group="bubble" data-value="spacious" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--muted);cursor:pointer;font-size:12px;font-family:inherit;">Spacious</button>
+      </div>
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Reply tone</label>
+      <select id="tone-select" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;outline:none;font-family:inherit;">
+        <option value="default">Default</option>
+        <option value="formal">Formal</option>
+        <option value="casual">Casual</option>
+        <option value="funny">Funny</option>
+        <option value="professional">Professional</option>
+      </select>
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Reply length</label>
+      <select id="length-select" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;outline:none;font-family:inherit;">
+        <option value="default">Default</option>
+        <option value="short">Short</option>
+        <option value="medium">Medium</option>
+        <option value="long">Long</option>
+      </select>
+    </div>
+
+    <div style="margin-bottom:16px;">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Custom instructions</label>
+      <textarea id="custom-instructions-input" rows="3" placeholder="e.g. always answer in bullet points"
+        style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;outline:none;font-family:inherit;resize:vertical;"></textarea>
+    </div>
+
+    <button id="settings-close-btn" style="width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">Done</button>
+  </div>
+</div>
+
+<!-- Image Generation Modal -->
+<div id="img-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:300;align-items:center;justify-content:center;">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:440px;max-height:90vh;overflow-y:auto;">
+    <h3 style="margin:0 0 4px;font-size:18px;">🎨 Generate Image</h3>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Describe what you want to see</p>
+
+    <textarea id="img-prompt" rows="3" placeholder="e.g. a cat astronaut floating in space, digital art"
+      style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:13.5px;outline:none;margin-bottom:12px;font-family:inherit;resize:vertical;"></textarea>
+
+    <select id="img-style" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;outline:none;margin-bottom:12px;font-family:inherit;">
+      <option value="">No specific style</option>
+      <option value="photorealistic">Photorealistic</option>
+      <option value="digital art">Digital Art</option>
+      <option value="anime">Anime</option>
+      <option value="watercolor">Watercolor</option>
+      <option value="3d render">3D Render</option>
+      <option value="oil painting">Oil Painting</option>
+    </select>
+
+    <div id="img-result" style="display:none;margin-bottom:12px;text-align:center;">
+      <img id="img-output" style="max-width:100%;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.4);">
+    </div>
+    <div id="img-loading" style="display:none;text-align:center;padding:20px;">
+      <div style="font-size:32px;margin-bottom:8px;">🎨</div>
+      <div style="color:var(--muted);font-size:13px;">Generating your image...</div>
+    </div>
+    <div id="img-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px;background:#fef2f2;border-radius:6px;"></div>
+
+    <div style="display:flex;gap:8px;">
+      <button id="img-generate-btn" style="flex:1;background:linear-gradient(135deg,#10a37f,#0d7a5f);color:#fff;border:none;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">✨ Generate</button>
+      <button id="img-close-btn" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:12px 16px;font-size:14px;cursor:pointer;">✕</button>
+    </div>
+  </div>
+</div>
+
+<!-- Weather Modal -->
+<div id="weather-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:300;align-items:center;justify-content:center;">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:92%;max-width:400px;">
+    <h3 style="margin:0 0 4px;font-size:18px;">🌤 Weather</h3>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 16px;">Check the current weather anywhere</p>
+
+    <input id="weather-city" type="text" placeholder="Enter a city, e.g. Mumbai"
+      style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;margin-bottom:10px;font-family:inherit;">
+
+    <button id="weather-location-btn" style="width:100%;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:9px;font-size:13px;cursor:pointer;font-family:inherit;margin-bottom:12px;">📍 Use my current location</button>
+
+    <div id="weather-result" style="display:none;background:var(--bg);border-radius:10px;padding:14px;margin-bottom:12px;">
+      <div id="weather-content"></div>
+    </div>
+    <div id="weather-loading" style="display:none;text-align:center;padding:16px;color:var(--muted);font-size:13px;">Fetching weather...</div>
+    <div id="weather-error" style="display:none;color:#ef4444;font-size:12px;margin-bottom:8px;padding:8px;background:#fef2f2;border-radius:6px;"></div>
+
+    <div style="display:flex;gap:8px;">
+      <button id="weather-search-btn" style="flex:1;background:linear-gradient(135deg,#10a37f,#0d7a5f);color:#fff;border:none;border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;">Search</button>
+      <button id="weather-close-btn" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:12px 16px;font-size:14px;cursor:pointer;">✕</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const messagesWrap = document.getElementById('messages-wrap');
 const messagesEl   = document.getElementById('messages');
@@ -669,11 +797,17 @@ const newChatBtn   = document.getElementById('new-chat-btn');
 const sidebarToggle= document.getElementById('sidebar-toggle');
 const fullscreenBtn= document.getElementById('fullscreen-btn');
 const nameBtn       = document.getElementById('name-btn');
-const modelSelect   = document.getElementById('model-select');
+const vipBtn        = document.getElementById('vip-btn');
+const vipBadge      = document.getElementById('vip-badge');
 
-let selectedModel = 'aarav-2.5';
 let vipUnlocked   = false;
 let newsContext    = null;
+
+function setVipUI(unlocked) {
+  vipUnlocked = unlocked;
+  if (vipBadge) vipBadge.style.display = unlocked ? 'inline-block' : 'none';
+  if (vipBtn) vipBtn.title = unlocked ? 'VIP unlocked' : 'VIP Access';
+}
 
 function showVipModal() {
   const existing = document.getElementById('vip-modal-overlay');
@@ -682,50 +816,40 @@ function showVipModal() {
   overlay.id = 'vip-modal-overlay';
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;display:flex;align-items:center;justify-content:center;';
   overlay.innerHTML=`<div style="background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;width:90%;max-width:340px;">
-    <div style="font-size:22px;margin-bottom:6px;">🔒 VIP Access</div>
-    <div style="color:var(--muted);font-size:13px;margin-bottom:16px;">Mythic Ultra is for VIP users only.</div>
+    <div style="font-size:22px;margin-bottom:6px;">👑 VIP Access</div>
+    <div style="color:var(--muted);font-size:13px;margin-bottom:16px;">${vipUnlocked ? 'You already have VIP access.' : 'Enter the VIP password to unlock.'}</div>
+    ${vipUnlocked ? '' : `
     <input id="vip-pw-in" type="password" placeholder="VIP password" style="width:100%;background:var(--bg);border:1.5px solid var(--border);color:var(--text);border-radius:8px;padding:10px 12px;font-size:14px;outline:none;margin-bottom:8px;font-family:inherit;">
-    <div id="vip-pw-err" style="color:#ef4444;font-size:12px;display:none;margin-bottom:8px;">Wrong password.</div>
+    <div id="vip-pw-err" style="color:#ef4444;font-size:12px;display:none;margin-bottom:8px;">Wrong password.</div>`}
     <div style="display:flex;gap:8px;">
-      <button id="vip-pw-ok" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Unlock</button>
-      <button id="vip-pw-cancel" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px;font-size:14px;cursor:pointer;">Cancel</button>
+      ${vipUnlocked ? '' : '<button id="vip-pw-ok" style="flex:1;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:14px;font-weight:600;cursor:pointer;">Unlock</button>'}
+      <button id="vip-pw-cancel" style="flex:1;background:none;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px;font-size:14px;cursor:pointer;">${vipUnlocked ? 'Close' : 'Cancel'}</button>
     </div></div>`;
   document.body.appendChild(overlay);
-  const pwIn=overlay.querySelector('#vip-pw-in'), pwErr=overlay.querySelector('#vip-pw-err');
-  pwIn.focus();
-  overlay.querySelector('#vip-pw-cancel').addEventListener('click',()=>{overlay.style.display='none';modelSelect.value=selectedModel;});
-  overlay.querySelector('#vip-pw-ok').addEventListener('click',async()=>{
-    const r=await fetch('/api/vip-unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwIn.value.trim()})});
-    const d=await r.json();
-    if(d.success){vipUnlocked=true;overlay.style.display='none';selectedModel='aarav-ultra';modelSelect.value='aarav-ultra';
-      const opt=modelSelect.querySelector('option[value="aarav-ultra"]');if(opt)opt.textContent='Mythic Ultra ✨';}
-    else{pwErr.style.display='block';pwIn.value='';pwIn.focus();}
-  });
-  pwIn.addEventListener('keydown',e=>{if(e.key==='Enter')overlay.querySelector('#vip-pw-ok').click();});
+  overlay.querySelector('#vip-pw-cancel').addEventListener('click',()=>{overlay.remove();});
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  if (!vipUnlocked) {
+    const pwIn=overlay.querySelector('#vip-pw-in'), pwErr=overlay.querySelector('#vip-pw-err');
+    pwIn.focus();
+    overlay.querySelector('#vip-pw-ok').addEventListener('click',async()=>{
+      try {
+        const r=await fetch('/api/vip-unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwIn.value.trim()})});
+        const d=await r.json();
+        if(d.success){ setVipUI(true); overlay.remove(); }
+        else{pwErr.style.display='block';pwIn.value='';pwIn.focus();}
+      } catch { pwErr.textContent='Network error.'; pwErr.style.display='block'; }
+    });
+    pwIn.addEventListener('keydown',e=>{if(e.key==='Enter')overlay.querySelector('#vip-pw-ok').click();});
+  }
 }
+if (vipBtn) vipBtn.addEventListener('click', showVipModal);
 
 (async()=>{
   try{
-    const[mr,vr]=await Promise.all([fetch('/api/models').then(r=>r.json()),fetch('/api/vip-status').then(r=>r.json())]);
-    vipUnlocked=vr.vip;
-    modelSelect.innerHTML='';
-    mr.models.forEach(m=>{
-      const opt=document.createElement('option');
-      opt.value=m.id;
-      opt.textContent=m.vip?(vipUnlocked?m.name.replace('🔒','✨'):m.name):m.name;
-      opt.dataset.vip=m.vip?'1':'0';
-      if(m.id===mr.default)opt.selected=true;
-      modelSelect.appendChild(opt);
-    });
-    selectedModel=mr.default;
+    const vr = await fetch('/api/vip-status').then(r=>r.json());
+    setVipUI(!!vr.vip);
   }catch{}
 })();
-
-modelSelect.addEventListener('change',()=>{
-  const opt=modelSelect.options[modelSelect.selectedIndex];
-  if(opt&&opt.dataset.vip==='1'&&!vipUnlocked){showVipModal();}
-  else{selectedModel=modelSelect.value;}
-});
 const nameModalOverlay = document.getElementById('name-modal-overlay');
 const nameInput     = document.getElementById('name-input');
 const nameCancelBtn = document.getElementById('name-cancel-btn');
@@ -1056,7 +1180,6 @@ async function streamReply({ message = null, attachment = null, regenerate = fal
         attachment,
         user_name: getUserName(),
         regenerate: !!regenerate,
-        model: selectedModel,
         news_context: newsContext || null,
       })
     });
@@ -1557,7 +1680,7 @@ async function addFollowupSuggestions(aiText) {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
         message: `Based on this AI reply, suggest 3 short follow-up questions the user might ask. Reply ONLY with 3 questions, one per line, no numbering, no extra text:\n\n${aiText.slice(0,400)}`,
-        conversation_id: null, model: 'aarav-1.0', user_name: ''
+        conversation_id: null, user_name: ''
       })
     });
     if (!r.ok) return;
@@ -2366,17 +2489,6 @@ def chat():
 
 
 NANOBANANA_API_KEY = os.environ.get("NANOBANANA_API_KEY", "")
-
-@app.route("/api/models")
-def get_models():
-    return jsonify({"models": [
-        {"id": "aarav-1.0",   "name": "Mythic 1",     "desc": "Fast - quick answers",      "vip": False},
-        {"id": "aarav-2.0",   "name": "Mythic 2",     "desc": "Balanced - everyday tasks", "vip": False},
-        {"id": "aarav-2.5",   "name": "Mythic 2.5",   "desc": "Smart - best for most",     "vip": False},
-        {"id": "aarav-3.5",   "name": "Mythic 3",     "desc": "Advanced - complex tasks",  "vip": False},
-        {"id": "aarav-ultra", "name": "Mythic Ultra ✨","desc": "Most powerful - VIP only", "vip": True},
-    ], "default": "aarav-2.5"})
-
 
 @app.route("/api/vip-unlock", methods=["POST"])
 def vip_unlock():
