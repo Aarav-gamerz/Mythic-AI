@@ -894,7 +894,7 @@ function showEmptyState() {
   messagesEl.innerHTML = '<div class="empty-state" id="empty-state"><h2>Mythic AI</h2><p>Ask me anything, generate images, or just chat 👋</p></div>';
 }
 
-function addMessage(role, text, attachment) {
+function addMessageBase(role, text, attachment) {
   clearEmptyState();
   const row = document.createElement('div');
   row.className = 'msg-row ' + role;
@@ -927,7 +927,7 @@ function addMessage(role, text, attachment) {
   return textNode;
 }
 
-function buildMsgActions(row, textNode, role) {
+function buildMsgActionsBase(row, textNode, role) {
   const actions = document.createElement('div');
   actions.className = 'msg-actions';
 
@@ -1645,9 +1645,8 @@ function renderMarkdown(text) {
   return div;
 }
 
-const _origAddMessage = addMessage;
 function addMessage(role, text, attachment) {
-  const textNode = _origAddMessage(role, text, attachment);
+  const textNode = addMessageBase(role, text, attachment);
   if (role === 'ai' && text) {
     try {
       const md = renderMarkdown(text);
@@ -1828,9 +1827,8 @@ if ('serviceWorker' in navigator) {
 }
 
 // ─── WIRE REACTIONS INTO MSG ACTIONS ─────────────────────────────────────────
-const _origBuildActions = buildMsgActions;
 function buildMsgActions(row, textNode, role) {
-  const actions = _origBuildActions(row, textNode, role);
+  const actions = buildMsgActionsBase(row, textNode, role);
   if (role === 'ai') {
     const reactBtn = document.createElement('button');
     reactBtn.type = 'button'; reactBtn.title = 'React'; reactBtn.textContent = '😊';
@@ -2580,11 +2578,24 @@ def get_weather():
         else:
             geo = requests.get("https://geocoding-api.open-meteo.com/v1/search",
                 params={"name": location, "count": 1, "language": "en", "format": "json"}, timeout=8)
-            if geo.status_code != 200 or not geo.json().get("results"):
-                return jsonify({"error": f"City '{location}' not found"}), 404
-            res = geo.json()["results"][0]
-            lat, lon = res["latitude"], res["longitude"]
-            location_name = res["name"] + ", " + res.get("country", "")
+            results = geo.json().get("results") if geo.status_code == 200 else None
+            if results:
+                res = results[0]
+                lat, lon = res["latitude"], res["longitude"]
+                location_name = res["name"] + ", " + res.get("country", "")
+            else:
+                # Open-Meteo's geocoder doesn't fuzzy-match typos/alt names (e.g.
+                # "Gurgoan" for Gurgaon/Gurugram) - fall back to Nominatim, which
+                # is more forgiving with partial/misspelled place names.
+                nomi = requests.get("https://nominatim.openstreetmap.org/search",
+                    params={"q": location, "format": "json", "limit": 1},
+                    headers={"User-Agent": "MythicAI/1.0"}, timeout=8)
+                nomi_results = nomi.json() if nomi.status_code == 200 else []
+                if not nomi_results:
+                    return jsonify({"error": f"City '{location}' not found. Check the spelling and try again."}), 404
+                nres = nomi_results[0]
+                lat, lon = float(nres["lat"]), float(nres["lon"])
+                location_name = nres.get("display_name", location).split(",")[0]
         wr = requests.get("https://api.open-meteo.com/v1/forecast",
             params={"latitude": lat, "longitude": lon,
                 "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
