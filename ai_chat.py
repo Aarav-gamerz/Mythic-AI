@@ -24,16 +24,10 @@ Usage (Ollama — fully local, no API key or internet needed):
     4. python ai_chat.py
     5. Open http://localhost:5000 in your browser
 
-Email verification (OTP login via Resend):
-    Set these environment variables (e.g. on Render -> Environment):
-         RESEND_API_KEY = your Resend API key
-         RESEND_FROM    = "Mythic AI <noreply@mythicai.com>"   (must be on a VERIFIED domain)
-    Until mythicai.com is verified in https://resend.com/domains, Resend's
-    sandbox sender can only email your own Resend account address.
-
 Features:
-- Email + OTP login (no passwords — a 6-digit code is emailed via Resend)
-- Multi-conversation chat with sidebar, saved per-account, survives restarts
+- Anonymous per-browser sessions (no login/email required — each browser gets
+  its own saved conversations automatically)
+- Multi-conversation chat with sidebar, saved per-session, survives restarts
 - File/image upload (attach an image or text file to a message)
 - Web search grounding (Gemini can search Google for current info — Gemini only)
 - Streaming responses (text appears word-by-word)
@@ -137,337 +131,25 @@ def sb(path):
     return f"{SUPABASE_URL}/rest/v1/{path}"
 
 
-# --- Email verification auth --------------------------------------------------
-import hashlib, secrets, time as _time
-
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "re_e7rAaTUK_Bue5bvRkSzcursftpQM3uaLM")
-# NOTE: mythicai.com must be verified at https://resend.com/domains before this
-# "from" address will deliver to anyone other than your own Resend account email.
-RESEND_FROM    = os.environ.get("RESEND_FROM", "Mythic AI <noreply@mythicai.com>")
-AUTH_FILE      = DATA_DIR / "auth.json"
-OTP_EXPIRY     = 600  # 10 minutes
-OTP_RESEND_COOLDOWN = 30  # seconds between resend requests per email
-MAX_OTP_ATTEMPTS = 5  # wrong-code attempts allowed before the code is invalidated
-
-def _load_auth():
-    if AUTH_FILE.exists():
-        try: return json.loads(AUTH_FILE.read_text(encoding="utf-8"))
-        except: pass
-    return {"users": {}, "otps": {}}
-
-def _save_auth(data):
-    AUTH_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-
-def send_otp_email(email, otp):
-    """Send OTP via Resend API. Returns True on success, False otherwise."""
-    if not RESEND_API_KEY:
-        print("[Resend] No RESEND_API_KEY configured - cannot send OTP email.")
-        return False
-    try:
-        r = requests.post("https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "from": RESEND_FROM,
-                "to": [email],
-                "subject": "Your Mythic AI verification code",
-                "html": f"""
-<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#1a1a1a;border-radius:16px;color:#ececec;">
-  <div style="text-align:center;margin-bottom:24px;">
-    <div style="width:60px;height:60px;background:#10a37f;border-radius:14px;margin:0 auto 12px;display:flex;align-items:center;justify-content:center;font-size:30px;font-weight:bold;color:white;line-height:60px;text-align:center;">M</div>
-    <h1 style="margin:0;font-size:22px;color:#ececec;">Mythic AI</h1>
-  </div>
-  <p style="color:#8e8ea0;font-size:14px;margin-bottom:8px;">Your verification code is:</p>
-  <div style="text-align:center;background:#2a2a2a;border:2px solid #10a37f;border-radius:12px;padding:20px;margin:16px 0;">
-    <span style="font-size:40px;font-weight:bold;letter-spacing:12px;color:#10a37f;">{otp}</span>
-  </div>
-  <p style="color:#8e8ea0;font-size:13px;text-align:center;">This code expires in <strong style="color:#ececec;">10 minutes</strong>.</p>
-  <p style="color:#8e8ea0;font-size:12px;text-align:center;margin-top:24px;">If you didn't request this, ignore this email.</p>
-</div>""",
-            }, timeout=10)
-        if r.status_code == 200:
-            return True
-        print(f"[Resend] send failed ({r.status_code}): {r.text[:300]}")
-        return False
-    except Exception as e:
-        print(f"[Resend] exception: {e}")
-        return False
+# --- Anonymous session auth (no login/email required) -----------------------
+# Every visitor gets a random persistent ID stored in their browser's session
+# cookie the first time they open the app. This keeps each browser's
+# conversations separate without requiring any sign-in step.
 
 def current_username():
-    if "user_email" in session:
-        return session["user_email"]
-    return None
+    if "user_id" not in session:
+        session["user_id"] = str(uuid.uuid4())
+        session.permanent = True
+    return session["user_id"]
 
 def login_required(view):
     from functools import wraps
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if not current_username():
-            return jsonify({"error": "auth_required"}), 401
+        current_username()  # ensures a session id exists
         return view(*args, **kwargs)
     return wrapped
 
-AUTH_PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta name="theme-color" content="#10a37f">
-<title>Mythic AI - Sign In</title>
-<style>
-  *{box-sizing:border-box;margin:0;padding:0;}
-  body{background:#1a1a1a;color:#ececec;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-    min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
-  .card{background:#2a2a2a;border:1px solid #3a3a3a;border-radius:20px;padding:36px 32px;
-    width:100%;max-width:400px;box-shadow:0 20px 60px rgba(0,0,0,.5);}
-  .logo{width:60px;height:60px;background:#10a37f;border-radius:14px;display:flex;
-    align-items:center;justify-content:center;font-size:28px;font-weight:bold;color:#fff;
-    margin:0 auto 16px;}
-  h1{text-align:center;font-size:22px;margin-bottom:4px;}
-  .sub{text-align:center;color:#8e8ea0;font-size:13px;margin-bottom:28px;}
-  .step{display:none;}
-  .step.active{display:block;}
-  label{display:block;font-size:13px;color:#8e8ea0;margin-bottom:6px;}
-  input{width:100%;background:#1a1a1a;border:1.5px solid #3a3a3a;color:#ececec;border-radius:10px;
-    padding:12px 14px;font-size:15px;outline:none;font-family:inherit;transition:border-color .2s;}
-  input:focus{border-color:#10a37f;}
-  .btn{width:100%;background:#10a37f;color:#fff;border:none;border-radius:10px;padding:13px;
-    font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;margin-top:16px;transition:opacity .2s;}
-  .btn:hover{opacity:.9;}
-  .btn:disabled{opacity:.5;cursor:not-allowed;}
-  .btn-ghost{background:none;border:1.5px solid #3a3a3a;color:#8e8ea0;margin-top:10px;}
-  .btn-ghost:hover{border-color:#10a37f;color:#10a37f;opacity:1;}
-  .error{color:#ef4444;font-size:12.5px;margin-top:8px;display:none;padding:8px 12px;
-    background:rgba(239,68,68,.1);border-radius:7px;}
-  .otp-row{display:flex;gap:10px;justify-content:center;margin:16px 0;}
-  .otp-row input{width:52px;height:58px;text-align:center;font-size:24px;font-weight:700;
-    border-radius:10px;padding:0;}
-  .resend-row{text-align:center;margin-top:12px;font-size:13px;color:#8e8ea0;}
-  .resend-row button{background:none;border:none;color:#10a37f;cursor:pointer;font-size:13px;font-family:inherit;}
-  .resend-row button:disabled{color:#8e8ea0;cursor:not-allowed;}
-  .email-show{color:#10a37f;font-size:13px;text-align:center;margin-bottom:16px;}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="logo">M</div>
-  <h1>Mythic AI</h1>
-  <p class="sub">Sign in to continue</p>
-
-  <div class="step active" id="step-email">
-    <label for="email-in">Email address</label>
-    <input type="email" id="email-in" placeholder="you@example.com" autocomplete="email">
-    <div class="error" id="email-err"></div>
-    <button class="btn" id="send-otp-btn">Continue</button>
-  </div>
-
-  <div class="step" id="step-otp">
-    <div class="email-show" id="email-show"></div>
-    <label>Enter the 6-digit code we sent you</label>
-    <div class="otp-row">
-      <input type="text" maxlength="1" class="otp-digit" inputmode="numeric">
-      <input type="text" maxlength="1" class="otp-digit" inputmode="numeric">
-      <input type="text" maxlength="1" class="otp-digit" inputmode="numeric">
-      <input type="text" maxlength="1" class="otp-digit" inputmode="numeric">
-      <input type="text" maxlength="1" class="otp-digit" inputmode="numeric">
-      <input type="text" maxlength="1" class="otp-digit" inputmode="numeric">
-    </div>
-    <div class="error" id="otp-err"></div>
-    <button class="btn" id="verify-btn">Verify &amp; Sign In</button>
-    <div class="resend-row">
-      Didn't receive it? <button id="resend-btn" disabled>Resend (<span id="resend-timer">60</span>s)</button>
-    </div>
-    <button class="btn btn-ghost" id="back-btn">Change email</button>
-  </div>
-</div>
-<script>
-const emailIn   = document.getElementById('email-in');
-const sendBtn   = document.getElementById('send-otp-btn');
-const emailErr  = document.getElementById('email-err');
-const stepEmail = document.getElementById('step-email');
-const stepOtp   = document.getElementById('step-otp');
-const emailShow = document.getElementById('email-show');
-const otpDigits = document.querySelectorAll('.otp-digit');
-const otpErr    = document.getElementById('otp-err');
-const verifyBtn = document.getElementById('verify-btn');
-const resendBtn = document.getElementById('resend-btn');
-const resendTimer=document.getElementById('resend-timer');
-const backBtn   = document.getElementById('back-btn');
-let currentEmail = '';
-let resendInterval = null;
-
-function showErr(el, msg) { el.textContent = msg; el.style.display = 'block'; }
-function hideErr(el) { el.style.display = 'none'; }
-
-function startResendTimer(seconds=60) {
-  let s = seconds;
-  resendBtn.disabled = true;
-  resendTimer.textContent = s;
-  clearInterval(resendInterval);
-  resendInterval = setInterval(() => {
-    s--;
-    resendTimer.textContent = s;
-    if (s <= 0) { clearInterval(resendInterval); resendBtn.disabled = false; resendBtn.textContent = 'Resend'; }
-  }, 1000);
-}
-
-async function sendOTP(email) {
-  sendBtn.disabled = true; sendBtn.textContent = 'Sending...';
-  hideErr(emailErr);
-  try {
-    const r = await fetch('/api/auth/send-otp', {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify({email})});
-    const d = await r.json();
-    if (d.ok) {
-      currentEmail = email;
-      emailShow.textContent = 'Code sent to ' + email;
-      stepEmail.classList.remove('active');
-      stepOtp.classList.add('active');
-      otpDigits[0].focus();
-      startResendTimer(60);
-    } else { showErr(emailErr, d.error || 'Failed to send code.'); }
-  } catch { showErr(emailErr, 'Network error. Try again.'); }
-  sendBtn.disabled = false; sendBtn.textContent = 'Continue';
-}
-
-sendBtn.addEventListener('click', () => {
-  const email = emailIn.value.trim();
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    showErr(emailErr, 'Enter a valid email address.'); return;
-  }
-  sendOTP(email);
-});
-emailIn.addEventListener('keydown', e => { if(e.key==='Enter') sendBtn.click(); });
-
-otpDigits.forEach((d, i) => {
-  d.addEventListener('input', () => {
-    d.value = d.value.replace(/\D/g,'');
-    if (d.value && i < 5) otpDigits[i+1].focus();
-    if (i === 5 && d.value) verifyBtn.click();
-  });
-  d.addEventListener('keydown', e => {
-    if (e.key==='Backspace' && !d.value && i > 0) otpDigits[i-1].focus();
-    if (e.key==='ArrowLeft' && i > 0) otpDigits[i-1].focus();
-    if (e.key==='ArrowRight' && i < 5) otpDigits[i+1].focus();
-  });
-  d.addEventListener('paste', e => {
-    e.preventDefault();
-    const paste = (e.clipboardData.getData('text')||'').replace(/\D/g,'').slice(0,6);
-    paste.split('').forEach((ch, j) => { if(otpDigits[i+j]) otpDigits[i+j].value=ch; });
-    const next = Math.min(i + paste.length, 5);
-    otpDigits[next].focus();
-  });
-});
-
-verifyBtn.addEventListener('click', async () => {
-  const otp = Array.from(otpDigits).map(d=>d.value).join('');
-  if (otp.length < 6) { showErr(otpErr, 'Enter all 6 digits.'); return; }
-  verifyBtn.disabled = true; verifyBtn.textContent = 'Verifying...';
-  hideErr(otpErr);
-  try {
-    const r = await fetch('/api/auth/verify-otp', {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:currentEmail, otp})});
-    const d = await r.json();
-    if (d.ok) { window.location.href = '/'; }
-    else {
-      showErr(otpErr, d.error || 'Invalid or expired code.');
-      otpDigits.forEach(d=>d.value=''); otpDigits[0].focus();
-    }
-  } catch { showErr(otpErr, 'Network error. Try again.'); }
-  verifyBtn.disabled = false; verifyBtn.textContent = 'Verify & Sign In';
-});
-
-resendBtn.addEventListener('click', () => {
-  resendBtn.textContent = 'Resend (60s)';
-  sendOTP(currentEmail);
-  startResendTimer(60);
-});
-
-backBtn.addEventListener('click', () => {
-  stepOtp.classList.remove('active');
-  stepEmail.classList.add('active');
-  otpDigits.forEach(d=>d.value='');
-  clearInterval(resendInterval);
-});
-</script>
-</body>
-</html>
-"""
-
-@app.route("/login")
-def login_page():
-    if current_username():
-        return redirect("/")
-    return Response(AUTH_PAGE, mimetype="text/html; charset=utf-8")
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect("/login")
-
-@app.route("/api/auth/send-otp", methods=["POST"])
-def auth_send_otp():
-    d = request.get_json(force=True) or {}
-    email = (d.get("email") or "").strip().lower()
-    if not email or "@" not in email or "." not in email.split("@")[-1]:
-        return jsonify({"ok": False, "error": "Invalid email"})
-
-    auth = _load_auth()
-    existing = auth["otps"].get(email)
-    now = _time.time()
-    if existing and now < existing.get("sent_at", 0) + OTP_RESEND_COOLDOWN:
-        wait = int(existing["sent_at"] + OTP_RESEND_COOLDOWN - now)
-        return jsonify({"ok": False, "error": f"Please wait {wait}s before requesting another code."})
-
-    otp = str(secrets.randbelow(900000) + 100000)  # 6-digit OTP
-    auth["otps"][email] = {
-        "otp": hashlib.sha256(otp.encode()).hexdigest(),
-        "expires": now + OTP_EXPIRY,
-        "sent_at": now,
-        "attempts": 0,
-    }
-    _save_auth(auth)
-    ok = send_otp_email(email, otp)
-    if not ok:
-        if os.environ.get("FLASK_ENV") == "development":
-            return jsonify({"ok": True, "dev_otp": otp})
-        return jsonify({"ok": False, "error": "Failed to send email. Check the Resend API key/from address."})
-    return jsonify({"ok": True})
-
-@app.route("/api/auth/verify-otp", methods=["POST"])
-def auth_verify_otp():
-    d = request.get_json(force=True) or {}
-    email = (d.get("email") or "").strip().lower()
-    otp   = (d.get("otp") or "").strip()
-    if not email or not otp:
-        return jsonify({"ok": False, "error": "Missing email or code"})
-    auth = _load_auth()
-    entry = auth.get("otps", {}).get(email)
-    if not entry:
-        return jsonify({"ok": False, "error": "No code sent to this email. Request a new one."})
-    if _time.time() > entry["expires"]:
-        del auth["otps"][email]; _save_auth(auth)
-        return jsonify({"ok": False, "error": "Code expired. Request a new one."})
-    if hashlib.sha256(otp.encode()).hexdigest() != entry["otp"]:
-        entry["attempts"] = entry.get("attempts", 0) + 1
-        if entry["attempts"] >= MAX_OTP_ATTEMPTS:
-            del auth["otps"][email]; _save_auth(auth)
-            return jsonify({"ok": False, "error": "Too many wrong attempts. Request a new code."})
-        _save_auth(auth)
-        return jsonify({"ok": False, "error": "Incorrect code. Try again."})
-    del auth["otps"][email]
-    if email not in auth["users"]:
-        auth["users"][email] = {"created": _time.time()}
-    _save_auth(auth)
-    session["user_email"] = email
-    session.permanent = True
-    return jsonify({"ok": True})
-
-@app.route("/api/auth/me")
-def auth_me():
-    email = current_username()
-    if not email:
-        return jsonify({"logged_in": False})
-    return jsonify({"logged_in": True, "email": email})
 
 
 def list_conversations(username):
@@ -2258,8 +1940,7 @@ def pwa_icon():
 
 @app.route("/")
 def index():
-    if not current_username():
-        return redirect("/login")
+    current_username()  # ensures a session id exists for this browser
     return Response(PAGE, mimetype="text/html; charset=utf-8")
 
 
@@ -2684,7 +2365,7 @@ def chat():
     return resp
 
 
-NANOBANANA_API_KEY = os.environ.get("NANOBANANA_API_KEY", "api-18a42424f3820dd304526a924b7bcef9")
+NANOBANANA_API_KEY = os.environ.get("NANOBANANA_API_KEY", "")
 
 @app.route("/api/models")
 def get_models():
@@ -2700,7 +2381,7 @@ def get_models():
 @app.route("/api/vip-unlock", methods=["POST"])
 def vip_unlock():
     d = request.get_json(force=True) or {}
-    VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "1254")
+    VIP_PASSWORD = os.environ.get("VIP_PASSWORD", "changeme123")
     if d.get("password") == VIP_PASSWORD:
         session["vip"] = True
         return jsonify({"success": True})
@@ -2715,7 +2396,7 @@ def vip_status():
 @app.route("/api/news", methods=["POST"])
 @login_required
 def get_news():
-    NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "344a953f2d08489a865239c2f9f030e4")
+    NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
     d = request.get_json(force=True) or {}
     if not NEWS_API_KEY:
         return jsonify({"error": "News unavailable"}), 503
