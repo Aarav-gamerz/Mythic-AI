@@ -302,6 +302,18 @@ PAGE = r"""<!DOCTYPE html>
     --accent-dim:#1a3a30; --user-bubble:#2a2a2a; --user-text:#ececec;
     --ai-bubble:#1a1a1a; --sidebar-w:260px;
   }
+  body.theme-light {
+    --bg:#f7f7f8; --panel:#ffffff; --border:#e3e3e6;
+    --text:#1a1a1a; --muted:#6b6b74;
+    --accent-dim:#e6f6f1; --user-bubble:#eef0f2; --user-text:#1a1a1a;
+    --ai-bubble:#ffffff;
+  }
+  body.bubble-compact .msg { padding:7px 11px; }
+  body.bubble-compact #messages { gap:8px; }
+  body.bubble-comfortable .msg { padding:11px 15px; }
+  body.bubble-comfortable #messages { gap:16px; }
+  body.bubble-spacious .msg { padding:16px 20px; }
+  body.bubble-spacious #messages { gap:26px; }
   * { box-sizing:border-box; margin:0; padding:0; }
   html,body { height:100%; background:var(--bg); color:var(--text);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif; overflow:hidden; }
@@ -388,7 +400,7 @@ PAGE = r"""<!DOCTYPE html>
   #messages { padding:24px 20px; display:flex; flex-direction:column; gap:16px;
     max-width:760px; margin:0 auto; width:100%; min-height:100%; }
   .msg { max-width:80%; padding:11px 15px; border-radius:18px; line-height:1.6;
-    font-size:14.5px; white-space:pre-wrap; word-wrap:break-word; }
+    font-size:var(--msg-font-size, 14.5px); white-space:pre-wrap; word-wrap:break-word; }
   .msg.user { align-self:flex-end; background:var(--user-bubble); color:var(--user-text);
     border-bottom-right-radius:4px; }
   .msg.ai { align-self:flex-start; background:var(--ai-bubble); color:var(--text);
