@@ -2801,8 +2801,14 @@ def get_weather():
 @app.route("/api/generate-image", methods=["POST"])
 @login_required
 def generate_image():
-    """Generate or edit images using NanoBanana API (Gemini 3.1 Flash Image).
-    Falls back to Pollinations.ai if NanoBanana fails."""
+    """Generate or edit images. Tries, in order:
+    1. NanoBanana API (paid, if NANOBANANA_API_KEY is set)
+    2. Hugging Face Inference API running Animagine XL - a free, anime-specific
+       model (trained on tagged anime/character data) that recognizes named
+       characters far more reliably than general-purpose models. Needs a free
+       HF_API_KEY from https://huggingface.co/settings/tokens
+    3. Pollinations.ai - fully free, no key required, general-purpose fallback
+    """
     import urllib.parse, random
     d = request.get_json(force=True) or {}
     prompt   = (d.get("prompt") or "").strip()
@@ -2855,6 +2861,26 @@ def generate_image():
                 print(f"[NanoBanana] error {resp.status_code}: {resp.text[:300]}")
         except Exception as e:
             print(f"[NanoBanana] exception: {e}")
+
+    # --- Hugging Face Animagine XL (free, anime/character-specialized) -----
+    if HF_API_KEY and not ref_b64:  # this model is text-to-image only, no editing
+        try:
+            # Animagine XL is fine-tuned on Danbooru-style anime tags, so it
+            # recognizes named characters (e.g. "Madara Uchiha") much better
+            # than general models - feeding it tag-style prompting helps too.
+            anime_prompt = f"{prompt}, masterpiece, best quality, highly detailed, anime screencap"
+            resp = requests.post(
+                "https://api-inference.huggingface.co/models/cagliostrolab/animagine-xl-3.1",
+                headers={"Authorization": f"Bearer {HF_API_KEY}"},
+                json={"inputs": anime_prompt, "options": {"wait_for_model": True}},
+                timeout=60,
+            )
+            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
+                return jsonify({"image": base64.b64encode(resp.content).decode(), "mime": resp.headers.get("content-type", "image/png")})
+            else:
+                print(f"[HF Animagine] error {resp.status_code}: {resp.text[:300] if resp.content else ''}")
+        except Exception as e:
+            print(f"[HF Animagine] exception: {e}")
 
     try:
         encoded = urllib.parse.quote(full_prompt)
